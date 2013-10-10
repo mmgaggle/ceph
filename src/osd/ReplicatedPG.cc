@@ -4137,7 +4137,8 @@ hobject_t ReplicatedPG::generate_temp_object()
 {
   ostringstream ss;
   ss << "temp_" << info.pgid << "_" << get_role() << "_" << osd->monc->get_global_id() << "_" << (++temp_seq);
-  hobject_t hoid(object_t(ss.str()), "", CEPH_NOSNAP, 0, -1, "");
+  hobject_t hoid = hobject_t::make_temp(ss.str());
+  // TODOSAM: adjust when this method gets absorbed into ReplicatedBackend
   pgbackend->add_temp_obj(hoid);
   dout(20) << __func__ << " " << hoid << dendl;
   return hoid;
@@ -4542,6 +4543,7 @@ void ReplicatedPG::_build_finish_copy_transaction(CopyOpRef cop,
     // finish writing to temp object, then move into place
     _write_copy_chunk(cop, &t);
     t.collection_move_rename(cop->temp_coll, cop->temp_oid, coll, obs.oi.soid);
+    // TODOSAM: adjust when this method gets absorbed into ReplicatedBackend
     pgbackend->clear_temp_obj(cop->temp_oid);
   }
 }
@@ -5639,11 +5641,13 @@ void ReplicatedPG::sub_op_modify(OpRequestRef op)
 
     if (m->new_temp_oid != hobject_t()) {
       dout(20) << __func__ << " start tracking temp " << m->new_temp_oid << dendl;
+      // TODOSAM: adjust when this method gets absorbed into ReplicatedBackend
       pgbackend->add_temp_obj(m->new_temp_oid);
       get_temp_coll(&rm->localt);
     }
     if (m->discard_temp_oid != hobject_t()) {
       dout(20) << __func__ << " stop tracking temp " << m->discard_temp_oid << dendl;
+      // TODOSAM: adjust when this method gets absorbed into ReplicatedBackend
       pgbackend->clear_temp_obj(m->discard_temp_oid);
     }
 

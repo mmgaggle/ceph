@@ -319,6 +319,17 @@ public:
   void op_applied_replica(
     const eversion_t &applied_version);
 
+  bool should_send_op(
+    int peer,
+    const hobject_t &hoid) {
+    return !(
+      peer == backfill_target &&
+      hoid > last_backfill_started &&
+      // only skip normal (not temp objects) objects
+      hoid.pool == (int64_t)info.pgid.pool());
+  }
+
+
   /*
    * Capture all object state associated with an in-progress read or write.
    */

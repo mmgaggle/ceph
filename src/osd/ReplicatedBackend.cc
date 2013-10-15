@@ -98,7 +98,6 @@ bool ReplicatedBackend::handle_message(
   dout(10) << __func__ << ": " << op << dendl;
   switch (op->get_req()->get_type()) {
   case MSG_OSD_PG_PUSH:
-    // TODOXXX: needs to be active possibly
     do_push(op);
     return true;
 
@@ -119,7 +118,6 @@ bool ReplicatedBackend::handle_message(
 	sub_op_pull(op);
 	return true;
       case CEPH_OSD_OP_PUSH:
-        // TODOXXX: needs to be active possibly
 	sub_op_push(op);
 	return true;
       default:

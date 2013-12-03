@@ -50,7 +50,11 @@ void PGLog::IndexedLog::split_into(
   index();
 }
 
-void PGLog::IndexedLog::trim(eversion_t s, set<eversion_t> *trimmed)
+void PGLog::IndexedLog::trim(
+  ObjectStore::Transaction *t,
+  LogEntryHandler *handler,
+  eversion_t s,
+  set<eversion_t> *trimmed)
 {
   if (complete_to != log.end() &&
       complete_to->version <= s) {
@@ -65,6 +69,7 @@ void PGLog::IndexedLog::trim(eversion_t s, set<eversion_t> *trimmed)
     generic_dout(20) << "trim " << e << dendl;
     if (trimmed)
       trimmed->insert(e.version);
+    handler->trim(t, e);
     unindex(e);         // remove from index,
     log.pop_front();    // from log
   }
@@ -118,7 +123,11 @@ void PGLog::clear_info_log(
   t->omap_rmkeys(coll_t::META_COLL, infos_oid, keys_to_remove);
 }
 
-void PGLog::trim(eversion_t trim_to, pg_info_t &info)
+void PGLog::trim(
+  ObjectStore::Transaction *t,
+  LogEntryHandler *handler,
+  eversion_t trim_to,
+  pg_info_t &info)
 {
   // trim?
   if (trim_to > log.tail) {
@@ -130,7 +139,7 @@ void PGLog::trim(eversion_t trim_to, pg_info_t &info)
     assert(trim_to <= info.last_complete);
 
     dout(10) << "trim " << log << " to " << trim_to << dendl;
-    log.trim(trim_to, &trimmed);
+    log.trim(t, handler, trim_to, &trimmed);
     info.log_tail = log.tail;
   }
 }
@@ -251,7 +260,9 @@ void PGLog::proc_replica_log(ObjectStore::Transaction& t,
  *
  * return true if entry is not divergent.
  */
-bool PGLog::merge_old_entry(ObjectStore::Transaction& t, const pg_log_entry_t& oe, const pg_info_t& info, list<hobject_t>& remove_snap)
+bool PGLog::merge_old_entry(
+  ObjectStore::Transaction& t, const pg_log_entry_t& oe,
+  const pg_info_t& info, LogEntryHandler *rollbacker)
 {
   if (oe.soid > info.last_backfill) {
     dout(20) << "merge_old_entry  had " << oe << " : beyond last_backfill" << dendl;
@@ -294,9 +305,17 @@ bool PGLog::merge_old_entry(ObjectStore::Transaction& t, const pg_log_entry_t& o
     dout(20) << "merge_old_entry  had " << oe
 	     << ", clone with no non-divergent log entries, "
 	     << "deleting" << dendl;
-    remove_snap.push_back(oe.soid);
-    if (missing.is_missing(oe.soid))
+    if (missing.is_missing(oe.soid)) {
       missing.rm(oe.soid, missing.missing[oe.soid].need);
+    }
+
+    if (oe.mod_desc.can_rollback() && oe.version > log.can_rollback_to) {
+      dout(20) << __func__ << ": rolling back " << oe << dendl;
+      rollbacker->rollback(&t, oe);
+    } else {
+      dout(20) << __func__ << ": had " << oe << " deleting" << dendl;
+      rollbacker->remove(&t, oe.soid);
+    }
   } else if (oe.prior_version > info.log_tail) {
     /**
      * oe.prior_version is a previously divergent log entry
@@ -308,17 +327,22 @@ bool PGLog::merge_old_entry(ObjectStore::Transaction& t, const pg_log_entry_t& o
 	     << " oe.soid " << oe.soid
 	     << " must already have been merged" << dendl;
   } else {
-    if (!oe.is_delete()) {
-      dout(20) << "merge_old_entry  had " << oe << " deleting" << dendl;
-      remove_snap.push_back(oe.soid);
-    }
-    dout(20) << "merge_old_entry  had " << oe << " updating missing to "
-	     << oe.prior_version << dendl;
-    if (oe.prior_version > eversion_t()) {
-      add_divergent_prior(oe.prior_version, oe.soid);
-      missing.revise_need(oe.soid, oe.prior_version);
-    } else if (missing.is_missing(oe.soid)) {
-      missing.rm(oe.soid, missing.missing[oe.soid].need);
+    if (oe.mod_desc.can_rollback() && oe.version > log.can_rollback_to) {
+      dout(20) << __func__ << ": rolling back " << oe << dendl;
+      rollbacker->rollback(&t, oe);
+    } else {
+      if (!oe.is_delete()) {
+	rollbacker->remove(&t, oe.soid);
+	dout(20) << __func__ << ": had " << oe << " deleting" << dendl;
+      }
+      dout(20) << "merge_old_entry  had " << oe << " updating missing to "
+	       << oe.prior_version << dendl;
+      if (oe.prior_version > eversion_t()) {
+	add_divergent_prior(oe.prior_version, oe.soid);
+	missing.revise_need(oe.soid, oe.prior_version);
+      } else if (missing.is_missing(oe.soid)) {
+	missing.rm(oe.soid, missing.missing[oe.soid].need);
+      }
     }
   }
   return false;
@@ -334,8 +358,8 @@ bool PGLog::merge_old_entry(ObjectStore::Transaction& t, const pg_log_entry_t& o
  * @param newhead new head to rewind to
  */
 void PGLog::rewind_divergent_log(ObjectStore::Transaction& t, eversion_t newhead,
-                      pg_info_t &info, list<hobject_t>& remove_snap,
-                      bool &dirty_info, bool &dirty_big_info)
+				 pg_info_t &info, LogEntryHandler *rollbacker,
+				 bool &dirty_info, bool &dirty_big_info)
 {
   dout(10) << "rewind_divergent_log truncate divergent future " << newhead << dendl;
   assert(newhead > log.tail);
@@ -361,12 +385,18 @@ void PGLog::rewind_divergent_log(ObjectStore::Transaction& t, eversion_t newhead
 
   log.head = newhead;
   info.last_update = newhead;
+  if (info.last_update < log.can_rollback_to)
+    log.can_rollback_to = info.last_update;
   if (info.last_complete > newhead)
     info.last_complete = newhead;
 
   log.index();
-  for (list<pg_log_entry_t>::iterator d = divergent.begin(); d != divergent.end(); ++d)
-    merge_old_entry(t, *d, info, remove_snap);
+  for (list<pg_log_entry_t>::iterator d = divergent.begin();
+       d != divergent.end();
+       ++d) {
+    merge_old_entry(t, *d, info, rollbacker);
+    rollbacker->trim(&t, *d);
+  }
 
   dirty_info = true;
   dirty_big_info = true;
@@ -374,7 +404,7 @@ void PGLog::rewind_divergent_log(ObjectStore::Transaction& t, eversion_t newhead
 
 void PGLog::merge_log(ObjectStore::Transaction& t,
                       pg_info_t &oinfo, pg_log_t &olog, int fromosd,
-                      pg_info_t &info, list<hobject_t>& remove_snap,
+                      pg_info_t &info, LogEntryHandler *rollbacker,
                       bool &dirty_info, bool &dirty_big_info)
 {
   dout(10) << "merge_log " << olog << " from osd." << fromosd
@@ -431,7 +461,7 @@ void PGLog::merge_log(ObjectStore::Transaction& t,
 
   // do we have divergent entries to throw out?
   if (olog.head < log.head) {
-    rewind_divergent_log(t, olog.head, info, remove_snap, dirty_info, dirty_big_info);
+    rewind_divergent_log(t, olog.head, info, rollbacker, dirty_info, dirty_big_info);
     changed = true;
   }
 
@@ -465,7 +495,7 @@ void PGLog::merge_log(ObjectStore::Transaction& t,
       if (ne.soid <= info.last_backfill) {
 	missing.add_next_event(ne);
 	if (ne.is_delete())
-	  remove_snap.push_back(ne.soid);
+	  rollbacker->remove(&t, ne.soid);
       }
     }
       
@@ -494,13 +524,19 @@ void PGLog::merge_log(ObjectStore::Transaction& t,
     log.index();   
 
     info.last_update = log.head = olog.head;
+
+    // We cannot rollback into the new log entries
+    log.can_rollback_to = log.head;
+
     info.last_user_version = oinfo.last_user_version;
     info.purged_snaps = oinfo.purged_snaps;
 
     // process divergent items
-    if (!divergent.empty()) {
-      for (list<pg_log_entry_t>::iterator d = divergent.begin(); d != divergent.end(); ++d)
-	merge_old_entry(t, *d, info, remove_snap);
+    for (list<pg_log_entry_t>::iterator d = divergent.begin();
+	 d != divergent.end();
+	 ++d) {
+      merge_old_entry(t, *d, info, rollbacker);
+      rollbacker->trim(&t, *d);
     }
 
     changed = true;

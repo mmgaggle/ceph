@@ -611,6 +611,67 @@ public:
   void proc_master_log(ObjectStore::Transaction& t, pg_info_t &oinfo, pg_log_t &olog,
 		       pg_missing_t& omissing, int from);
   bool proc_replica_info(int from, const pg_info_t &info);
+
+
+  struct LogEntryTrimmer : public ObjectModDesc::Visitor {
+    const hobject_t &soid;
+    PG *pg;
+    ObjectStore::Transaction *t;
+    LogEntryTrimmer(const hobject_t &soid, PG *pg, ObjectStore::Transaction *t)
+      : soid(soid), pg(pg), t(t) {}
+    void rmobject(version_t old_version) {
+      pg->get_pgbackend()->trim_stashed_object(
+	soid,
+	old_version,
+	t);
+    }
+  };
+
+  struct SnapRollBacker : public ObjectModDesc::Visitor {
+    const hobject_t &soid;
+    PG *pg;
+    ObjectStore::Transaction *t;
+    SnapRollBacker(const hobject_t &soid, PG *pg, ObjectStore::Transaction *t)
+      : soid(soid), pg(pg), t(t) {}
+    void update_snaps(set<snapid_t> &snaps) {
+      pg->update_object_snap_mapping(t, soid, snaps);
+    }
+    void create() {
+      pg->clear_object_snap_mapping(
+	t,
+	soid);
+    }
+  };
+
+  struct PGLogEntryHandler : public PGLog::LogEntryHandler {
+    PG *pg;
+    PGLogEntryHandler(PG *pg) : pg(pg) {}
+    
+    // LogEntryHandler
+    void remove(ObjectStore::Transaction *t, const hobject_t &hoid) {
+      pg->get_pgbackend()->rollback_create(hoid, t);
+      pg->remove_snap_mapped_object(*t, hoid);
+    }
+    void rollback(ObjectStore::Transaction *t, const pg_log_entry_t &entry) {
+      assert(entry.mod_desc.can_rollback());
+      pg->get_pgbackend()->rollback(entry.soid, entry.mod_desc, t);
+      SnapRollBacker rollbacker(entry.soid, pg, t);
+      entry.mod_desc.visit(&rollbacker);
+    }
+    void trim(ObjectStore::Transaction *t, const pg_log_entry_t &entry) {
+      LogEntryTrimmer trimmer(entry.soid, pg, t);
+      entry.mod_desc.visit(&trimmer);
+    }
+  };
+  
+  friend struct SnapRollBacker;
+  friend struct PGLogEntryHandler;
+  friend struct LogEntryTrimmer;
+  void update_object_snap_mapping(
+    ObjectStore::Transaction *t, const hobject_t &soid,
+    const set<snapid_t> &snaps);
+  void clear_object_snap_mapping(
+    ObjectStore::Transaction *t, const hobject_t &soid);
   void remove_snap_mapped_object(
     ObjectStore::Transaction& t, const hobject_t& soid);
   void merge_log(ObjectStore::Transaction& t, pg_info_t &oinfo, pg_log_t &olog, int from);

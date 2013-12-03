@@ -402,7 +402,7 @@ public:
     t->remove(coll, hoid);
     t->collection_move_rename(
       coll,
-      ghobject_t(hoid, old_version, ghobject_t::NO_SHARD),
+      ghobject_t(hoid, old_version, 0),
       coll,
       hoid);
   }
@@ -412,6 +412,14 @@ public:
     ObjectStore::Transaction *t) {
     t->remove(coll, hoid);
   }
+
+  void trim_stashed_object(
+    const hobject_t &hoid,
+    version_t old_version,
+    ObjectStore::Transaction *t) {
+    t->remove(coll, ghobject_t(hoid, old_version, 0));
+  }
+
 private:
   void issue_op(
     const hobject_t &soid,

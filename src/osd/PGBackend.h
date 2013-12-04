@@ -244,6 +244,10 @@
        uint64_t len,          ///< [in] len to write from bl
        bufferlist &bl         ///< [in] bl to write will be claimed to len
        ) = 0;
+     virtual void stash(
+       const hobject_t &hoid,   ///< [in] obj to remove
+       version_t former_version ///< [in] former object version
+       ) = 0;
      virtual void remove(
        const hobject_t &hoid ///< [in] obj to remove
        ) = 0;

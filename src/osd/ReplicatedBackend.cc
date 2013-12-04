@@ -345,6 +345,13 @@ public:
     ) {
     t->remove(get_coll_rm(hoid), hoid);
   }
+  void stash(
+    const hobject_t &hoid,
+    version_t former_version) {
+    t->collection_move_rename(
+      coll, hoid, coll,
+      ghobject_t(hoid, former_version, 0));
+  }
   void setattrs(
     const hobject_t &hoid,
     map<string, bufferlist> &attrs

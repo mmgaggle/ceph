@@ -1913,7 +1913,6 @@ ReplicatedPG::RepGather *ReplicatedPG::trim_object(const hobject_t &coid)
     // remove clone
     dout(10) << coid << " snaps " << old_snaps << " -> "
 	     << new_snaps << " ... deleting" << dendl;
-    t->remove(coid);
 
     // ...from snapset
     snapid_t last = coid.snap;
@@ -1957,6 +1956,20 @@ ReplicatedPG::RepGather *ReplicatedPG::trim_object(const hobject_t &coid)
 	osd_reqid_t(),
 	ctx->mtime)
       );
+    if (pool.info.ec_pool()) {
+      set<snapid_t> snaps(
+	ctx->obc->obs.oi.snaps.begin(),
+	ctx->obc->obs.oi.snaps.end());
+      ctx->log.back().mod_desc.update_snaps(snaps);
+      if (ctx->log.back().mod_desc.rmobject(ctx->at_version.version)) {
+	t->stash(coid, ctx->at_version.version);
+      } else {
+	t->remove(coid);
+      }
+    } else {
+      t->remove(coid);
+      ctx->log.back().mod_desc.mark_unrollbackable();
+    }
     ctx->at_version.version++;
   } else {
     // save adjusted snaps for this object
@@ -1980,6 +1993,18 @@ ReplicatedPG::RepGather *ReplicatedPG::trim_object(const hobject_t &coid)
 	osd_reqid_t(),
 	ctx->mtime)
       );
+    if (pool.info.ec_pool()) {
+      set<string> changing;
+      changing.insert(OI_ATTR);
+      ctx->obc->fill_in_setattrs(changing, &(ctx->log.back().mod_desc));
+      set<snapid_t> snaps(
+	ctx->obc->obs.oi.snaps.begin(),
+	ctx->obc->obs.oi.snaps.end());
+      ctx->log.back().mod_desc.update_snaps(snaps);
+    } else {
+      ctx->log.back().mod_desc.mark_unrollbackable();
+    }
+    
     ::encode(coi.snaps, ctx->log.back().snaps);
     ctx->at_version.version++;
   }
@@ -2005,9 +2030,19 @@ ReplicatedPG::RepGather *ReplicatedPG::trim_object(const hobject_t &coid)
 	osd_reqid_t(),
 	ctx->mtime)
       );
-    ctx->snapset_obc->obs.exists = false;
 
-    t->remove(snapoid);
+    ctx->snapset_obc->obs.exists = false;
+    
+    if (pool.info.ec_pool()) {
+      if (ctx->log.back().mod_desc.rmobject(ctx->at_version.version)) {
+	t->stash(snapoid, ctx->at_version.version);
+      } else {
+	t->remove(snapoid);
+      }
+    } else {
+      t->remove(snapoid);
+      ctx->log.back().mod_desc.mark_unrollbackable();
+    }
   } else {
     dout(10) << coid << " updating snapset on " << snapoid << dendl;
     ctx->log.push_back(
@@ -2032,6 +2067,15 @@ ReplicatedPG::RepGather *ReplicatedPG::trim_object(const hobject_t &coid)
     bl.clear();
     ::encode(ctx->snapset_obc->obs.oi, bl);
     setattr_maybe_cache(ctx->snapset_obc, ctx, t, OI_ATTR, bl);
+
+    if (pool.info.ec_pool()) {
+      set<string> changing;
+      changing.insert(OI_ATTR);
+      changing.insert(SS_ATTR);
+      ctx->snapset_obc->fill_in_setattrs(changing, &(ctx->log.back().mod_desc));
+    } else {
+      ctx->log.back().mod_desc.mark_unrollbackable();
+    }
   }
 
   return repop;
@@ -2528,6 +2572,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
     /* map extents */
     case CEPH_OSD_OP_MAPEXT:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_read;
       {
 	// read into a buffer
@@ -2544,6 +2592,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
     /* map extents */
     case CEPH_OSD_OP_SPARSE_READ:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_read;
       {
         if (op.extent.truncate_seq) {
@@ -3022,6 +3074,19 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -EINVAL;
 	  break;
 	}
+
+	if (!obs.exists) {
+	  ctx->mod_desc.create();
+	} else if (op.extent.offset == oi.size) {
+	  ctx->mod_desc.append(oi.size);
+	} else {
+	  ctx->mod_desc.mark_unrollbackable();
+	  if (pool.info.ec_pool()) {
+	    result = -EOPNOTSUPP;
+	    break;
+	  }
+	}
+
         __u32 seq = oi.truncate_seq;
         if (seq && (seq > op.extent.truncate_seq) &&
             (op.extent.offset + op.extent.length > oi.size)) {
@@ -3076,13 +3141,31 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	result = check_offset_and_length(op.extent.offset, op.extent.length, cct->_conf->osd_max_object_size);
 	if (result < 0)
 	  break;
-	if (obs.exists) {
-	  t->truncate(soid, 0);
+
+	if (pool.info.ec_pool()) {
+	  if (obs.exists) {
+	    if (ctx->mod_desc.rmobject(oi.version.version)) {
+	      t->stash(soid, oi.version.version);
+	    } else {
+	      t->remove(soid);
+	    }
+	  }
+	  ctx->mod_desc.create();
+	  t->write(soid, op.extent.offset, op.extent.length, osd_op.indata);
+	  if (obs.exists) {
+	    t->setattrs(soid, ctx->obc->attr_cache);
+	  }
 	} else {
+	  ctx->mod_desc.mark_unrollbackable();
+	  if (obs.exists) {
+	    t->truncate(soid, 0);
+	  }
+	  t->write(soid, op.extent.offset, op.extent.length, osd_op.indata);
+	}
+	if (!obs.exists) {
 	  ctx->delta_stats.num_objects++;
 	  obs.exists = true;
 	}
-	t->write(soid, op.extent.offset, op.extent.length, osd_op.indata);
 	interval_set<uint64_t> ch;
 	if (oi.size > 0)
 	  ch.insert(0, oi.size);
@@ -3103,6 +3186,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_ZERO:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_write;
       { // zero
 	result = check_offset_and_length(op.extent.offset, op.extent.length, cct->_conf->osd_max_object_size);
@@ -3110,6 +3197,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  break;
 	assert(op.extent.length);
 	if (obs.exists) {
+	  ctx->mod_desc.mark_unrollbackable();
 	  t->zero(soid, op.extent.offset, op.extent.length);
 	  interval_set<uint64_t> ch;
 	  ch.insert(op.extent.offset, op.extent.length);
@@ -3147,6 +3235,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	    }
 	  }
 	  if (result >= 0 && !obs.exists) {
+	    ctx->mod_desc.create();
 	    t->touch(soid);
 	    ctx->delta_stats.num_objects++;
 	    obs.exists = true;
@@ -3161,6 +3250,11 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
     case CEPH_OSD_OP_TRUNCATE:
       ++ctx->num_write;
+      ctx->mod_desc.mark_unrollbackable();
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       {
 	// truncate
 	if (!obs.exists) {
@@ -3213,6 +3307,11 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_CLONERANGE:
+      ctx->mod_desc.mark_unrollbackable();
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_read;
       ++ctx->num_write;
       {
@@ -3291,6 +3390,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  break;
 	}
 	if (!obs.exists) {
+	  ctx->mod_desc.create();
 	  t->touch(soid);
 	  ctx->delta_stats.num_objects++;
 	  obs.exists = true;
@@ -3298,6 +3398,19 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	string aname;
 	bp.copy(op.xattr.name_len, aname);
 	string name = "_" + aname;
+	if (pool.info.ec_pool()) {
+	  map<string, boost::optional<bufferlist> > to_set;
+	  bufferlist old;
+	  int r = getattr_maybe_cache(ctx->obc, name, &old);
+	  if (r == 0) {
+	    to_set[name] = old;
+	  } else {
+	    to_set[name];
+	  }
+	  ctx->mod_desc.setattrs(to_set);
+	} else {
+	  ctx->mod_desc.mark_unrollbackable();
+	}
 	bufferlist bl;
 	bp.copy(op.xattr.value_len, bl);
 	setattr_maybe_cache(ctx->obc, ctx, t, name, bl);
@@ -3311,6 +3424,19 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	string aname;
 	bp.copy(op.xattr.name_len, aname);
 	string name = "_" + aname;
+	if (pool.info.ec_pool()) {
+	  map<string, boost::optional<bufferlist> > to_set;
+	  bufferlist old;
+	  int r = getattr_maybe_cache(ctx->obc, name, &old);
+	  if (r == 0) {
+	    to_set[name] = old;
+	  } else {
+	    to_set[name];
+	  }
+	  ctx->mod_desc.setattrs(to_set);
+	} else {
+	  ctx->mod_desc.mark_unrollbackable();
+	}
 	rmattr_maybe_cache(ctx->obc, ctx, t, name);
  	ctx->delta_stats.num_wr++;
       }
@@ -3416,6 +3542,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
       // OMAP Read ops
     case CEPH_OSD_OP_OMAPGETKEYS:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_read;
       {
 	string start_after;
@@ -3449,6 +3579,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_OMAPGETVALS:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_read;
       {
 	string start_after;
@@ -3490,6 +3624,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_OMAPGETHEADER:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_read;
       {
 	osd->store->omap_get_header(coll, soid, &osd_op.outdata);
@@ -3499,6 +3637,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_OMAPGETVALSBYKEYS:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_read;
       {
 	set<string> keys_to_get;
@@ -3518,6 +3660,10 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_OMAP_CMP:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
       ++ctx->num_read;
       {
 	if (!obs.exists) {
@@ -3585,6 +3731,11 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
       // OMAP Write ops
     case CEPH_OSD_OP_OMAPSETVALS:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
+      ctx->mod_desc.mark_unrollbackable();
       ++ctx->num_write;
       {
 	if (!obs.exists) {
@@ -3612,6 +3763,11 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_OMAPSETHEADER:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
+      ctx->mod_desc.mark_unrollbackable();
       ++ctx->num_write;
       {
 	if (!obs.exists) {
@@ -3625,6 +3781,11 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_OMAPCLEAR:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
+      ctx->mod_desc.mark_unrollbackable();
       ++ctx->num_write;
       {
 	if (!obs.exists) {
@@ -3638,6 +3799,11 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       break;
 
     case CEPH_OSD_OP_OMAPRMKEYS:
+      if (pool.info.ec_pool()) {
+	result = -EOPNOTSUPP;
+	break;
+      }
+      ctx->mod_desc.mark_unrollbackable();
       ++ctx->num_write;
       {
 	if (!obs.exists) {
@@ -3764,8 +3930,17 @@ inline int ReplicatedPG::_delete_head(OpContext *ctx)
 
   if (!obs.exists)
     return -ENOENT;
-  
-  t->remove(soid);
+
+  if (pool.info.ec_pool()) {
+    if (ctx->mod_desc.rmobject(oi.version.version)) {
+      t->stash(soid, oi.version.version);
+    } else {
+      t->remove(soid);
+    }
+  } else {
+    ctx->mod_desc.mark_unrollbackable();
+    t->remove(soid);
+  }
 
   if (oi.size > 0) {
     interval_set<uint64_t> ch;
@@ -3843,9 +4018,21 @@ int ReplicatedPG::_rollback_to(OpContext *ctx, ceph_osd_op& op)
       dout(10) << "_rollback_to deleting " << soid.oid
 	       << " and rolling back to old snap" << dendl;
 
-      if (obs.exists)
-	t->remove(soid);
-      
+      if (pool.info.ec_pool()) {
+	if (obs.exists) {
+	  if (ctx->mod_desc.rmobject(oi.version.version)) {
+	    t->stash(soid, oi.version.version);
+	  } else {
+	    t->remove(soid);
+	  }
+	}
+      } else {
+	if (obs.exists) {
+	  ctx->mod_desc.mark_unrollbackable();
+	  t->remove(soid);
+	}
+      }
+      ctx->mod_desc.create();
       t->clone(rollback_to_sobject, soid);
       snapset.head_exists = true;
 
@@ -3979,6 +4166,7 @@ void ReplicatedPG::make_writeable(OpContext *ctx)
 				      ctx->obs->oi.user_version,
 				      osd_reqid_t(), ctx->new_obs.oi.mtime));
     ::encode(snaps, ctx->log.back().snaps);
+    ctx->log.back().mod_desc.create();
 
     ctx->at_version.version++;
   }
@@ -4186,11 +4374,20 @@ int ReplicatedPG::prepare_transaction(OpContext *ctx)
 
       ctx->snapset_obc = get_object_context(snapoid, false);
       if (ctx->snapset_obc && ctx->snapset_obc->obs.exists) {
-	ctx->op_t->remove(snapoid);
-	dout(10) << " removing old " << snapoid << dendl;
-
 	ctx->log.push_back(pg_log_entry_t(pg_log_entry_t::DELETE, snapoid, ctx->at_version, old_version,
 					  0, osd_reqid_t(), ctx->mtime));
+	if (pool.info.ec_pool()) {
+	  if (ctx->log.back().mod_desc.rmobject(ctx->at_version.version)) {
+	    ctx->op_t->stash(snapoid, ctx->at_version.version);
+	  } else {
+	    ctx->op_t->remove(snapoid);
+	  }
+	} else {
+	  ctx->op_t->remove(snapoid);
+	  ctx->log.back().mod_desc.mark_unrollbackable();
+	}
+	dout(10) << " removing old " << snapoid << dendl;
+
  	ctx->at_version.version++;
 
 	ctx->snapset_obc->obs.exists = false;
@@ -4206,6 +4403,11 @@ int ReplicatedPG::prepare_transaction(OpContext *ctx)
 				      0, osd_reqid_t(), ctx->mtime));
 
     ctx->snapset_obc = get_object_context(snapoid, true);
+    if (pool.info.ec_pool() && !ctx->snapset_obc->obs.exists) {
+      ctx->log.back().mod_desc.create();
+    } else if (!pool.info.ec_pool()) {
+      ctx->log.back().mod_desc.mark_unrollbackable();
+    }
     ctx->snapset_obc->obs.exists = true;
     ctx->snapset_obc->obs.oi.version = ctx->at_version;
     ctx->snapset_obc->obs.oi.last_reqid = ctx->reqid;
@@ -4216,6 +4418,14 @@ int ReplicatedPG::prepare_transaction(OpContext *ctx)
     ctx->op_t->touch(snapoid);
     setattr_maybe_cache(ctx->snapset_obc, ctx, ctx->op_t, OI_ATTR, bv);
     setattr_maybe_cache(ctx->snapset_obc, ctx, ctx->op_t, SS_ATTR, bss);
+    if (pool.info.ec_pool()) {
+      map<string, boost::optional<bufferlist> > to_set;
+      to_set[SS_ATTR] = bv;
+      to_set[OI_ATTR] = bss;
+      ctx->log.back().mod_desc.setattrs(to_set);
+    } else {
+      ctx->log.back().mod_desc.mark_unrollbackable();
+    }
     ctx->at_version.version++;
   }
 
@@ -4252,6 +4462,13 @@ int ReplicatedPG::prepare_transaction(OpContext *ctx)
     dout(10) << " final snapset " << ctx->new_snapset
 	     << " in " << soid << dendl;
     setattr_maybe_cache(ctx->obc, ctx, ctx->op_t, SS_ATTR, bss);
+
+    if (pool.info.ec_pool()) {
+      set<string> changing;
+      changing.insert(OI_ATTR);
+      changing.insert(SS_ATTR);
+      ctx->obc->fill_in_setattrs(changing, &(ctx->mod_desc));
+    }
   }
 
   // append to log
@@ -4260,6 +4477,7 @@ int ReplicatedPG::prepare_transaction(OpContext *ctx)
     logopcode = pg_log_entry_t::DELETE;
   ctx->log.push_back(pg_log_entry_t(logopcode, soid, ctx->at_version, old_version,
 				ctx->user_at_version, ctx->reqid, ctx->mtime));
+  ctx->log.back().mod_desc.claim(ctx->mod_desc);
 
   // apply new object state.
   ctx->obc->obs = ctx->new_obs;
@@ -4864,6 +5082,15 @@ void ReplicatedPG::issue_repop(RepGather *repop, utime_t now)
 
   repop->ctx->apply_pending_attrs();
 
+  if (pool.info.ec_pool()) {
+    for (vector<pg_log_entry_t>::iterator i = repop->ctx->log.begin();
+	 i != repop->ctx->log.end();
+	 ++i) {
+      assert(i->mod_desc.can_rollback());
+      assert(!i->mod_desc.empty());
+    }
+  }
+
   Context *on_all_commit = new C_OSD_RepopCommit(this, repop);
   Context *on_all_applied = new C_OSD_RepopApplied(this, repop);
   Context *onapplied_sync = new C_OSD_OndiskWriteUnlock(
@@ -5150,6 +5377,14 @@ void ReplicatedPG::handle_watch_timeout(WatchRef watch)
   bufferlist bl;
   ::encode(obc->obs.oi, bl);
   setattr_maybe_cache(obc, repop->ctx, t, OI_ATTR, bl);
+
+  if (pool.info.ec_pool()) {
+    map<string, boost::optional<bufferlist> > to_set;
+    to_set[OI_ATTR] = bl;
+    ctx->log.back().mod_desc.setattrs(to_set);
+  } else {
+    ctx->log.back().mod_desc.mark_unrollbackable();
+  }
 
   // obc ref swallowed by repop!
   issue_repop(repop, repop->ctx->mtime);

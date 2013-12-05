@@ -35,6 +35,23 @@ public:
   }
 };
 
+struct TestHandler : public PGLog::LogEntryHandler {
+  list<hobject_t> &removed;
+  TestHandler(list<hobject_t> &removed) : removed(removed) {}
+
+  void rollback(
+    ObjectStore::Transaction *t,
+    const pg_log_entry_t &entry) {}
+  void remove(
+    ObjectStore::Transaction *t,
+    const hobject_t &hoid) {
+    removed.push_back(hoid);
+  }
+  void trim(
+    ObjectStore::Transaction *t,
+    const pg_log_entry_t &entry) {}
+};
+
 TEST_F(PGLogTest, rewind_divergent_log) {
   // newhead > log.tail : throw an assert
   {
@@ -47,7 +64,8 @@ TEST_F(PGLogTest, rewind_divergent_log) {
     bool dirty_big_info = false;
 
     log.tail = eversion_t(2, 1);
-    EXPECT_THROW(rewind_divergent_log(t, eversion_t(1, 1), info, remove_snap,
+    TestHandler h(remove_snap);
+    EXPECT_THROW(rewind_divergent_log(t, eversion_t(1, 1), info, &h,
 				      dirty_info, dirty_big_info),
 		 FailedAssertion);
   }
@@ -88,6 +106,7 @@ TEST_F(PGLogTest, rewind_divergent_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.hash = 0x5;
@@ -119,7 +138,8 @@ TEST_F(PGLogTest, rewind_divergent_log) {
     EXPECT_FALSE(dirty_info);
     EXPECT_FALSE(dirty_big_info);
 
-    rewind_divergent_log(t, newhead, info, remove_snap,
+    TestHandler h(remove_snap);
+    rewind_divergent_log(t, newhead, info, &h,
 			 dirty_info, dirty_big_info);
 
     EXPECT_TRUE(log.objects.count(divergent));
@@ -165,6 +185,7 @@ TEST_F(PGLogTest, rewind_divergent_log) {
     eversion_t newhead;
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       info.log_tail = log.tail = eversion_t(1, 1);
       newhead = eversion_t(1, 3);
@@ -185,7 +206,8 @@ TEST_F(PGLogTest, rewind_divergent_log) {
     EXPECT_FALSE(dirty_info);
     EXPECT_FALSE(dirty_big_info);
 
-    rewind_divergent_log(t, newhead, info, remove_snap,
+    TestHandler h(remove_snap);
+    rewind_divergent_log(t, newhead, info, &h,
 			 dirty_info, dirty_big_info);
 
     EXPECT_TRUE(missing.is_missing(divergent_object));
@@ -206,6 +228,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -219,7 +242,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_FALSE(missing.have_missing());
     EXPECT_TRUE(log.empty());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_FALSE(is_dirty());
     EXPECT_TRUE(remove_snap.empty());
@@ -234,13 +258,15 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
     oe.op = pg_log_entry_t::CLONE;
 
     oe.soid.snap = CEPH_NOSNAP;
-    EXPECT_THROW(merge_old_entry(t, oe, info, remove_snap), FailedAssertion);
+    TestHandler h(remove_snap);
+    EXPECT_THROW(merge_old_entry(t, oe, info, &h), FailedAssertion);
     oe.soid.snap = 1U;
     missing.add(oe.soid, eversion_t(), eversion_t());
 
@@ -251,7 +277,7 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_TRUE(missing.is_missing(oe.soid));
     EXPECT_TRUE(log.empty());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_FALSE(is_dirty());
     EXPECT_EQ(oe.soid, remove_snap.front());
@@ -267,6 +293,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -279,7 +306,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_FALSE(missing.have_missing());
     EXPECT_EQ(1U, log.log.size());
 
-    EXPECT_TRUE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_TRUE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_FALSE(is_dirty());
     EXPECT_TRUE(remove_snap.empty());
@@ -299,6 +327,7 @@ TEST_F(PGLogTest, merge_old_entry) {
     list<hobject_t> remove_snap;
 
     pg_log_entry_t ne;
+    ne.mod_desc.mark_unrollbackable();
     ne.version = eversion_t(2,1);
     log.add(ne);
 
@@ -313,9 +342,11 @@ TEST_F(PGLogTest, merge_old_entry) {
     {
       log.log.front().op = pg_log_entry_t::DELETE;
       pg_log_entry_t oe;
+      oe.mod_desc.mark_unrollbackable();
       oe.version = eversion_t(1,1);
 
-      EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+      TestHandler h(remove_snap);
+      EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
     }
 
     // if the newer entry is not DELETE, the object must be in missing
@@ -324,9 +355,11 @@ TEST_F(PGLogTest, merge_old_entry) {
       ne.op = pg_log_entry_t::MODIFY;
       missing.add_next_event(ne);
       pg_log_entry_t oe;
+      oe.mod_desc.mark_unrollbackable();
       oe.version = eversion_t(1,1);
 
-      EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+      TestHandler h(remove_snap);
+      EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
       missing.rm(ne.soid, ne.version);
     }
@@ -336,9 +369,10 @@ TEST_F(PGLogTest, merge_old_entry) {
       pg_log_entry_t &ne = log.log.front();
       ne.op = pg_log_entry_t::MODIFY;
       pg_log_entry_t oe;
+      oe.mod_desc.mark_unrollbackable();
       oe.version = eversion_t(1,1);
-
-      EXPECT_THROW(merge_old_entry(t, oe, info, remove_snap), FailedAssertion);
+      TestHandler h(remove_snap);
+      EXPECT_THROW(merge_old_entry(t, oe, info, &h), FailedAssertion);
     }
 
     EXPECT_FALSE(is_dirty());
@@ -358,10 +392,12 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
     pg_log_entry_t ne;
+    ne.mod_desc.mark_unrollbackable();
     ne.version = eversion_t(1,1);
     ne.op = pg_log_entry_t::DELETE;
     log.add(ne);
@@ -375,7 +411,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_FALSE(missing.have_missing());
     EXPECT_EQ(1U, log.log.size());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_FALSE(is_dirty());
     EXPECT_TRUE(remove_snap.empty());
@@ -399,10 +436,12 @@ TEST_F(PGLogTest, merge_old_entry) {
 
       ObjectStore::Transaction t;
       pg_log_entry_t oe;
+      oe.mod_desc.mark_unrollbackable();
       pg_info_t info;
       list<hobject_t> remove_snap;
 
       pg_log_entry_t ne;
+      ne.mod_desc.mark_unrollbackable();
       ne.version = eversion_t(1,1);
       ne.op = pg_log_entry_t::MODIFY;
       log.add(ne);
@@ -419,7 +458,8 @@ TEST_F(PGLogTest, merge_old_entry) {
       eversion_t old_version(0, 0);
       // if the object is not already in missing, add it
       {
-        EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+	TestHandler h(remove_snap);
+        EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
         EXPECT_TRUE(missing.is_missing(ne.soid, ne.version));
         EXPECT_FALSE(missing.is_missing(ne.soid, old_version));
@@ -429,7 +469,8 @@ TEST_F(PGLogTest, merge_old_entry) {
         missing.revise_need(ne.soid, old_version);
         EXPECT_TRUE(missing.is_missing(ne.soid, old_version));
 
-        EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+	TestHandler h(remove_snap);
+        EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
         EXPECT_TRUE(missing.is_missing(ne.soid, ne.version));
         EXPECT_FALSE(missing.is_missing(ne.soid, old_version));
@@ -452,10 +493,12 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
     pg_log_entry_t ne;
+    ne.mod_desc.mark_unrollbackable();
     ne.version = eversion_t(1,1);
     ne.op = pg_log_entry_t::DELETE;
     log.add(ne);
@@ -470,7 +513,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_TRUE(missing.is_missing(oe.soid));
     EXPECT_EQ(1U, log.log.size());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_FALSE(is_dirty());
     EXPECT_TRUE(remove_snap.empty());
@@ -488,6 +532,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -501,7 +546,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_FALSE(missing.have_missing());
     EXPECT_TRUE(log.empty());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_FALSE(is_dirty());
     EXPECT_TRUE(remove_snap.empty());
@@ -523,6 +569,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -537,7 +584,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_FALSE(missing.have_missing());
     EXPECT_TRUE(log.empty());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_TRUE(is_dirty());
     EXPECT_EQ(oe.soid, remove_snap.front());
@@ -559,6 +607,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -573,7 +622,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_FALSE(missing.have_missing());
     EXPECT_TRUE(log.empty());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_TRUE(is_dirty());
     EXPECT_TRUE(remove_snap.empty());
@@ -594,6 +644,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -610,7 +661,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_TRUE(missing.is_missing(oe.soid));
     EXPECT_TRUE(log.empty());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_FALSE(is_dirty());
     EXPECT_TRUE(remove_snap.empty());
@@ -631,6 +683,7 @@ TEST_F(PGLogTest, merge_old_entry) {
 
     ObjectStore::Transaction t;
     pg_log_entry_t oe;
+    oe.mod_desc.mark_unrollbackable();
     pg_info_t info;
     list<hobject_t> remove_snap;
 
@@ -647,7 +700,8 @@ TEST_F(PGLogTest, merge_old_entry) {
     EXPECT_TRUE(missing.is_missing(oe.soid));
     EXPECT_TRUE(log.empty());
 
-    EXPECT_FALSE(merge_old_entry(t, oe, info, remove_snap));
+    TestHandler h(remove_snap);
+    EXPECT_FALSE(merge_old_entry(t, oe, info, &h));
 
     EXPECT_FALSE(is_dirty());
     EXPECT_EQ(oe.soid, remove_snap.front());
@@ -691,7 +745,8 @@ TEST_F(PGLogTest, merge_log) {
     EXPECT_FALSE(dirty_info);
     EXPECT_FALSE(dirty_big_info);
 
-    merge_log(t, oinfo, olog, fromosd, info, remove_snap,
+    TestHandler h(remove_snap);
+    merge_log(t, oinfo, olog, fromosd, info, &h,
               dirty_info, dirty_big_info);
 
     EXPECT_FALSE(missing.have_missing());
@@ -742,7 +797,8 @@ TEST_F(PGLogTest, merge_log) {
     EXPECT_FALSE(dirty_info);
     EXPECT_FALSE(dirty_big_info);
 
-    merge_log(t, oinfo, olog, fromosd, info, remove_snap,
+    TestHandler h(remove_snap);
+    merge_log(t, oinfo, olog, fromosd, info, &h,
               dirty_info, dirty_big_info);
 
     EXPECT_FALSE(missing.have_missing());
@@ -808,6 +864,7 @@ TEST_F(PGLogTest, merge_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 4);
       e.soid.hash = 0x5;
@@ -847,7 +904,8 @@ TEST_F(PGLogTest, merge_log) {
     EXPECT_FALSE(dirty_info);
     EXPECT_FALSE(dirty_big_info);
 
-    merge_log(t, oinfo, olog, fromosd, info, remove_snap,
+    TestHandler h(remove_snap);
+    merge_log(t, oinfo, olog, fromosd, info, &h,
               dirty_info, dirty_big_info);
 
     EXPECT_FALSE(missing.have_missing());
@@ -903,6 +961,7 @@ TEST_F(PGLogTest, merge_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.hash = 0x5;
@@ -956,7 +1015,8 @@ TEST_F(PGLogTest, merge_log) {
     EXPECT_FALSE(dirty_info);
     EXPECT_FALSE(dirty_big_info);
 
-    merge_log(t, oinfo, olog, fromosd, info, remove_snap,
+    TestHandler h(remove_snap);
+    merge_log(t, oinfo, olog, fromosd, info, &h,
               dirty_info, dirty_big_info);
 
     /* When the divergent entry is a DELETE and the authoritative
@@ -1014,6 +1074,7 @@ TEST_F(PGLogTest, merge_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.hash = 0x5;
@@ -1056,7 +1117,8 @@ TEST_F(PGLogTest, merge_log) {
     EXPECT_FALSE(dirty_info);
     EXPECT_FALSE(dirty_big_info);
 
-    merge_log(t, oinfo, olog, fromosd, info, remove_snap,
+    TestHandler h(remove_snap);
+    merge_log(t, oinfo, olog, fromosd, info, &h,
               dirty_info, dirty_big_info);
 
     EXPECT_FALSE(missing.have_missing());
@@ -1086,7 +1148,8 @@ TEST_F(PGLogTest, merge_log) {
     // olog has been trimmed
     olog.tail = eversion_t(1, 1);
 
-    ASSERT_THROW(merge_log(t, oinfo, olog, fromosd, info, remove_snap,
+    TestHandler h(remove_snap);
+    ASSERT_THROW(merge_log(t, oinfo, olog, fromosd, info, &h,
                            dirty_info, dirty_big_info), FailedAssertion);
   }
 
@@ -1125,6 +1188,7 @@ TEST_F(PGLogTest, merge_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.hash = 0x5;
@@ -1147,7 +1211,8 @@ TEST_F(PGLogTest, merge_log) {
       olog.head = e.version;
     }
 
-    EXPECT_THROW(merge_log(t, oinfo, olog, fromosd, info, remove_snap,
+    TestHandler h(remove_snap);
+    EXPECT_THROW(merge_log(t, oinfo, olog, fromosd, info, &h,
                            dirty_info, dirty_big_info), FailedAssertion);
   }
 }
@@ -1217,6 +1282,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 2);
       e.soid.hash = 0x5;
@@ -1303,6 +1369,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.hash = 0x5;
@@ -1404,6 +1471,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.hash = 0x5;
@@ -1487,6 +1555,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.hash = 0x5;
@@ -1576,6 +1645,7 @@ TEST_F(PGLogTest, proc_replica_log) {
 
     {
       pg_log_entry_t e;
+      e.mod_desc.mark_unrollbackable();
 
       e.version = eversion_t(1, 1);
       e.soid.hash = 0x5;

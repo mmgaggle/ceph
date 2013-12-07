@@ -160,6 +160,10 @@ public:
      * results.get<4>() is a bool; if true you must requeue the client Op
      * after processing the rest of the results (this will only be true
      * in conjunction with an ECANCELED return code).
+     *
+     * The user is responsible for ensuring that the destination
+     * object is not present by the point in the transaction where
+     * results.get<3>() happens.
      */
     virtual void finish(CopyResults& results_) = 0;
 

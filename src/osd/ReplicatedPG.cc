@@ -4909,6 +4909,7 @@ int ReplicatedPG::finish_copyfrom(OpContext *ctx)
     ctx->discard_temp_oid = cb->temp_obj;
   }
   cb->results.get<3>()->append(ctx->op_t);
+  delete ctx->op_t;
   ctx->op_t = cb->results.get<3>();
   cb->results.get<3>() = 0;
 

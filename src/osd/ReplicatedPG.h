@@ -954,8 +954,10 @@ protected:
   // -- copyfrom --
   map<hobject_t, CopyOpRef> copy_ops;
 
-  int fill_in_copy_get(bufferlist::iterator& bp, OSDOp& op,
-                       object_info_t& oi, bool classic);
+  int fill_in_copy_get(
+    OpContext *ctx,
+    bufferlist::iterator& bp, OSDOp& op,
+    object_info_t& oi, bool classic);
   /**
    * To copy an object, call start_copy.
    *

@@ -3892,14 +3892,14 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
     case CEPH_OSD_OP_COPY_GET_CLASSIC:
       ++ctx->num_read;
-      result = fill_in_copy_get(bp, osd_op, oi, true);
+      result = fill_in_copy_get(ctx, bp, osd_op, oi, true);
       if (result == -EINVAL)
 	goto fail;
       break;
 
     case CEPH_OSD_OP_COPY_GET:
       ++ctx->num_read;
-      result = fill_in_copy_get(bp, osd_op, oi, false);
+      result = fill_in_copy_get(ctx, bp, osd_op, oi, false);
       if (result == -EINVAL)
 	goto fail;
       break;
@@ -4614,8 +4614,25 @@ struct C_Copyfrom : public Context {
   }
 };
 
-int ReplicatedPG::fill_in_copy_get(bufferlist::iterator& bp, OSDOp& osd_op,
-                                   object_info_t& oi, bool classic)
+struct C_CopyFrom_AsyncReadCb : public Context {
+  OSDOp *osd_op;
+  object_copy_data_t reply_obj;
+  bool classic;
+  C_CopyFrom_AsyncReadCb(OSDOp *osd_op, bool classic) :
+    osd_op(osd_op), classic(classic) {}
+  void finish(int r) {
+    if (classic) {
+      reply_obj.encode_classic(osd_op->outdata);
+    } else {
+      ::encode(reply_obj, osd_op->outdata);
+    }
+  }
+};
+
+int ReplicatedPG::fill_in_copy_get(
+  OpContext *ctx,
+  bufferlist::iterator& bp, OSDOp& osd_op,
+  object_info_t& oi, bool classic)
 {
   hobject_t& soid = oi.soid;
   int result = 0;
@@ -4630,7 +4647,13 @@ int ReplicatedPG::fill_in_copy_get(bufferlist::iterator& bp, OSDOp& osd_op,
     return result;
   }
 
-  object_copy_data_t reply_obj;
+  bool async_read_started = false;
+  object_copy_data_t _reply_obj;
+  C_CopyFrom_AsyncReadCb *cb = NULL;
+  if (pool.info.ec_pool()) {
+    cb = new C_CopyFrom_AsyncReadCb(&osd_op, classic);
+  }
+  object_copy_data_t &reply_obj = cb ? cb->reply_obj : _reply_obj;
   // size, mtime
   reply_obj.size = oi.size;
   reply_obj.mtime = oi.mtime;
@@ -4650,12 +4673,21 @@ int ReplicatedPG::fill_in_copy_get(bufferlist::iterator& bp, OSDOp& osd_op,
 
   // data
   bufferlist& bl = reply_obj.data;
-  if (left > 0 && !cursor.data_complete) {
+  if (out_max > 0 && !cursor.data_complete) {
     if (cursor.data_offset < oi.size) {
-      result = pgbackend->objects_read_sync(
-	oi.soid, cursor.data_offset, left, &bl);
-      if (result < 0)
-	return result;
+      if (cb) {
+	async_read_started = true;
+	ctx->pending_async_reads.push_back(
+	  make_pair(
+	    make_pair(cursor.data_offset, left),
+	    make_pair(&bl, cb)));
+	result = MIN(oi.size - cursor.data_offset, (uint64_t)left);
+      } else {
+	result = pgbackend->objects_read_sync(
+	  oi.soid, cursor.data_offset, left, &bl);
+	if (result < 0)
+	  return result;
+      }
       assert(result <= left);
       left -= result;
       cursor.data_offset += result;
@@ -4667,35 +4699,44 @@ int ReplicatedPG::fill_in_copy_get(bufferlist::iterator& bp, OSDOp& osd_op,
   }
 
   // omap
-  std::map<std::string,bufferlist>& out_omap = reply_obj.omap;
-  if (left > 0 && !cursor.omap_complete) {
-    ObjectMap::ObjectMapIterator iter = osd->store->get_omap_iterator(coll, oi.soid);
-    assert(iter);
-    if (iter->valid()) {
-      iter->upper_bound(cursor.omap_offset);
-      for (; left > 0 && iter->valid(); iter->next()) {
-	out_omap.insert(make_pair(iter->key(), iter->value()));
-	left -= iter->key().length() + 4 + iter->value().length() + 4;
+  if (pool.info.ec_pool()) {
+    cursor.omap_complete = true;
+  } else {
+    std::map<std::string,bufferlist>& out_omap = reply_obj.omap;
+    if (left > 0 && !cursor.omap_complete) {
+      ObjectMap::ObjectMapIterator iter = osd->store->get_omap_iterator(coll, oi.soid);
+      assert(iter);
+      if (iter->valid()) {
+	iter->upper_bound(cursor.omap_offset);
+	for (; left > 0 && iter->valid(); iter->next()) {
+	  out_omap.insert(make_pair(iter->key(), iter->value()));
+	  left -= iter->key().length() + 4 + iter->value().length() + 4;
+	}
       }
-    }
-    if (iter->valid()) {
-      cursor.omap_offset = iter->key();
-    } else {
-      cursor.omap_complete = true;
-      dout(20) << " got omap" << dendl;
+      if (iter->valid()) {
+	cursor.omap_offset = iter->key();
+      } else {
+	cursor.omap_complete = true;
+	dout(20) << " got omap" << dendl;
+      }
     }
   }
 
   dout(20) << " cursor.is_complete=" << cursor.is_complete()
 		     << " " << out_attrs.size() << " attrs"
 		     << " " << bl.length() << " bytes"
-		     << " " << out_omap.size() << " keys"
+		     << " " << reply_obj.omap.size() << " keys"
 		     << dendl;
   reply_obj.cursor = cursor;
-  if (classic) {
-    reply_obj.encode_classic(osd_op.outdata);
-  } else {
-    ::encode(reply_obj, osd_op.outdata);
+  if (!async_read_started) {
+    if (classic) {
+      reply_obj.encode_classic(osd_op.outdata);
+    } else {
+      ::encode(reply_obj, osd_op.outdata);
+    }
+  }
+  if (cb && !async_read_started) {
+    delete cb;
   }
   result = 0;
   return result;

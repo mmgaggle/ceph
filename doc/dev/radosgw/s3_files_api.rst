@@ -11,6 +11,32 @@
    and may change without notice. There are no users yet; do not
    depend on anything described here.
 
+Implementation status
+=====================
+
+This document describes the **target** architecture. Much of it is
+design intent, not shipped code. As of this writing the in-tree
+state is:
+
+* **Store**: only an in-process, non-persistent ``MemoryStore`` is
+  implemented. The FoundationDB-backed store and the entire FDB key
+  layout described below are design only — they depend on a shared
+  FDB client and generic ``rgw_fdb_*`` configuration tracked by
+  ``ceph/ceph#65535``. Treat every FoundationDB reference in this
+  document as design, not behavior.
+* **Data-plane sink**: the ``Reconciler`` and a ``GaneshaSink``
+  *interface* exist, exercised in unit tests via an in-process
+  recording double. **No production sink ships.** The original
+  D-Bus sink has been removed; the production transport will be
+  gRPC and is future work. ``radosgw`` does **not** start the
+  reconciler — the startup wiring is deferred with the gRPC sink.
+* **REST surface**: implemented, and the primary reviewable
+  surface. It reads/writes the active ``Store`` directly.
+
+Net: this is a design + scaffolding drop. The only persistence is
+in-memory, and the control plane's state is not yet programmed into
+any NFS data plane.
+
 Goals
 =====
 

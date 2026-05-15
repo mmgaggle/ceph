@@ -327,6 +327,12 @@ options:
                 any ``radosgw`` instance that is meant to
                 participate in a `multi-site <../multisite>`_
                 configuration.
+
+      .. note:: The ``s3files`` API (AWS S3 Files / EFS-shape
+                control plane) is opt-in and not in the default
+                list. v1 uses an in-memory store; FoundationDB-
+                backed persistence will land separately. See
+                :ref:`rgw-s3-files-api`.
   default: s3, s3website, swift, swift_auth, admin, sts, iam, notifications
   services:
   - rgw

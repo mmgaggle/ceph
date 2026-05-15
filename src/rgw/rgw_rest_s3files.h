@@ -58,27 +58,6 @@ rgw::file_state::Store& default_store();
 // against concurrent default_store() calls.
 void set_default_store(rgw::file_state::Store* store);
 
-// Lifetime bundle for the in-process s3files reconciler. Owns
-// an InProcessChangeFeed, a DbusGaneshaSink, and the Reconciler
-// itself; wires the active Store's on-change hook to the feed,
-// reads config from `cct`, and starts the worker thread on
-// construction. Destruction stops the worker and tears
-// everything down in the safe order. AppMain owns one of these
-// when the s3files API is enabled AND
-// rgw_s3files_reconciler_enabled is true.
-class ReconcilerHarness {
- public:
-  ReconcilerHarness(rgw::file_state::Store& store,
-                     rgw::sal::Driver* driver,
-                     CephContext* cct);
-  ~ReconcilerHarness();
-  ReconcilerHarness(const ReconcilerHarness&) = delete;
-  ReconcilerHarness& operator=(const ReconcilerHarness&) = delete;
- private:
-  struct Impl;
-  std::unique_ptr<Impl> impl_;
-};
-
 }  // namespace rgw::s3files
 
 class RGWHandler_REST_S3Files : public RGWHandler_REST {

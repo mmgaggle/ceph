@@ -309,18 +309,32 @@ target_include_directories(unittest_rgw_arn
 target_link_libraries(unittest_rgw_arn ${rgw_libs})
 
 # unittest_rgw_file_state_memory_store
-# Self-contained: compiles MemoryStore directly into the test binary
-# rather than depending on rgw_libs.
+# Substrate only: Store / MemoryStore / ChangeFeed. Self-contained --
+# compiles the sources directly into the test binary rather than
+# depending on rgw_libs. The reconciler / GaneshaSink layer is
+# exercised by unittest_rgw_file_state_reconciler instead.
 add_executable(unittest_rgw_file_state_memory_store
   test_file_state_memory_store.cc
   ${CMAKE_SOURCE_DIR}/src/rgw/file_state/change_feed.cc
-  ${CMAKE_SOURCE_DIR}/src/rgw/file_state/dbus_ganesha_sink.cc
+  ${CMAKE_SOURCE_DIR}/src/rgw/file_state/memory_store.cc)
+add_ceph_unittest(unittest_rgw_file_state_memory_store)
+target_include_directories(unittest_rgw_file_state_memory_store
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
+                 "${CMAKE_SOURCE_DIR}/src/rgw/file_state")
+
+# unittest_rgw_file_state_reconciler
+# compose_exports + Reconciler over MemoryStore, using
+# RecordingGaneshaSink. No DbusGaneshaSink (dropped pending the
+# gRPC sink). Self-contained, same as above.
+add_executable(unittest_rgw_file_state_reconciler
+  test_file_state_reconciler.cc
+  ${CMAKE_SOURCE_DIR}/src/rgw/file_state/change_feed.cc
   ${CMAKE_SOURCE_DIR}/src/rgw/file_state/desired_export.cc
   ${CMAKE_SOURCE_DIR}/src/rgw/file_state/ganesha_sink.cc
   ${CMAKE_SOURCE_DIR}/src/rgw/file_state/memory_store.cc
   ${CMAKE_SOURCE_DIR}/src/rgw/file_state/reconciler.cc)
-add_ceph_unittest(unittest_rgw_file_state_memory_store)
-target_include_directories(unittest_rgw_file_state_memory_store
+add_ceph_unittest(unittest_rgw_file_state_reconciler)
+target_include_directories(unittest_rgw_file_state_reconciler
   SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw"
                  "${CMAKE_SOURCE_DIR}/src/rgw/file_state")
 

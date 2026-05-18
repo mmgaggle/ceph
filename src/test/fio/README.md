@@ -114,3 +114,102 @@ see ceph-messenger.conf and ceph-messenger.fio for details.
 To run:
 
     ./fio ./ceph-messenger.fio
+
+### Phase 0 instrumentation and modes
+
+The engine carries copy-accounting instrumentation and several payload
+modes used by the messenger zero-copy investigation. Counters are
+emitted in the engine teardown dump (look for the `PERFCOUNTERS`,
+`PERF HISTOGRAMS`, and `BUFFER CRC CACHE` marker blocks):
+
+- `l_msgr_send_bytes_copied` — payload bytes that went through the
+  kernel copy on send (today: all of them).
+- `l_msgr_send_iov_segments` — histogram of iovec elements per
+  `send()`; this is the headline send-shape counter.
+- `buffer_cached_crc` / `buffer_missed_crc` — bufferlist CRC-cache
+  hits/misses (`buffer_track_crc` is enabled by the engine).
+
+Payload-shape options (default off == single contiguous non-owning
+ptr, original behavior, no allocation or memcpy in the harness):
+
+- `payload_frags=N` — split each send payload into N non-owning
+  bufferptrs carved from fio's I/O buffer, to mimic the
+  RGW-multipart / EC-scatter shape that drives multi-segment iovec
+  assembly. Shifts the `l_msgr_send_iov_segments` histogram.
+- `payload_frag_unalign=1` — skew the fragment boundaries off page
+  alignment.
+
+EC read send-shape models (companions; run back to back and diff the
+`l_msgr_send_iov_segments` histogram — that delta is the EC
+horizontal-gather reply-fragmentation component):
+
+    ./fio ./ceph-messenger-ec-r1.fio   # single-shard / client-scatter
+    ./fio ./ceph-messenger-ec-r2.fio   # full-stripe horizontal gather
+
+### Data-integrity gate (verify_echo)
+
+`verify_echo=1` round-trips the payload and the **engine self-checks**
+it: the receiver echoes the bytes it actually received, and the sender
+compares crc32c + length of the echo against a snapshot taken just
+before send. A mismatch fails the io_u (`EILSEQ`) so fio aborts. This
+catches corrupted/stale sends — iovec mis-assembly, fragment-boundary
+bugs, truncation/partial send, and (in Phase 1) a buffer
+retired/mutated before the kernel finished sending or recycled by
+another in-flight request.
+
+    ./fio ./ceph-messenger-verify.fio
+
+Why not fio's `verify=crc32c`: fio's verify is medium/offset-keyed
+(write a pattern to offset X, later read offset X back from the
+medium), but this engine is a storageless request/reply pipe keyed by
+an io_u pointer abused as the object name — it has no offset→data map,
+and `FIO_UNIDIR` disables fio's post-write verify phase. fio-native
+verify fails even on a correct build ("bad magic header 0"). The
+engine-side crc compare needs no medium and is the actual Phase-1
+buffer-lifetime gate.
+
+`verify_echo` adds a full reply payload and a crc scan, so it **must
+not be used for throughput/bandwidth runs** — the memory-traffic
+numbers would be polluted. Bandwidth baselines use `ceph-messenger.fio`
+and the EC R1/R2 variants (all with `verify_echo` off).
+
+#### Broken-build gate procedure (env-gated, no rebuild)
+
+The gate proves the job actually catches a bad send. It is built into
+the engine and toggled by env vars — no code edit or rebuild:
+
+- `CEPH_MSGR_VERIFY_ECHO_CORRUPT=1` — mutate one payload byte after
+  the integrity snapshot but before the send (and invalidate the CRC
+  cache so it round-trips; see the finding below). Models the Phase-1
+  defect class: a buffer changed out from under an in-flight send.
+- `CEPH_MSGR_VERIFY_ECHO_DEBUG=1` — print `sent` vs `echoed`
+  len/crc32c for every reply (diagnostic).
+
+Pass:
+
+    ./fio ./ceph-messenger-verify.fio
+    # runs to completion, err=0, no "verify_echo MISMATCH"
+
+Fail (gate fires):
+
+    CEPH_MSGR_VERIFY_ECHO_CORRUPT=1 ./fio ./ceph-messenger-verify.fio
+    # engine prints "fio: verify_echo MISMATCH io=... sent crc=A
+    # echoed crc=B" and fio aborts with an io_u error (EILSEQ)
+
+Record both outcomes as the gate evidence.
+
+Finding (why `invalidate_crc()` is in the corrupt path): a naive
+in-place mutation of a pending send buffer is **masked by the
+bufferlist per-raw CRC cache**. `buflist.crc32c()` (the integrity
+snapshot) caches the crc on the non-owning `raw` wrapping the fio
+buffer; an external pointer write does *not* invalidate it, so the
+messenger ships a *stale* data-CRC while the wire carries the mutated
+bytes, and the receiver rejects the frame — the corruption is caught,
+but as a connection CRC error with no round trip, not a legible
+content mismatch. The self-test calls
+`req_msg->get_data().invalidate_crc()` so the messenger re-CRCs the
+mutated bytes, the frame round-trips, and the echo self-check reports
+it cleanly. Corollary for MSG_ZEROCOPY: any code path that mutates or
+recycles a buffer while a send is still pending must
+invalidate/guard the CRC cache, or corruption surfaces as opaque
+connection resets.

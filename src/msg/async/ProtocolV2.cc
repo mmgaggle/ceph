@@ -1346,11 +1346,21 @@ CtPtr ProtocolV2::ready() {
     can_write = true;
     // MSG_ZEROCOPY is pointless and adds pin-lifetime risk for secure
     // connections - the payload is already copied during encryption
-    // (crypto_onwire), so there is no copy left to elide.
-    // Exclude this connection once, here, where both client and server
-    // converge after auth.
+    // (crypto_onwire), so there is no copy left to elide. Exclude this
+    // connection once, here, where both client and server converge
+    // after auth. is_mode_secure() returns true for both secure
+    // (aesgcm) and secure-psp, so PSP also excludes zerocopy here -
+    // correct while the data path for secure-psp is still in-process
+    // aesgcm; this exclusion narrows to in-process AEAD only when the
+    // PSP kernel-offload path lands.
     if (auth_meta->is_mode_secure()) {
       connection->cs.set_zerocopy_eligible(false);
+    }
+    // Count secure-psp negotiations; the counter remains valid once
+    // the kernel offload engages, becoming a measure of NIC inline
+    // PSP usage.
+    if (auth_meta->is_mode_secure_psp()) {
+      connection->logger->inc(l_msgr_psp_connections);
     }
     if (!out_queue.empty()) {
       connection->center->dispatch_event_external(connection->write_handler);

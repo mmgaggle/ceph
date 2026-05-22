@@ -281,6 +281,14 @@ enum {
   l_msgr_zerocopy_fallback,
   l_msgr_zerocopy_pinned_bytes,
 
+  // PSP Security Protocol negotiation telemetry; see
+  // doc/dev/msgr2-psp.rst.  Increments on every connection whose
+  // negotiated mode is secure-psp, regardless of whether the kernel
+  // offload is actually engaged.  Companion counters (_attach_failed,
+  // _fallback_to_aesgcm, _handshake_bytes, _active_assocs) land with
+  // the kernel-offload path.
+  l_msgr_psp_connections,
+
   l_msgr_last,
 };
 
@@ -371,6 +379,9 @@ class Worker {
                         "Zero-copy requested but degraded to a copy");
     plb.add_u64(l_msgr_zerocopy_pinned_bytes, "msgr_zerocopy_pinned_bytes",
                 "Bytes currently pinned awaiting zero-copy completion");
+
+    plb.add_u64_counter(l_msgr_psp_connections, "msgr_psp_connections",
+                        "Connections that negotiated secure-psp mode");
 
     perf_logger = plb.create_perf_counters();
     cct->get_perfcounters_collection()->add(perf_logger);

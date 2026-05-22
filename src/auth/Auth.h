@@ -130,8 +130,17 @@ struct AuthConnectionMeta {
   bool is_mode_crc() const {
     return con_mode == CEPH_CON_MODE_CRC;
   }
+  // secure and secure-psp are both "in-process AEAD" under the hood
+  // until the PSP kernel-offload path is engaged: secure-psp is
+  // currently treated identically to secure-aesgcm here, and a
+  // separate is_mode_kernel_offloaded() query will distinguish them
+  // when the netlink attach lands.
   bool is_mode_secure() const {
-    return con_mode == CEPH_CON_MODE_SECURE;
+    return con_mode == CEPH_CON_MODE_SECURE ||
+           con_mode == CEPH_CON_MODE_SECURE_PSP;
+  }
+  bool is_mode_secure_psp() const {
+    return con_mode == CEPH_CON_MODE_SECURE_PSP;
   }
 
   CryptoKey session_key;           ///< per-ticket key
@@ -141,6 +150,7 @@ struct AuthConnectionMeta {
     case CEPH_CON_MODE_CRC:
       return 0;
     case CEPH_CON_MODE_SECURE:
+    case CEPH_CON_MODE_SECURE_PSP:
       return 16 * 4;
     }
     return 0;

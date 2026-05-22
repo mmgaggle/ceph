@@ -134,9 +134,9 @@ int NetHandler::set_socket_options(int sd, bool nodelay, int size)
     }
   }
 
-  // MSG_ZEROCOPY send opt-in (Phase 1, default off). Setting
-  // SO_ZEROCOPY alone changes nothing on the wire; it only takes
-  // effect once a send passes MSG_ZEROCOPY (added by a later slice).
+  // MSG_ZEROCOPY send opt-in (default off). Setting SO_ZEROCOPY
+  // alone changes nothing on the wire; it only takes effect once a
+  // send passes MSG_ZEROCOPY.
   // Failure is non-fatal: the connection proceeds in the normal
   // copying mode. Linux >= 4.14 only; absent from Ceph compat headers.
 #ifdef SO_ZEROCOPY

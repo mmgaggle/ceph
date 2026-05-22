@@ -336,6 +336,13 @@ ssize_t AsyncConnection::_try_send(bool more)
   }
 
   ceph_assert(center->in_thread());
+
+  // Drive MSG_ERRQUEUE completion processing so pinned
+  // buffers retire (the socket self-credits the zerocopy
+  // perfcounters at the event site; no-op unless zero-copy engaged).
+  if (cs)
+    cs.drain_zerocopy_completions();
+
   ldout(async_msgr->cct, 25) << __func__ << " cs.send " << outgoing_bl.length()
                              << " bytes" << dendl;
   // network block would make ::send return EAGAIN, that would make here looks
@@ -352,10 +359,13 @@ ssize_t AsyncConnection::_try_send(bool more)
     return r;
   }
   if (r > 0) {
-    // Every byte handed to the socket currently passes through a kernel
-    // copy; later work splits this between _copied and _zerocopy when
-    // MSG_ZEROCOPY is engaged.
-    logger->inc(l_msgr_send_bytes_copied, r);
+    // The socket pinned `zc` bytes for MSG_ZEROCOPY (and counted
+    // submitted/zerocopy/pinned itself); the remainder went through
+    // the kernel copy and is accounted here.
+    const size_t zc = cs.last_send_zerocopy_bytes();
+    const size_t cp = (size_t)r > zc ? (size_t)r - zc : 0;
+    if (cp)
+      logger->inc(l_msgr_send_bytes_copied, cp);
     logger->hinc(l_msgr_send_iov_segments, iov_segs, r);
   }
 
@@ -666,6 +676,10 @@ void AsyncConnection::shutdown_socket() {
   }
   if (cs) {
     center->delete_file_event(cs.fd(), EVENT_READABLE | EVENT_WRITABLE);
+    // cs.close() drains, then credits any residual pinned
+    // sends as completed and zeroes the pinned gauge itself (it holds
+    // the Worker logger), so submitted == completed and pinned == 0
+    // hold exactly on every close path - no reconciliation needed here.
     cs.shutdown();
     cs.close();
   }

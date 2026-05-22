@@ -1344,6 +1344,14 @@ CtPtr ProtocolV2::ready() {
   {
     std::lock_guard<std::mutex> l(connection->write_lock);
     can_write = true;
+    // MSG_ZEROCOPY is pointless and adds pin-lifetime risk for secure
+    // connections - the payload is already copied during encryption
+    // (crypto_onwire), so there is no copy left to elide.
+    // Exclude this connection once, here, where both client and server
+    // converge after auth.
+    if (auth_meta->is_mode_secure()) {
+      connection->cs.set_zerocopy_eligible(false);
+    }
     if (!out_queue.empty()) {
       connection->center->dispatch_event_external(connection->write_handler);
     }

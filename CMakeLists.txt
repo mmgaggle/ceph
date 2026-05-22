@@ -195,6 +195,21 @@ if(WITH_RDMA)
   set(HAVE_RDMA TRUE)
 endif()
 
+# PSP Security Protocol (kernel inline AEAD for messenger zero-copy
+# secure mode, kernel v6.18+ on CX-7+/mlx5). A.1.0 ships detection
+# only + a no-op stub. See MESSENGER_PSP_PLAN.md.
+option(WITH_PSP "Enable PSP Security Protocol in async messenger" ON)
+if(WITH_PSP AND LINUX)
+  include(CheckIncludeFile)
+  check_include_file("linux/psp.h" HAVE_LINUX_PSP_H)
+  if(HAVE_LINUX_PSP_H)
+    set(HAVE_PSP TRUE)
+  else()
+    message(STATUS "WITH_PSP=ON but linux/psp.h not found; "
+                   "PSP will compile a no-op stub")
+  endif()
+endif()
+
 find_package(Backtrace)
 
 option(WITH_RBD "Enable RADOS Block Device related targets" ON)

@@ -37,8 +37,6 @@ std::unique_ptr<NetlinkBackend> make_real_backend() {
   return std::make_unique<StubBackend>();
 }
 
-// make_mock_backend() is intentionally undefined here; it lands
-// in PSPNetlinkMock.cc when A.1.1 ships. Linking a unit test that
-// references it will fail until then.
+// make_mock_backend() is defined in PSPNetlinkMock.cc.
 
 }  // namespace ceph::msgr::psp

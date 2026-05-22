@@ -20,7 +20,8 @@ list(APPEND msg_srcs
   async/compression_onwire.cc
   async/frames_v2.cc
   async/net_handler.cc
-  async/PSPNetlink.cc)
+  async/PSPNetlink.cc
+  async/PSPNetlinkMock.cc)
 
 if(LINUX)
   list(APPEND msg_srcs

@@ -30,11 +30,10 @@ struct DeviceCaps {
   uint32_t free_rx_assoc_slots = 0;
 };
 
-// Backend abstraction. CI swaps in a mock (A.1.1); production
-// swaps in a real libmnl/libnl-genl impl (A.1.2). A.1.0 ships
-// only the stub, which reports psp_supported=false from every
-// call so the rest of the messenger can develop against the
-// interface without committing to behavior.
+// Backend abstraction. CI swaps in a mock; production swaps in a
+// real libmnl/libnl-genl impl. The default stub reports
+// psp_supported=false from every call, so the rest of the messenger
+// can develop against the interface without committing to behavior.
 class NetlinkBackend {
  public:
   virtual ~NetlinkBackend() = default;
@@ -64,13 +63,28 @@ class NetlinkBackend {
   virtual int teardown(int sock_fd) = 0;
 };
 
-// Production backend factory. A.1.0 returns a stub that reports
-// unsupported; A.1.2 replaces the implementation with real netlink
-// calls when HAVE_LINUX_PSP_H is defined.
+// Production backend factory.  Returns a stub that reports
+// unsupported until the real netlink-backed implementation lands
+// (gated on HAVE_LINUX_PSP_H).
 std::unique_ptr<NetlinkBackend> make_real_backend();
 
-// Forward decl for the CI mock landing in A.1.1.
-struct MockConfig;
+// Knobs for the CI-only mock backend. The mock is deterministic
+// and stateful per-instance: each MockBackend acts as one "host"
+// with its own tx/rx slot accounting. Failure-injection counters
+// decrement on use so tests can script "next N calls fail."
+struct MockConfig {
+  std::string ifname = "mock0";
+  bool psp_supported = true;
+  uint32_t versions_mask = 0x1;           // AES-GCM-128 by default
+  uint32_t tx_capacity = 64;
+  uint32_t rx_capacity = 64;
+
+  // Failure injection (decrement on use). 0 = no failures.
+  uint32_t fail_next_alloc_rx_assoc = 0;
+  uint32_t fail_next_install_tx_assoc = 0;
+  bool fail_get_dev_caps = false;
+};
+
 std::unique_ptr<NetlinkBackend> make_mock_backend(const MockConfig&);
 
 }  // namespace ceph::msgr::psp

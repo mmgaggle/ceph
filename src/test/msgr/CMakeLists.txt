@@ -31,6 +31,11 @@ add_executable(unittest_frames_v2 test_frames_v2.cc)
 add_ceph_unittest(unittest_frames_v2)
 target_link_libraries(unittest_frames_v2 os global ${UNITTEST_LIBS})
 
+# unittest_psp_netlink_mock
+add_executable(unittest_psp_netlink_mock test_psp_netlink_mock.cc)
+add_ceph_unittest(unittest_psp_netlink_mock)
+target_link_libraries(unittest_psp_netlink_mock global ${UNITTEST_LIBS})
+
 add_executable(unittest_comp_registry
   test_comp_registry.cc
   $<TARGET_OBJECTS:unit-main>

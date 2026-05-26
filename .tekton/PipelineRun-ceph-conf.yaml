@@ -1,0 +1,134 @@
+# .tekton/PipelineRun-ceph-conf.yaml — bootstrap — first PaC PipelineRun for mmgaggle/ceph.
+#
+# Fires on every pull_request targeting the ci-tekton integration branch.
+# Builds the ceph-conf aggregator target via ninja inside the
+# ceph-builder image, then reports a GitHub Check back.
+#
+# Image source: localhost/ceph-builder:centos10-x86_64. Today the image
+# lives on the EC2 host's podman storage (landed by the #10 probe) and
+# is imported into k3s containerd via:
+#     podman save localhost/ceph-builder:centos10-x86_64 \
+#       | sudo k3s ctr images import -
+# Once #11 lands the registry-pushed variants, switch to a registry ref.
+#
+# Resource shape: the probe took ~8 min wall on the EC2 m5d.4xlarge with
+# 16 vCPU available. Request 8 CPU / 16 GiB, allow up to 14 CPU / 32 GiB.
+# Single-cell pipeline; only one ceph-conf build runs at a time on the
+# dev cluster.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: ceph-conf-
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request, push]"
+    pipelinesascode.tekton.dev/on-target-branch: "[ci-tekton]"
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+spec:
+  params:
+    - name: repo_url
+      value: "{{ repo_url }}"
+    - name: revision
+      value: "{{ revision }}"
+  pipelineSpec:
+    params:
+      - name: repo_url
+        type: string
+      - name: revision
+        type: string
+    workspaces:
+      - name: source
+    tasks:
+      - name: clone
+        params:
+          - name: repo_url
+            value: $(params.repo_url)
+          - name: revision
+            value: $(params.revision)
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          params:
+            - name: repo_url
+              type: string
+            - name: revision
+              type: string
+          workspaces:
+            - name: source
+          steps:
+            - name: clone
+              image: docker.io/alpine/git:v2.49.1
+              workingDir: $(workspaces.source.path)
+              env:
+                - name: REPO_URL
+                  value: $(params.repo_url)
+                - name: REVISION
+                  value: $(params.revision)
+              script: |
+                #!/bin/sh
+                set -eux
+                # Rewrite the submodule git:// URLs to https:// at clone
+                # time. ceph's `.gitmodules` pins several submodules via
+                # `git://github.com/...` (deprecated by GitHub in 2022,
+                # port 9418 closed at most edges) and `git://ceph.com/...`
+                # (ceph.com no longer serves the git protocol — the
+                # canonical mirror is github.com/ceph/<repo>).
+                git config --global url."https://github.com/".insteadOf "git://github.com/"
+                git config --global url."https://github.com/ceph/".insteadOf "git://ceph.com/git/"
+                git clone --filter=blob:none "$REPO_URL" ceph
+                cd ceph
+                git fetch --depth 1 origin "$REVISION"
+                git checkout "$REVISION"
+                git submodule update --init --recursive --depth 1
+      - name: build-ceph-conf
+        runAfter: [clone]
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          workspaces:
+            - name: source
+          steps:
+            - name: configure-and-build
+              image: localhost/ceph-builder:centos10-x86_64
+              imagePullPolicy: IfNotPresent
+              workingDir: $(workspaces.source.path)/ceph
+              # alpine/git wrote /workspace/source/ceph as root in the
+              # prior step; ceph-builder's image has USER 1000 ("builder")
+              # which can't write to that root-owned tree. Override to
+              # root for the build — the privilege-separation that the
+              # builder image's USER directive provides matters for
+              # downstream package builds (#13/#16), not for this dev
+              # ninja-ceph-conf path which is purely compile + emit.
+              securityContext:
+                runAsUser: 0
+              computeResources:
+                requests:
+                  cpu: "8"
+                  memory: 16Gi
+                limits:
+                  cpu: "14"
+                  memory: 32Gi
+              script: |
+                #!/bin/bash
+                set -euxo pipefail
+                mkdir -p build
+                cd build
+                cmake -G Ninja ..
+                ninja -j$(nproc) ceph-conf
+                ls -la bin/ceph-conf
+                file bin/ceph-conf
+  workspaces:
+    - name: source
+      # volumeClaimTemplate (not emptyDir): emptyDir at PipelineRun level
+      # is per-pod, so a clone Pod and a build Pod never see each other's
+      # files. Tekton provisions one PVC per PipelineRun from this
+      # template and mounts it into both step Pods, deleting it when the
+      # PipelineRun completes. k3s's default local-path storage class
+      # handles the binding on the dev cluster.
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 30Gi

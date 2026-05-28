@@ -1,0 +1,136 @@
+# PipelineRun template — Pipelines-as-Code first probe on
+# mmgaggle/ceph (refs mmgaggle/ceph-tekton#71).
+#
+# Discovery: PaC scans `.tekton/*.yaml` on the PR head and matches
+# annotations against the inbound GitHub event. The Repository CR
+# that routes this repo's events lives in the ceph-tekton repo:
+#   kustomize/base/pac-repositories/ceph-mmgaggle.yaml
+# (namespace `ceph-builds-ci` on the dev cluster).
+#
+# Annotations:
+#   pipelinesascode.tekton.dev/on-event         — pull_request only.
+#   pipelinesascode.tekton.dev/on-target-branch — restricted to
+#     `ceph-tekton-integration` so we don't fire on every mmgaggle/ceph
+#     PR against `main` (which would mean every upstream rebase
+#     triggers a build). The integration branch is the surface we
+#     intentionally drive PaC against in phase 1.
+#   pipelinesascode.tekton.dev/max-keep-runs    — PaC garbage-collects
+#     completed PipelineRuns above this count.
+#
+# What it does: clone ceph at the PR head, init submodules shallow,
+# run the same cmake configure the existing `build-from-source` task
+# uses (mirrors tasks/build-from-source/task.yaml), then `ninja
+# ceph-conf` — the smallest meaningful build artefact (a single
+# binary) that proves the configure step worked end to end. Full
+# `ninja vstart` is what the production task targets; ceph-conf is
+# enough for a first-light probe and finishes in ~1-2 minutes once
+# configure is done.
+#
+# Builder image: `localhost/ceph-builder:centos10-x86_64` — same image
+# the existing `build-from-source`, `vstart-cluster`, and
+# `build-builder-image` tasks pull. The dev cluster pre-loads it (see
+# docs/builder-images.md); on a fresh cluster the first run will fail
+# until the image is built and side-loaded.
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: ceph-conf-build
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[ceph-tekton-integration]"
+    pipelinesascode.tekton.dev/max-keep-runs: "5"
+spec:
+  params:
+    - name: revision
+      value: "{{revision}}"
+    - name: source-url
+      value: "{{repo_url}}"
+  pipelineSpec:
+    params:
+      - name: revision
+        type: string
+      - name: source-url
+        type: string
+    workspaces:
+      - name: source
+    tasks:
+      - name: build-ceph-conf
+        params:
+          - name: revision
+            value: $(params.revision)
+          - name: source-url
+            value: $(params.source-url)
+        workspaces:
+          - name: source
+            workspace: source
+        taskSpec:
+          params:
+            - name: revision
+              type: string
+            - name: source-url
+              type: string
+          workspaces:
+            - name: source
+          steps:
+            - name: clone
+              image: alpine/git:latest
+              workingDir: $(workspaces.source.path)
+              script: |
+                #!/bin/sh
+                set -eu
+                # PaC supplies revision = PR head SHA. Try a shallow
+                # branch clone first (cheap when the ref name and SHA
+                # match), fall back to a full clone + checkout SHA.
+                if git clone --depth 1 --branch "$(params.revision)" "$(params.source-url)" ceph 2>/dev/null; then
+                  echo "[clone] shallow branch clone of $(params.revision) succeeded"
+                else
+                  echo "[clone] falling back to full clone + checkout $(params.revision)"
+                  git clone "$(params.source-url)" ceph
+                  git -C ceph checkout "$(params.revision)"
+                fi
+            - name: submodules
+              image: alpine/git:latest
+              workingDir: $(workspaces.source.path)/ceph
+              script: |
+                #!/bin/sh
+                set -eu
+                git submodule update --init --recursive --depth 1
+            - name: configure
+              image: localhost/ceph-builder:centos10-x86_64
+              workingDir: $(workspaces.source.path)/ceph
+              script: |
+                #!/bin/bash
+                set -euo pipefail
+                # Mirrors tasks/build-from-source/task.yaml:304-312 so
+                # this probe exercises the same configure shape the
+                # production task does. Drop dashboard frontend +
+                # cephfs-shell to shrink the configure tree.
+                mkdir -p build
+                cd build
+                cmake -G Ninja \
+                  -DCMAKE_BUILD_TYPE=Debug \
+                  -DWITH_TESTS=ON \
+                  -DWITH_RADOSGW=ON \
+                  -DWITH_MGR_DASHBOARD_FRONTEND=OFF \
+                  -DWITH_CEPHFS_SHELL=OFF \
+                  ..
+            - name: build
+              image: localhost/ceph-builder:centos10-x86_64
+              workingDir: $(workspaces.source.path)/ceph/build
+              script: |
+                #!/bin/bash
+                set -euo pipefail
+                # ninja ceph-conf is the smallest meaningful binary
+                # target; configure dominates wall-time, the build
+                # itself is ~1-2 min.
+                ninja ceph-conf
+                ls -la bin/ceph-conf
+                ./bin/ceph-conf --version
+  workspaces:
+    - name: source
+      volumeClaimTemplate:
+        spec:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 20Gi

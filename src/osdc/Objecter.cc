@@ -3980,14 +3980,27 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     // per-op out-of-band delivery results: an OSD that pushed fills
     // oob_results aligned with the ops; an inline reply (old OSD,
     // refusal, or nothing requested) carries none, which reads back
-    // as all-zero results
+    // as all-zero results. Both result forms are served here, so a
+    // caller learns "nothing delivered" even for an op the reply
+    // left out (the per-op handlers below stop at out_ops.end()).
     const auto& oob = m->get_oob_results();
+    const ceph::rdma::oob_result_t none;
     for (unsigned i = 0; i < op->rdma_oob_result.size(); ++i) {
-      if (!op->rdma_oob_result[i]) {
+      auto* result = op->rdma_oob_result[i];
+      auto* handler =
+	(op->rdma_oob_handler && i < op->rdma_oob_handler->size() &&
+	 (*op->rdma_oob_handler)[i]) ? &(*op->rdma_oob_handler)[i] : nullptr;
+      if (!result && !handler) {
 	continue;
       }
-      *op->rdma_oob_result[i] =
-	i < oob.size() ? oob[i] : ceph::rdma::oob_result_t{};
+      const auto& r = i < oob.size() ? oob[i] : none;
+      if (result) {
+	*result = r;
+      }
+      if (handler) {
+	std::move(*handler)(r);
+	*handler = nullptr;
+      }
     }
   }
 

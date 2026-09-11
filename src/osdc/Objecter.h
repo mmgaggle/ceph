@@ -115,6 +115,16 @@ struct ObjectOperation {
   /// out: per-op out-of-band delivery result (bytes 0 = inline)
   boost::container::small_vector<ceph::rdma::oob_result_t*, osdc_opvec_len>
     rdma_oob_result;
+  /// results a caller takes through a callback rather than a pointer:
+  /// one handler per op, indexed like ops, that the Objecter invokes
+  /// from the reply's out-of-band copy (after the pointer form's copy,
+  /// before the op's completion) with the wire result, or an all-zero
+  /// one when the reply carries none for that op; allocated only when
+  /// that form is used so the common case pays one pointer (neorados
+  /// embeds this struct in fixed storage)
+  using rdma_oob_handler_t =
+    fu2::unique_function<void(const ceph::rdma::oob_result_t&) &&>;
+  std::unique_ptr<std::vector<rdma_oob_handler_t>> rdma_oob_handler;
 
   ObjectOperation() = default;
   ObjectOperation(const ObjectOperation&) = delete;
@@ -137,6 +147,7 @@ struct ObjectOperation {
     out_ec.clear();
     rdma_delivery.clear();
     rdma_oob_result.clear();
+    rdma_oob_handler.reset();
   }
 
   /// request out-of-band delivery for the most recently added op
@@ -147,6 +158,18 @@ struct ObjectOperation {
     rdma_delivery.back() = ceph::rdma::delivery_t{std::string(token),
 						  base_offset, flags};
     rdma_oob_result.back() = result;
+  }
+  /// as above, but hand the result to on_result when the reply is
+  /// processed (see rdma_oob_handler), for callers whose result type
+  /// is not the wire one
+  void set_rdma_delivery(std::string_view token, uint64_t base_offset,
+			 uint32_t flags, rdma_oob_handler_t on_result) {
+    set_rdma_delivery(token, base_offset, flags, nullptr);
+    if (!rdma_oob_handler) {
+      rdma_oob_handler = std::make_unique<std::vector<rdma_oob_handler_t>>();
+    }
+    rdma_oob_handler->resize(ops.size());
+    rdma_oob_handler->back() = std::move(on_result);
   }
   bool has_rdma_delivery() const {
     return std::any_of(rdma_delivery.begin(), rdma_delivery.end(),
@@ -2100,6 +2123,10 @@ public:
       rdma_delivery;
     boost::container::small_vector<ceph::rdma::oob_result_t*, osdc_opvec_len>
       rdma_oob_result;
+    /// callback-form results, taken over from the ObjectOperation at
+    /// submission so they outlive it (see ObjectOperation::rdma_oob_handler)
+    std::unique_ptr<std::vector<::ObjectOperation::rdma_oob_handler_t>>
+      rdma_oob_handler;
     bool has_rdma_delivery() const {
       return std::any_of(rdma_delivery.begin(), rdma_delivery.end(),
 			 [](const auto& d) { return !d.empty(); });
@@ -3204,6 +3231,7 @@ public:
     o->out_ec.swap(op.out_ec);
     o->rdma_delivery.swap(op.rdma_delivery);
     o->rdma_oob_result.swap(op.rdma_oob_result);
+    o->rdma_oob_handler.swap(op.rdma_oob_handler);
     op.clear();
     return o;
   }
@@ -3245,6 +3273,7 @@ public:
     o->out_ec.swap(op.out_ec);
     o->rdma_delivery.swap(op.rdma_delivery);
     o->rdma_oob_result.swap(op.rdma_oob_result);
+    o->rdma_oob_handler.swap(op.rdma_oob_handler);
     if (features)
       o->features = features;
     op.clear();

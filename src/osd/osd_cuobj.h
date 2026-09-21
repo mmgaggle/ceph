@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,9 @@ public:
     ceph::osd::oob::placement_plan plan;
     /// CRC64-NVME each placed range while the writes are in flight
     bool want_crc64 = false;
+    /// per plan triple, a value the caller already has (from the
+    /// store's checksum metadata); empty, or nullopt, means hash it
+    std::vector<std::optional<uint64_t>> known_crc64;
     /// the transfer may not be initiated after this (the delivery
     /// lease and the PG's read lease, whichever ends first)
     utime_t initiate_by;
@@ -102,6 +106,11 @@ public:
    * calls req.on_done. All or nothing, like execute_plan().
    */
   void execute_plan_async(plan_request&& req);
+
+  /// account where a placed range's CRC64 came from
+  void note_crc_source(bool from_metadata) {
+    (from_metadata ? m_crc_from_metadata : m_crc_computed)++;
+  }
 
   /// asok/debug counters
   void dump_stats(ceph::Formatter* f) const;
@@ -185,6 +194,8 @@ private:
   std::atomic<uint32_t> m_writes_inflight{0};
   std::atomic<uint64_t> m_buffers_leaked{0};
   std::atomic<uint64_t> m_plans_queued{0};  ///< async plans not yet done
+  std::atomic<uint64_t> m_crc_from_metadata{0};
+  std::atomic<uint64_t> m_crc_computed{0};
   std::atomic<uint64_t> m_plans_in_place{0};
   std::atomic<uint64_t> m_segments_pooled{0};  ///< served by the cache below
 

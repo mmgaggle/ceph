@@ -730,10 +730,20 @@ void OSDCuObj::DeliveryThread::checksum(inflight_plan& p)
   auto& res = p.res;
   res.ranges.reserve(p.req.plan.size());
   uint64_t whole = 0;
+  size_t i = 0;
   for (const auto& t : p.req.plan) {
-    ceph::buffer::list part;
-    part.substr_of(p.req.data, t.local_ofs, t.len);
-    const uint64_t crc = ceph::crc64nvme(part);
+    const auto known = i < p.req.known_crc64.size() ? p.req.known_crc64[i]
+						      : std::nullopt;
+    i++;
+    m_parent.note_crc_source(known.has_value());
+    uint64_t crc;
+    if (known) {
+      crc = *known;
+    } else {
+      ceph::buffer::list part;
+      part.substr_of(p.req.data, t.local_ofs, t.len);
+      crc = ceph::crc64nvme(part);
+    }
     res.ranges.push_back({t.client_ofs, t.len, crc});
     whole = res.ranges.size() == 1 ? crc
 	  : ceph::crc64nvme_combine(whole, crc, t.len);
@@ -912,6 +922,8 @@ void OSDCuObj::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("writes_inflight", m_writes_inflight.load());
   f->dump_unsigned("buffers_leaked", m_buffers_leaked.load());
   f->dump_unsigned("payload_segments", m_payload_segments.load());
+  f->dump_unsigned("crc64_from_metadata", m_crc_from_metadata.load());
+  f->dump_unsigned("crc64_computed", m_crc_computed.load());
   f->dump_unsigned("plans_in_place", m_plans_in_place.load());
   f->dump_unsigned("segments_from_huge_pool", m_segments_pooled.load());
   f->dump_unsigned("plans_copied", m_plans_copied.load());

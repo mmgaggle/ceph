@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -14,6 +15,7 @@
 #include "common/rdma_token.h"
 #include "include/buffer.h"
 #include "include/common_fwd.h"
+#include "include/utime.h"
 #include "osd/oob_placement.h"
 
 namespace ceph { class Formatter; }
@@ -33,7 +35,10 @@ class cuObjServer;
  * Thread safety: rdma_write() and execute_plan() may be called
  * concurrently from any number of op worker threads. Each thread lazily
  * allocates its own cuObject channel (DCI); buffer-pool slots are
- * claimed with atomic compare-exchange.
+ * claimed with atomic compare-exchange. execute_plan_async() hands the
+ * plan to one of osd_cuobj_delivery_threads delivery threads, each of
+ * which owns a channel and multiplexes many plans over it, so the
+ * caller (an op worker holding the PG lock) never waits on the fabric.
  */
 class OSDCuObj {
 public:
@@ -70,6 +75,34 @@ public:
 		       const ceph::buffer::list& data,
 		       const ceph::osd::oob::placement_plan& plan);
 
+  struct plan_request {
+    std::string key;    ///< telemetry only
+    std::string token;
+    ceph::buffer::list data;
+    ceph::osd::oob::placement_plan plan;
+    /// CRC64-NVME each placed range while the writes are in flight
+    bool want_crc64 = false;
+    /// the transfer may not be initiated after this (the delivery
+    /// lease and the PG's read lease, whichever ends first)
+    utime_t initiate_by;
+    /// called exactly once, from a delivery thread, with no locks held:
+    /// r is the bytes pushed (res is then filled in) or a negative
+    /// errno, in which case the caller must deliver inline
+    std::function<void(ssize_t r, ceph::rdma::oob_result_t&& res)> on_done;
+  };
+
+  /// true if execute_plan_async() is usable (delivery threads running)
+  bool has_async_delivery() const {
+    return !m_delivery_threads.empty();
+  }
+
+  /**
+   * execute_plan() without blocking the caller: the plan is staged,
+   * submitted and polled to completion on a delivery thread, which then
+   * calls req.on_done. All or nothing, like execute_plan().
+   */
+  void execute_plan_async(plan_request&& req);
+
   /// asok/debug counters
   void dump_stats(ceph::Formatter* f) const;
 
@@ -80,6 +113,9 @@ private:
     struct rdma_buffer* handle = nullptr;
     std::atomic<bool> in_use{false};
   };
+
+  struct inflight_plan;
+  class DeliveryThread;
 
   int do_init(const std::string& rdma_ip, uint16_t rdma_port);
   void do_shutdown();
@@ -148,6 +184,7 @@ private:
   std::atomic<uint64_t> m_bytes_pushed{0};
   std::atomic<uint32_t> m_writes_inflight{0};
   std::atomic<uint64_t> m_buffers_leaked{0};
+  std::atomic<uint64_t> m_plans_queued{0};  ///< async plans not yet done
   std::atomic<uint64_t> m_plans_in_place{0};
   std::atomic<uint64_t> m_segments_pooled{0};  ///< served by the cache below
 
@@ -158,6 +195,9 @@ private:
   std::atomic<uint64_t> m_register_ns{0};   ///< spent registering in place
   std::atomic<uint64_t> m_payload_segments{0};
   bool m_register_in_place = false;
+
+  std::vector<std::unique_ptr<DeliveryThread>> m_delivery_threads;
+  std::atomic<uint64_t> m_next_delivery_thread{0};
 
   static thread_local uint16_t tls_channel_id;
   static thread_local bool tls_channel_valid;

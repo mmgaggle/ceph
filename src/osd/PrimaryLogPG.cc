@@ -9350,17 +9350,15 @@ void PrimaryLogPG::apply_stats(
 }
 
 #ifdef WITH_OSD_CUOBJ
-bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
-			       std::vector<ceph::rdma::oob_result_t>& oob)
+bool PrimaryLogPG::oob_delivery_allowed(OpContext *ctx, size_t num_ops)
 {
   auto m = ctx->op->get_req<MOSDOp>();
   const auto& deliveries = m->get_rdma_deliveries();
-  ceph_assert(oob.size() == rops.size());
-  if (deliveries.size() != rops.size()) {
+  if (deliveries.size() != num_ops) {
     // the descriptor vector must mirror the ops; anything else is
     // malformed and everything stays inline
     dout(10) << __func__ << " " << deliveries.size()
-	     << " delivery descriptors for " << rops.size()
+	     << " delivery descriptors for " << num_ops
 	     << " ops, delivering inline" << dendl;
     return false;
   }
@@ -9394,6 +9392,18 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
 	     << "s), delivering inline" << dendl;
     return false;
   }
+  return true;
+}
+
+bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
+			       std::vector<ceph::rdma::oob_result_t>& oob)
+{
+  auto m = ctx->op->get_req<MOSDOp>();
+  const auto& deliveries = m->get_rdma_deliveries();
+  ceph_assert(oob.size() == rops.size());
+  if (!oob_delivery_allowed(ctx, rops.size())) {
+    return false;
+  }
   bool any = false;
   for (size_t i = 0; i < rops.size(); i++) {
     if (deliveries[i].empty()) {
@@ -9406,11 +9416,12 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
   return any;
 }
 
-bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
-				  const ceph::rdma::delivery_t& d,
-				  ceph::rdma::oob_result_t& res)
+bool PrimaryLogPG::plan_op_oob(OpContext *ctx, OSDOp& op,
+			       const ceph::rdma::delivery_t& d,
+			       ceph::osd::oob::placement_plan& plan,
+			       bufferlist& payload,
+			       std::map<uint64_t, uint64_t>& sparse_extents)
 {
-  auto m = ctx->op->get_req<MOSDOp>();
   if (d.flags & ~ceph::rdma::delivery_t::KNOWN_FLAGS) {
     // flag bits we do not implement: deliver inline so future
     // semantics degrade safely
@@ -9432,9 +9443,6 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
   }
 
   const bool ec_direct = ctx->op->ec_direct_read();
-  ceph::osd::oob::placement_plan plan;
-  bufferlist payload;  // the bytes the plan indexes
-  std::map<uint64_t, uint64_t> sparse_extents;
   if (data_op->op.op == CEPH_OSD_OP_SPARSE_READ) {
     if (ec_direct) {
       // the fiemap extent map is in shard-offset space; interleaving
@@ -9475,7 +9483,31 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
 				       data_op->outdata.length());
     payload = data_op->outdata;
   }
-  if (plan.empty()) {
+  return !plan.empty();
+}
+
+// strip the delivered data from the reply; sparse reads keep their
+// extent map inline with an empty data blob
+static void strip_oob_delivered(OSDOp& op,
+				const std::map<uint64_t, uint64_t>& sparse_extents)
+{
+  op.outdata.clear();
+  if (op.op.op == CEPH_OSD_OP_SPARSE_READ) {
+    encode(sparse_extents, op.outdata);
+    encode(bufferlist(), op.outdata);
+  }
+}
+
+bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
+				  const ceph::rdma::delivery_t& d,
+				  ceph::rdma::oob_result_t& res)
+{
+  auto m = ctx->op->get_req<MOSDOp>();
+  OSDOp* data_op = &op;
+  ceph::osd::oob::placement_plan plan;
+  bufferlist payload;  // the bytes the plan indexes
+  std::map<uint64_t, uint64_t> sparse_extents;
+  if (!plan_op_oob(ctx, op, d, plan, payload, sparse_extents)) {
     return false;
   }
 
@@ -9486,13 +9518,7 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
 	     << pushed << "), delivering inline" << dendl;
     return false;
   }
-  // strip the delivered data from the reply; sparse reads keep their
-  // extent map inline with an empty data blob
-  data_op->outdata.clear();
-  if (data_op->op.op == CEPH_OSD_OP_SPARSE_READ) {
-    encode(sparse_extents, data_op->outdata);
-    encode(bufferlist(), data_op->outdata);
-  }
+  strip_oob_delivered(*data_op, sparse_extents);
   res.bytes = static_cast<uint64_t>(pushed);
   if (d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME) {
     // checksum each placed range at the storage node, after it
@@ -9525,6 +9551,111 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
   }
   return true;
 }
+
+namespace {
+// a read reply whose data is on its way out of band: owned jointly by
+// the delivery completions, the last of which sends it. Nothing here
+// needs the PG; the op context is already closed.
+struct OobReply {
+  OSDService *osd;
+  MOSDOpReply *reply;
+  ConnectionRef con;
+  OpRequestRef op;
+  std::vector<OSDOp> rops;  // the reply's ops, data still inline
+  std::vector<ceph::rdma::oob_result_t> oob;
+  std::vector<std::map<uint64_t, uint64_t>> sparse_extents;
+  std::atomic<unsigned> pending{0};
+  std::atomic<bool> any{false};
+
+  // each completion touches only its own index
+  void complete_one(size_t idx, ssize_t r, ceph::rdma::oob_result_t&& res) {
+    if (r >= 0) {
+      strip_oob_delivered(rops[idx], sparse_extents[idx]);
+      oob[idx] = std::move(res);
+      any = true;
+    } else {
+      lgeneric_subdout(osd->cct, osd, 10)
+	<< "oob delivery of op " << idx << " failed (" << r
+	<< "), delivering inline" << dendl;
+    }
+    if (--pending == 0) {
+      send();
+    }
+  }
+  void send() {
+    if (any) {
+      reply->set_oob_results(std::move(oob));
+    }
+    reply->claim_ops(rops);
+    op->mark_event("oob_delivered");
+    osd->send_message_osd_client(reply, con);
+    reply = nullptr;
+  }
+};
+} // anonymous namespace
+
+bool PrimaryLogPG::start_oob_delivery(OpContext *ctx, MOSDOpReply *reply)
+{
+  auto m = ctx->op->get_req<MOSDOp>();
+  const auto& deliveries = m->get_rdma_deliveries();
+  auto state = std::make_shared<OobReply>();
+  reply->claim_ops(state->rops);
+  auto& rops = state->rops;
+  if (!oob_delivery_allowed(ctx, rops.size())) {
+    reply->claim_ops(rops);
+    return false;
+  }
+  state->oob.resize(rops.size());
+  state->sparse_extents.resize(rops.size());
+
+  // the transfer may only be initiated inside both leases; the delivery
+  // thread re-checks this bound when it gets to the plan
+  utime_t initiate_by = m->get_recv_stamp();
+  initiate_by += pool.info.get_rdma_delivery_lease();
+  {
+    const auto readable_left =
+      recovery_state.get_readable_until() - osd->get_mnow();
+    utime_t read_lease_end = ceph_clock_now();
+    read_lease_end += std::chrono::duration<double>(readable_left).count();
+    initiate_by = std::min(initiate_by, read_lease_end);
+  }
+
+  std::vector<OSDCuObj::plan_request> reqs;
+  for (size_t i = 0; i < rops.size(); i++) {
+    if (deliveries[i].empty()) {
+      continue;
+    }
+    const auto& d = deliveries[i];
+    OSDCuObj::plan_request req;
+    if (!plan_op_oob(ctx, rops[i], d, req.plan, req.data,
+		     state->sparse_extents[i])) {
+      continue;
+    }
+    req.key = m->get_hobj().oid.name;
+    req.token = d.token;
+    req.want_crc64 = d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME;
+    req.initiate_by = initiate_by;
+    req.on_done = [state, i](ssize_t r, ceph::rdma::oob_result_t&& res) {
+      state->complete_one(i, r, std::move(res));
+    };
+    reqs.push_back(std::move(req));
+  }
+  if (reqs.empty()) {
+    reply->claim_ops(rops);
+    return false;
+  }
+  state->osd = osd;
+  state->reply = reply;
+  state->con = m->get_connection();
+  state->op = ctx->op;
+  // set before anything is queued: a completion may run immediately
+  state->pending = reqs.size();
+  ctx->op->mark_event("oob_delivery_queued");
+  for (auto& req : reqs) {
+    osd->cuobj->execute_plan_async(std::move(req));
+  }
+  return true;
+}
 #endif // WITH_OSD_CUOBJ
 
 void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
@@ -9546,7 +9677,9 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
   ctx->reply = nullptr;
 
 #ifdef WITH_OSD_CUOBJ
-  if (result >= 0 && osd->cuobj && m->has_rdma_delivery()) {
+  const bool oob_wanted =
+    result >= 0 && osd->cuobj && m->has_rdma_delivery();
+  if (oob_wanted && !osd->cuobj->has_async_delivery()) {
     // advisory out-of-band delivery: try to RDMA-write each
     // descriptor-bearing op's read data straight into the client
     // window; on any refusal or failure the reply simply keeps that
@@ -9583,6 +9716,17 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
 
   reply->set_result(result);
   reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+#ifdef WITH_OSD_CUOBJ
+  if (oob_wanted && osd->cuobj->has_async_delivery() &&
+      start_oob_delivery(ctx, reply)) {
+    // the read data is staged from the reply's own buffers, so the op
+    // context (and with it the object lock) can go now; the delivery
+    // threads send the reply once the transfers complete, with no
+    // worker or PG lock held meanwhile
+    close_op_ctx(ctx);
+    return;
+  }
+#endif
   osd->send_message_osd_client(reply, m->get_connection());
   close_op_ctx(ctx);
 }

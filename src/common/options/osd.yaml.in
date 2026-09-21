@@ -1681,7 +1681,7 @@ options:
   type: uint
   level: advanced
   desc: Number of DC initiators (cuObject channels); must be at least the
-    number of osd op worker threads
+    number of osd op worker threads plus osd_cuobj_delivery_threads
   default: 128
   services:
   - osd
@@ -1694,6 +1694,18 @@ options:
     copying it into a pre-registered staging buffer; trades a per-read memory
     registration for two passes over the memory bus
   default: false
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_cuobj_delivery_threads
+  type: uint
+  level: advanced
+  desc: Threads that carry out-of-band RDMA deliveries to completion so the
+    op worker (and the PG lock it holds) is released as soon as the read
+    data is handed over; each multiplexes up to 16 writes over its own
+    channel. 0 delivers synchronously from the op worker.
+  default: 0
   services:
   - osd
   flags:

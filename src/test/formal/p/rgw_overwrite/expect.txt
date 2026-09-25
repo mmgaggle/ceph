@@ -1,0 +1,49 @@
+tcPutsSafe                     holds
+tcPutsIndex                    violated the bucket index lists
+tcPutsCancelKeepsVer           holds
+tcBugNoIdTagGuard              violated leaked
+tcPutVsCompleteSafe            holds
+tcPutVsCompleteLeak            violated leaked
+tcPutVsCompleteLoserGc         holds
+tcBugCancelSkipsRemoveObjs     violated orphaned in the multipart namespace
+tcCompletesSafe                holds
+tcCompletesLeak                violated leaked
+tcCompletesLoserGc             holds
+tcSameCompletes                holds
+tcBugNoLockRenewal             violated deleted
+tcBugReplayNoEtag              violated answered success with ETag 0
+tcReupload                     holds
+tcBugNoMetaVersionCheck        violated leaked
+tcBugHistoryNoSkip             violated deleted
+tcAbortVsComplete              holds
+tcBugAbortNoLock               violated deleted
+tcAssumeLockHeld               violated deleted
+tcLcAbortVsComplete            violated deleted
+tcLcAbortTakesLock             holds
+tcCrashThenRetry               violated deleted
+tcCrashThenAbort               violated deleted
+tcMetaDeleteFailsThenRetry     violated deleted
+tcMetaDeleteFailsThenAbort     violated deleted
+tcSparesHeadCrashRetry         holds
+tcSparesHeadCrashAbort         holds
+tcSparesHeadCrashPutRetry      violated deleted
+tcDelVsPutSafe                 holds
+tcDelVsPutLeak                 violated leaked
+tcDelVsPutGuard                holds
+tcDelsAndPutSafe               holds
+tcDelsAndPutIndex              violated the bucket index lists
+tcDelsCancelKeepsVer           holds
+tcDelVsCompleteSafe            holds
+tcDelVsCompleteLeak            violated leaked
+tcDelVsCompleteGuard           holds
+tcCopyVsPutSrc                 holds
+tcBugCopyNoRefs                violated deleted
+tcCopyVsDelSrc                 holds
+tcCopyVsPutDstSafe             holds
+tcCopyVsPutDstLeak             violated leaked
+tcCopyVsPutDstDropRefs         holds
+tcCopyThenDeletes              holds
+tcCopySelfVsPutLoss            violated deleted
+tcCopySelfGuarded              holds
+tcCopyMpu                      holds
+tcCrashCopyRetry               violated deleted

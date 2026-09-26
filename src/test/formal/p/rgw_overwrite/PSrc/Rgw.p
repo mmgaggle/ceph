@@ -10,14 +10,26 @@
  *   RadosMultipartUpload::complete);
  * - AbortMultipartUpload (RGWAbortMultipart) and lifecycle's
  *   AbortIncompleteMultipartUpload (RGWLC::handle_multipart_expiration),
- *   both through RadosMultipartUpload::abort.
+ *   both through RadosMultipartUpload::abort;
+ * - a bucket listing's repair of entries with pending ops
+ *   (cls_bucket_list_ordered, check_disk_state);
+ * - dedup of one key's object onto another's with the same bytes
+ *   (rgw::dedup::Background::dedup_object);
+ * - a bucket reshard (RGWBucketReshard::execute).
+ * A request reads the bucket's index layout when it starts. An index op
+ * answered -ERR_BUSY_RESHARDING waits for the reshard to commit and is
+ * retried on the new layout (UpdateIndex::guard_reshard).
  * A request's tag, and the writer recorded in what it writes, is its rid.
+ * write_meta's outcome is WRITTEN, LOST (a lost race, answered as
+ * success) or FAILED (the head was written but the index completion
+ * failed, answered as an error).
  */
 machine Rgw {
   var cfg: tCfg;
   var store: machine;
   var driver: machine;
   var rid: int;
+  var gen: int;
 
   start state Serve {
     entry (p: (cfg: tCfg, store: machine, driver: machine, rid: int, req: tSpec)) {
@@ -26,6 +38,7 @@ machine Rgw {
       driver = p.driver;
       rid = p.rid;
       announce mStarted, rid;
+      gen = GetLayout();
       if (p.req.kind == R_PUT) {
         PutObject(p.req.key);
       } else if (p.req.kind == R_DELETE) {
@@ -38,6 +51,12 @@ machine Rgw {
         CompleteMultipart(p.req.upload, p.req.list);
       } else if (p.req.kind == R_ABORT) {
         Abort(p.req.upload, cfg.abortTakesLock);
+      } else if (p.req.kind == R_LIST) {
+        ListBucket();
+      } else if (p.req.kind == R_DEDUP) {
+        Dedup(p.req.src, p.req.key);
+      } else if (p.req.kind == R_RESHARD) {
+        Reshard();
       } else {
         Abort(p.req.upload, cfg.lcTakesLock);
       }
@@ -48,13 +67,15 @@ machine Rgw {
   // first chunk) in write_meta
   fun PutObject(key: int) {
     var tail: set[int];
+    var w: int;
     tail += (TAIL(rid));
     WriteData(tail);
-    if (WriteMeta(key, tail, rid, 0, default(set[int]), rid, false)) {
-      // lost a race: ~RadosWriter removes the tail it wrote
+    w = WriteMeta(key, tail, rid, 0, default(set[int]), rid, false, 1);
+    if (w != WRITTEN()) {
+      // lost a race, or failed: ~RadosWriter removes the tail it wrote
       DeleteInline(tail);
     }
-    Answer(true);
+    Answer(w != FAILED());
   }
 
   // RGWRados::Object::Delete::delete_obj on a non-versioned bucket
@@ -70,13 +91,20 @@ machine Rgw {
     // cls_rgw_remove_obj; on main without the ID tag check (55f5b762c67)
     r = HeadRemove(key, cfg.deleteGuard, st.tag);
     if (r.rc == OK || r.rc == ENOENT) {
-      IndexComplete(key, IX_DEL, 1, r.epoch, default(set[int]));
+      if (cfg.ixCompleteMayFail && $) {
+        // complete_del fails before the op reaches the OSD: the pending
+        // op stays, and the error is answered after the tail goes to GC
+        SendGc(st.tailTag, st.manifest);
+        Answer(false);
+        return;
+      }
+      IndexComplete(key, IX_DEL, 1, r.epoch, 0, default(set[int]));
       // complete_atomic_modification: the head it read goes to GC
       SendGc(st.tailTag, st.manifest);
       Answer(true);
       return;
     }
-    IndexComplete(key, IX_CANCEL, -1, 0, default(set[int]));
+    IndexComplete(key, IX_CANCEL, -1, 0, 0, default(set[int]));
     Answer(false);
   }
 
@@ -90,6 +118,7 @@ machine Rgw {
     var g: int;
     var rc: tRc;
     var canceled: bool;
+    var w: int;
     s = ReadHead(src);
     if (!s.present) {
       Answer(false);  // NoSuchKey
@@ -100,11 +129,12 @@ machine Rgw {
       // kept. The write reads the head afresh (the destination has its own
       // RGWObjectCtx), so it guards on whatever head is there by then.
       if (cfg.copySelfGuardsSource) {
-        canceled = WriteHeadOver(dst, s, s.manifest, s.etag, s.upload, s.tailTag);
+        canceled = WriteHeadOver(dst, s, s.manifest, s.etag, s.upload, s.tailTag, s.size);
+        Answer(true);
       } else {
-        canceled = WriteMeta(dst, s.manifest, s.etag, s.upload, default(set[int]), s.tailTag, true);
+        w = WriteMeta(dst, s.manifest, s.etag, s.upload, default(set[int]), s.tailTag, true, s.size);
+        Answer(w != FAILED());
       }
-      Answer(true);
       return;
     }
     if (cfg.copyTakesRefs) {
@@ -121,20 +151,19 @@ machine Rgw {
         got += (o);
       }
     }
-    canceled = WriteMeta(dst, s.manifest, s.etag, 0, default(set[int]), rid, false);
-    if (canceled && cfg.copyLoserDropsRefs) {
+    w = WriteMeta(dst, s.manifest, s.etag, 0, default(set[int]), rid, false, s.size);
+    // done_ret drops the references on an error; a lost race keeps them
+    if (w == FAILED() || (w == LOST() && cfg.copyLoserDropsRefs)) {
       foreach (g in got) {
         rc = RefPut(g, rid);
       }
     }
-    Answer(true);
+    Answer(w != FAILED());
   }
 
-  // RGWRados::Object::Write::write_meta and _do_write_meta. Returns true
-  // if the write was canceled - it lost a race, which RGW answers as a
-  // success.
+  // RGWRados::Object::Write::write_meta and _do_write_meta
   fun WriteMeta(key: int, manifest: set[int], etag: int, upload: int, removeKeys: set[int],
-                tailTag: int, keepTail: bool): bool {
+                tailTag: int, keepTail: bool, size: int): int {
     var st: tHead;
     var nh: tHead;
     var r: (rc: tRc, epoch: int);
@@ -144,7 +173,7 @@ machine Rgw {
     var old: set[int];
     var o: int;
     nh = (present = true, tag = rid, tailTag = tailTag, manifest = manifest, writer = rid, etag = etag,
-          upload = upload);
+          upload = upload, size = size, ver = 0);
     // first without reading the head, as an exclusive create; on
     // -EEXIST, read it and replace it
     assumeNoent = true;
@@ -169,8 +198,8 @@ machine Rgw {
     }
     if (r.rc != OK) {
       // done_cancel: -ECANCELED, -ENOENT or -EEXIST, answered as success
-      IndexComplete(key, IX_CANCEL, -1, 0, removeKeys);
-      return true;
+      IndexComplete(key, IX_CANCEL, -1, 0, 0, removeKeys);
+      return LOST();
     }
     // complete_atomic_modification: the replaced head's manifest goes to
     // GC under its tail tag, unless keep_tail
@@ -182,24 +211,196 @@ machine Rgw {
       }
       SendGc(st.tailTag, old);
     }
-    IndexComplete(key, IX_ADD, 1, r.epoch, removeKeys);
-    return false;
+    if (cfg.ixCompleteMayFail && $) {
+      // UpdateIndex::complete fails before the op reaches the OSD
+      if (cfg.ixFailKeepsWrite) {
+        return WRITTEN();  // the pending op stays for a listing to repair
+      }
+      // done_cancel: the cancel may fail the same way; the caller then
+      // undoes its write
+      if ($) {
+        IndexComplete(key, IX_CANCEL, -1, 0, 0, removeKeys);
+      }
+      return FAILED();
+    }
+    IndexComplete(key, IX_ADD, 1, r.epoch, size, removeKeys);
+    return WRITTEN();
+  }
+
+  // Background::dedup_object: the target comes to share the source's
+  // tail. The records are the scan's: each head's ETag, manifest and ref
+  // tag (the tail tag).
+  fun Dedup(src: int, tgt: int) {
+    var s: tHead;
+    var t: tHead;
+    var got: set[int];
+    var o: int;
+    var g: int;
+    var rc: tRc;
+    s = ReadHead(src);
+    t = ReadHead(tgt);
+    if (!s.present || !t.present || s.etag != t.etag) {
+      Answer(false);
+      return;
+    }
+    // inc_ref_count_by_manifest: the source's tail, under the target's tag
+    foreach (o in s.manifest) {
+      rc = RefGet(o, t.tailTag);
+      if (rc != OK) {
+        foreach (g in got) {
+          rc = RefPut(g, t.tailTag);
+        }
+        Answer(false);
+        return;
+      }
+      got += (o);
+    }
+    // the source head, then the target head, each under cmpxattr on its
+    // ETag and ref tag; a failure rolls the references back
+    rc = HeadRewrite(src, s.etag, s.tailTag, false, default(set[int]));
+    if (rc == OK) {
+      rc = HeadRewrite(tgt, t.etag, t.tailTag, true, s.manifest);
+    }
+    if (rc != OK) {
+      foreach (g in got) {
+        rc = RefPut(g, t.tailTag);
+      }
+      Answer(false);
+      return;
+    }
+    // free_tail_objs_by_manifest: the target's old tail, at once, not
+    // through GC
+    foreach (o in t.manifest) {
+      rc = RefPut(o, t.tailTag);
+    }
+    Answer(true);
+  }
+
+  fun HeadRewrite(key: int, etag: int, tailTag: int, setManifest: bool, manifest: set[int]): tRc {
+    var r: tRc;
+    send store, eHeadRewrite, (from = this, key = key, etag = etag, tailTag = tailTag, setManifest = setManifest,
+                               manifest = manifest);
+    receive {
+      case eDataDone: (x: tRc) { r = x; }
+    }
+    return r;
+  }
+
+  // RGWBucketReshard::do_reshard, with logrecord
+  fun Reshard() {
+    var src: (ix: map[int, tIx], mp: set[int]);
+    var k: int;
+    var o: int;
+    ReshardOp(0);
+    // the inventory: each source entry as listed, copied to the target
+    src = ReshardList();
+    foreach (k in keys(src.ix)) {
+      if (src.ix[k].present) {
+        ReshardPut(true, k, src.ix[k]);
+      }
+    }
+    foreach (o in src.mp) {
+      ReshardPut(false, o, default(tIx));
+    }
+    ReshardOp(1);  // in progress: client index ops block
+    ReshardOp(2);  // the incremental pass over the logged entries
+    ReshardOp(3);  // commit
+    Answer(true);
+  }
+
+  fun ReshardOp(step: int) {
+    if (step == 0) {
+      send store, eReshardStart, this;
+    } else if (step == 1) {
+      send store, eReshardBlock, this;
+    } else if (step == 2) {
+      send store, eReshardInc, this;
+    } else {
+      send store, eReshardCommit, this;
+    }
+    receive {
+      case eIndexDone: (rc: tRc) { }
+    }
+  }
+
+  fun ReshardList(): (ix: map[int, tIx], mp: set[int]) {
+    var r: (ix: map[int, tIx], mp: set[int]);
+    send store, eReshardList, this;
+    receive {
+      case eReshardEntries: (x: (ix: map[int, tIx], mp: set[int])) { r = x; }
+    }
+    return r;
+  }
+
+  fun ReshardPut(isMain: bool, id: int, e: tIx) {
+    send store, eReshardPut, (from = this, isMain = isMain, id = id, e = e);
+    receive {
+      case eIndexDone: (rc: tRc) { }
+    }
+  }
+
+  fun GetLayout(): int {
+    var g: int;
+    send store, eGetLayout, this;
+    receive {
+      case eLayout: (x: int) { g = x; }
+    }
+    return g;
+  }
+
+  // -ERR_BUSY_RESHARDING: block_while_resharding, then the new layout
+  fun Rewait() {
+    send store, eWaitLayout, this;
+    receive {
+      case eLayout: (x: int) { gen = x; }
+    }
+  }
+
+  fun WRITTEN(): int { return 0; }
+  fun LOST(): int { return 1; }
+  fun FAILED(): int { return 2; }
+
+  // cls_bucket_list_ordered: an entry with pending ops, or not marked as
+  // existing, goes through check_disk_state, which reads the head and
+  // suggests an update from it, or a removal
+  fun ListBucket() {
+    var k: int;
+    var e: tIx;
+    var h: tHead;
+    var o: int;
+    k = 1;
+    while (k <= 2) {
+      e = ListEntry(k);
+      if (e.present && (!e.listed || sizeof(e.pending) > 0)) {
+        h = ReadHead(k);
+        if (h.present && h.upload != 0) {
+          // a multipart head's parts leave the multipart namespace
+          foreach (o in h.manifest) {
+            MpIndexDel(o);
+          }
+        }
+        Suggest(k, !h.present, h, e.iver);
+      }
+      k = k + 1;
+    }
+    Answer(true);
   }
 
   // proposed: a keep_tail rewrite guarded on the head it read before, so
   // it lands only over that head
-  fun WriteHeadOver(key: int, st: tHead, manifest: set[int], etag: int, upload: int, tailTag: int): bool {
+  fun WriteHeadOver(key: int, st: tHead, manifest: set[int], etag: int, upload: int, tailTag: int,
+                     size: int): bool {
     var nh: tHead;
     var r: (rc: tRc, epoch: int);
     nh = (present = true, tag = rid, tailTag = tailTag, manifest = manifest, writer = rid, etag = etag,
-          upload = upload);
+          upload = upload, size = size, ver = 0);
     IndexPrepare(key);
     r = HeadWrite(key, true, st.tag, false, nh);
     if (r.rc != OK) {
-      IndexComplete(key, IX_CANCEL, -1, 0, default(set[int]));
+      IndexComplete(key, IX_CANCEL, -1, 0, 0, default(set[int]));
       return true;
     }
-    IndexComplete(key, IX_ADD, 1, r.epoch, default(set[int]));
+    IndexComplete(key, IX_ADD, 1, r.epoch, size, default(set[int]));
     return false;
   }
 
@@ -248,7 +449,7 @@ machine Rgw {
     var manifest: set[int];
     var removeKeys: set[int];
     var chain: set[int];
-    var canceled: bool;
+    var w: int;
     var i: int;
     var rc: tRc;
     var k: int;
@@ -314,8 +515,14 @@ machine Rgw {
       }
       processed[num] = hist.done;
     }
-    canceled = WriteMeta(MPKEY(), manifest, MPETAG(list), u, removeKeys, rid, false);
-    if (canceled && cfg.loserGcsParts) {
+    w = WriteMeta(MPKEY(), manifest, MPETAG(list), u, removeKeys, rid, false, sizeof(manifest));
+    if (w == FAILED()) {
+      // RadosMultipartUpload::complete returns the error: the meta
+      // object stays, and complete() releases the lock
+      Finish(u, false);
+      return;
+    }
+    if (w == LOST() && cfg.loserGcsParts) {
       SendGc(UPLOADTAG(u), manifest);
     }
     if (cfg.completeMayCrash && $) {
@@ -474,6 +681,7 @@ machine Rgw {
   }
 
   fun Answer(ok: bool) {
+    send store, eFinished, rid;
     announce mAnswered, (rid = rid, ok = ok);
     send driver, eDone, (rid = rid, crashed = false);
   }
@@ -566,31 +774,76 @@ machine Rgw {
   }
 
   fun IndexPrepare(key: int) {
-    send store, eIndexPrepare, (from = this, key = key, tag = rid);
-    receive {
-      case eIndexDone: (rc: tRc) { }
+    var r: tRc;
+    r = EBUSY;
+    while (r == EBUSY) {
+      send store, eIndexPrepare, (from = this, gen = gen, key = key, tag = rid);
+      receive {
+        case eIndexDone: (rc: tRc) { r = rc; }
+      }
+      if (r == EBUSY) {
+        Rewait();
+      }
     }
   }
 
-  fun IndexComplete(key: int, op: tIxOp, pool: int, epoch: int, removeKeys: set[int]) {
-    send store, eIndexComplete, (from = this, key = key, op = op, tag = rid, pool = pool, epoch = epoch,
-                                 writer = rid, removeKeys = removeKeys);
+  fun IndexComplete(key: int, op: tIxOp, pool: int, epoch: int, size: int, removeKeys: set[int]) {
+    var r: tRc;
+    r = EBUSY;
+    while (r == EBUSY) {
+      send store, eIndexComplete, (from = this, gen = gen, key = key, op = op, tag = rid, pool = pool,
+                                   epoch = epoch, writer = rid, size = size, removeKeys = removeKeys);
+      receive {
+        case eIndexDone: (rc: tRc) { r = rc; }
+      }
+      if (r == EBUSY) {
+        Rewait();
+      }
+    }
+  }
+
+  fun ListEntry(key: int): tIx {
+    var e: tIx;
+    send store, eListEntry, (from = this, key = key);
+    receive {
+      case eIxEntry: (x: tIx) { e = x; }
+    }
+    return e;
+  }
+
+  // cls_rgw_suggest_changes is sent and not retried
+  fun Suggest(key: int, remove: bool, h: tHead, iverSeen: int) {
+    send store, eSuggest, (from = this, gen = gen, key = key, remove = remove, head = h, iverSeen = iverSeen);
     receive {
       case eIndexDone: (rc: tRc) { }
     }
   }
 
   fun MpIndexAdd(key: int) {
-    send store, eMpIndexAdd, (from = this, key = key);
-    receive {
-      case eIndexDone: (rc: tRc) { }
+    var r: tRc;
+    r = EBUSY;
+    while (r == EBUSY) {
+      send store, eMpIndexAdd, (from = this, gen = gen, key = key);
+      receive {
+        case eIndexDone: (rc: tRc) { r = rc; }
+      }
+      if (r == EBUSY) {
+        Rewait();
+      }
     }
   }
 
   fun MpIndexDel(key: int) {
-    send store, eMpIndexDel, (from = this, key = key);
-    receive {
-      case eIndexDone: (rc: tRc) { }
+    var r: tRc;
+    r = EBUSY;
+    while (r == EBUSY) {
+      send store, eMpIndexDel, (from = this, gen = gen, key = key);
+      receive {
+        case eIndexDone: (rc: tRc) { r = rc; }
+      }
+      if (r == EBUSY) {
+        Rewait();
+      }
     }
   }
 
@@ -648,9 +901,15 @@ machine Rgw {
 
   fun MetaDelete(u: int, checkVer: int, removeKeys: set[int]): tRc {
     var r: tRc;
-    send store, eMetaDelete, (from = this, upload = u, checkVer = checkVer, removeKeys = removeKeys);
-    receive {
-      case eMetaRc: (x: (rc: tRc, ver: int)) { r = x.rc; }
+    r = EBUSY;
+    while (r == EBUSY) {
+      send store, eMetaDelete, (from = this, gen = gen, upload = u, checkVer = checkVer, removeKeys = removeKeys);
+      receive {
+        case eMetaRc: (x: (rc: tRc, ver: int)) { r = x.rc; }
+      }
+      if (r == EBUSY) {
+        Rewait();
+      }
     }
     return r;
   }

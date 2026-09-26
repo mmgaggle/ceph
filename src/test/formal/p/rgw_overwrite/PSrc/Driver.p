@@ -13,11 +13,11 @@ machine Driver {
   var nextRid: int;
 
   start state Run {
-    entry (p: (cfg: tCfg, objects: set[int], uploads: set[int], script: seq[seq[tSpec]])) {
+    entry (p: (cfg: tCfg, objects: set[int], twins: bool, uploads: set[int], script: seq[seq[tSpec]])) {
       cfg = p.cfg;
       script = p.script;
       nextRid = 2;
-      store = new Store((cfg = cfg, objects = p.objects, uploads = p.uploads));
+      store = new Store((cfg = cfg, objects = p.objects, twins = p.twins, uploads = p.uploads));
       Launch();
     }
 

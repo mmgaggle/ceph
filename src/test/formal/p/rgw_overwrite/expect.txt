@@ -47,3 +47,28 @@ tcCopySelfVsPutLoss            violated deleted
 tcCopySelfGuarded              holds
 tcCopyMpu                      holds
 tcCrashCopyRetry               violated deleted
+tcIxFailPutLoss                violated deleted
+tcIxFailPutIndex               violated the bucket index lists
+tcIxFailCopyLoss               violated deleted
+tcIxFailRetryLoss              violated deleted
+tcIxKeepsWritePut              holds
+tcIxKeepsWriteCopy             holds
+tcIxKeepsWriteRetry            holds
+tcListVsPut                    holds
+tcListVsDel                    holds
+tcListVsComplete               holds
+tcAssumeWritersPrompt          violated the bucket index lists
+tcDedupThenDeletes             holds
+tcDedupVsPutTgtSafe            holds
+tcDedupVsPutTgtLeak            violated leaked
+tcDedupVsDelTgtLeak            violated leaked
+tcDedupVsDelTgtGuarded         violated leaked
+tcDedupVsPutSrc                holds
+tcDedupVsCopySelfLoss          violated deleted
+tcDedupVsCopySelfGuarded       violated deleted
+tcReshardVsPuts                holds
+tcReshardVsDel                 holds
+tcReshardVsMpu                 holds
+tcBugReshardNoLog              violated the bucket index lists
+tcBugReshardNoCheckExisting    violated the bucket stats say
+tcBugOldShardsOpen             violated the bucket index lists

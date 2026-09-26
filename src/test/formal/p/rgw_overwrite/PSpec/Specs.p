@@ -30,10 +30,9 @@ spec HeadIntact observes mHead, mDeleted, mCreated {
   }
 }
 
-// At the end, once nothing is pending on a key's bucket index entry, the
-// entry lists the object the key's head holds, or nothing if there is no
-// head. (A pending entry would be checked against the head by the next
-// listing.)
+// At the end, after a listing has repaired the entries with pending ops,
+// each key's bucket index entry lists the object its head holds, or
+// nothing if there is no head.
 spec IndexMatchesHead observes mFinal {
   start state Watch {
     on mFinal do (f: tFinal) {
@@ -43,17 +42,40 @@ spec IndexMatchesHead observes mFinal {
       foreach (k in keys(f.heads)) {
         h = f.heads[k];
         e = f.ixs[k];
-        if (sizeof(e.pending) == 0) {
-          if (h.present) {
-            assert e.present && e.listed && e.writer == h.writer,
-              format("the bucket index lists request {0}'s object at key {1} (listed: {2}), but the head holds request {3}'s",
-                     e.writer, k, e.present && e.listed, h.writer);
-          } else {
-            assert !(e.present && e.listed),
-              format("the bucket index lists request {0}'s object at key {1}, but there is no head", e.writer, k);
-          }
+        if (h.present) {
+          assert e.present && e.listed && e.writer == h.writer,
+            format("the bucket index lists request {0}'s object at key {1} (listed: {2}), but the head holds request {3}'s",
+                   e.writer, k, e.present && e.listed, h.writer);
+        } else {
+          assert !(e.present && e.listed),
+            format("the bucket index lists request {0}'s object at key {1}, but there is no head", e.writer, k);
         }
       }
+    }
+  }
+}
+
+// At the end, the index header's stats count every listed entry, in both
+// namespaces, with its size.
+spec BucketStats observes mFinal {
+  start state Watch {
+    on mFinal do (f: tFinal) {
+      var k: int;
+      var count: int;
+      var size: int;
+      foreach (k in keys(f.ixs)) {
+        if (f.ixs[k].present && f.ixs[k].listed) {
+          count = count + 1;
+          size = size + f.ixs[k].size;
+        }
+      }
+      foreach (k in f.mpIndex) {
+        count = count + 1;
+        size = size + MPSIZE(k);
+      }
+      assert f.statCount == count && f.statSize == size,
+        format("the bucket stats say {0} entries of total size {1}, but the index lists {2} of size {3}",
+               f.statCount, f.statSize, count, size);
     }
   }
 }

@@ -9,7 +9,7 @@ for the mechanism.
 
 | Model | Covers | Properties |
 |---|---|---|
-| [`rgw_overwrite`](rgw_overwrite/README.md) | PutObject, DeleteObject, CopyObject with a shared tail, and multipart completion over existing keys: head-object races, the bucket index entry, `cls_refcount`, part re-uploads, abort, lifecycle's abort, GC | no head's data is deleted; the index matches the head; nothing leaks; every request answered |
+| [`rgw_overwrite`](rgw_overwrite/README.md) | PutObject, DeleteObject, CopyObject with a shared tail, dedup and multipart completion over existing keys: head-object races, the bucket index entry and stats, listings, resharding, `cls_refcount`, part re-uploads, abort, lifecycle's abort, GC | no head's data is deleted; the index matches the head; the stats match the index; nothing leaks; every request answered |
 
 ## Running
 
@@ -31,7 +31,7 @@ test name may be a prefix of another.
 
 ## What the models found
 
-`rgw_overwrite` finds seven gaps on main, detailed in its README:
+`rgw_overwrite` finds eleven gaps on main, detailed in its README:
 
 - **The bucket index can keep a stale entry.** A stale or canceled
   completion still overwrites the entry's version. Three overlapping
@@ -49,3 +49,14 @@ test name may be a prefix of another.
   reference no head carries.
 - **A copy onto itself can write a deleted tail back into the head.** An
   overwrite between the copy's read and its write loses the object's data.
+- **A failed index completion undoes a write that already happened.** On
+  a FIFO-bilog bucket the bilog flush can fail after the head write; the
+  write's tail is then deleted, or a copy's references dropped.
+- **A writer that read a head before dedup rewrote it leaks the source's
+  tail.** Dedup changes the manifest but not the ID tag writers guard on.
+- **Dedup and a copy onto itself can delete the object's data.** Dedup
+  frees the old tail at once, and the copy writes it back.
+- **A write that stalls past the pending-op expiry is lost from the
+  index.** A listing rewrites the entry from the old head.
+
+Resharding holds, and each of its mechanisms is needed.

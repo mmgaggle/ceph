@@ -22,6 +22,10 @@ type tCfg = (
   replayAnswersEtag: bool,     // a replayed completion answers the object's ETag (565077e2f1c)
   copyTakesRefs: bool,         // a copy that shares the source's tail takes a cls_refcount
                                // reference on each tail object
+  reshardLogs: bool,           // entries changed while resharding in logrecord are logged, and the
+                               // incremental pass copies them again (55b404afeb6)
+  reshardCheckExisting: bool,  // the incremental pass takes a re-copied entry's old stats out
+  oldShardsBlocked: bool,      // after the commit, the old shards still answer -ERR_BUSY_RESHARDING
   // proposed (false is main)
   cancelKeepsVer: bool,        // an index cancel leaves the entry's version alone
   lcTakesLock: bool,           // lifecycle's abort takes the completion lock too
@@ -32,27 +36,38 @@ type tCfg = (
                                // (as before 55f5b762c67)
   copyLoserDropsRefs: bool,    // a copy that loses the head race drops the references it took
   copySelfGuardsSource: bool,  // a copy onto itself writes only over the head it copied
+  ixFailKeepsWrite: bool,      // an index completion that fails after the head write neither
+                               // cancels the index op nor undoes the write
   // environment
   completeMayCrash: bool,      // RGW may die after a completion's head write, before it
                                // deletes the meta object; the lock then expires
   metaDeleteMayFail: bool,     // deleting the meta object may fail other than with -ECANCELED
+  ixCompleteMayFail: bool,     // an index completion may fail before it reaches the OSD, as
+                               // the FIFO bilog flush can (a67a233ccbd); so may the cancel
   // assumption
-  lockHeld: bool               // a live holder keeps the completion lock (renewal succeeds)
+  lockHeld: bool,              // a live holder keeps the completion lock (renewal succeeds)
+  writersPrompt: bool          // a request completes its index op before its pending op
+                               // expires (rgw_pending_bucket_index_op_expiration, 120 s)
 );
 
 enum tRc { OK, EEXIST, ECANCELED, ENOENT, EBUSY, EIO, EINVAL }
 
 // What a key's head object holds. writer is the request that wrote it;
 // tailTag is the tag its tail is referenced by (RGW_ATTR_TAIL_TAG).
-type tHead = (present: bool, tag: int, tailTag: int, manifest: set[int], writer: int, etag: int, upload: int);
+// size is the object's size in the model's units; ver is the head
+// object's RADOS version, set by the Store.
+type tHead = (present: bool, tag: int, tailTag: int, manifest: set[int], writer: int, etag: int, upload: int,
+              size: int, ver: int);
 
-// a key's bucket index entry: listed = entry.exists; ver = (pool, epoch)
-type tIx = (present: bool, listed: bool, writer: int, pool: int, epoch: int, pending: set[int]);
+// a key's bucket index entry: listed = entry.exists; ver = (pool, epoch);
+// iver = entry.index_ver, bumped whenever an op completes on the entry
+type tIx = (present: bool, listed: bool, writer: int, size: int, pool: int, epoch: int, pending: set[int],
+            iver: int);
 
 // an uploaded part as the meta object records it (RGWUploadPartInfo)
 type tPart = (prefix: int, etag: int, past: set[int]);
 
-enum tKind { R_PUT, R_DELETE, R_COPY, R_UPLOAD_PART, R_COMPLETE, R_ABORT, R_LC_ABORT }
+enum tKind { R_PUT, R_DELETE, R_COPY, R_UPLOAD_PART, R_COMPLETE, R_ABORT, R_LC_ABORT, R_LIST, R_DEDUP, R_RESHARD }
 // key: the key written or deleted, or a copy's destination; src: a copy's source
 type tSpec = (kind: tKind, key: int, src: int, upload: int, num: int, etag: int, list: map[int, int]);
 
@@ -72,6 +87,13 @@ fun PARTETAG(upload: int, num: int): int { return 10 * upload + num; }
 fun UPLOADTAG(upload: int): int { return 900 + upload; }
 // cls_refcount's implicit reference
 fun WILD(): int { return 0; }
+// an entry's size in the multipart namespace: a part 1, the meta object 0
+fun MPSIZE(key: int): int {
+  if (key >= 7000) {
+    return 0;
+  }
+  return 1;
+}
 // a multipart object's ETag is derived from its parts' ETags, in order
 fun MPETAG(list: map[int, int]): int {
   var acc: int;
@@ -94,6 +116,9 @@ event eReadHead: (from: machine, key: int);
 event eHeadRead: tHead;
 event eHeadWrite: (from: machine, key: int, guard: bool, expectTag: int, excl: bool, head: tHead);
 event eHeadRemove: (from: machine, key: int, guard: bool, expectTag: int);
+// dedup's head update: cmpxattr on the ETag and ref (tail) tag, then
+// setxattr of SHARE_MANIFEST and, on the target, of the manifest
+event eHeadRewrite: (from: machine, key: int, etag: int, tailTag: int, setManifest: bool, manifest: set[int]);
 event eHeadWritten: (rc: tRc, epoch: int);
 // data objects
 event eWriteData: (from: machine, objs: set[int]);    // write_full of fresh tail objects
@@ -105,11 +130,30 @@ event eRefPut: (from: machine, obj: int, tag: int);   // cls_refcount_put
 event eDataDone: tRc;
 // the bucket index: each key's entry, and the multipart namespace
 enum tIxOp { IX_ADD, IX_DEL, IX_CANCEL }
-event eIndexPrepare: (from: machine, key: int, tag: int);
-event eIndexComplete: (from: machine, key: int, op: tIxOp, tag: int, pool: int, epoch: int,
-                       writer: int, removeKeys: set[int]);
-event eMpIndexAdd: (from: machine, key: int);   // a part head's own index entry
-event eMpIndexDel: (from: machine, key: int);
+// every index op names the layout generation its RGW read
+event eIndexPrepare: (from: machine, gen: int, key: int, tag: int);
+event eIndexComplete: (from: machine, gen: int, key: int, op: tIxOp, tag: int, pool: int, epoch: int,
+                       writer: int, size: int, removeKeys: set[int]);
+// a listing: an entry as listed, and check_disk_state's suggestion
+event eListEntry: (from: machine, key: int);
+event eIxEntry: tIx;
+event eSuggest: (from: machine, gen: int, key: int, remove: bool, head: tHead, iverSeen: int);
+// the bucket's index layout: its generation, now or once a reshard in
+// progress commits
+event eGetLayout: machine;
+event eWaitLayout: machine;
+event eLayout: int;
+// a reshard: start (logrecord), list the source, copy an entry, block
+// (in progress), the incremental pass, commit
+event eReshardStart: machine;
+event eReshardList: machine;
+event eReshardEntries: (ix: map[int, tIx], mp: set[int]);
+event eReshardPut: (from: machine, isMain: bool, id: int, e: tIx);
+event eReshardBlock: machine;
+event eReshardInc: machine;
+event eReshardCommit: machine;
+event eMpIndexAdd: (from: machine, gen: int, key: int);   // a part head's own index entry
+event eMpIndexDel: (from: machine, gen: int, key: int);
 event eIndexDone: tRc;
 // an upload's meta object
 event eTryLock: (from: machine, upload: int, rid: int);
@@ -119,17 +163,19 @@ event eLocked: bool;
 event eGetAttrs: (from: machine, upload: int);
 event eListParts: (from: machine, upload: int);
 event ePartUpdate: (from: machine, upload: int, num: int, part: tPart);
-event eMetaDelete: (from: machine, upload: int, checkVer: int, removeKeys: set[int]);
+event eMetaDelete: (from: machine, gen: int, upload: int, checkVer: int, removeKeys: set[int]);
 event eMetaRc: (rc: tRc, ver: int);
 event eParts: (rc: tRc, parts: map[int, tPart]);
 event eCrashed: int;                            // a request's RGW died
+event eFinished: int;                           // a request was answered
 event eQuiesce: machine;
 event eQuiesced;
 
 // what the specs see at the end, after GC has run to completion
 type tFinal = (heads: map[int, tHead], ixs: map[int, tIx],
                live: set[int], referenced: set[int],
-               mpIndex: set[int], validKeys: set[int]);
+               mpIndex: set[int], validKeys: set[int],
+               statCount: int, statSize: int);
 
 // monitor-only
 event mHead: (key: int, writer: int, manifest: set[int]);  // a head written, or removed (empty)

@@ -3,8 +3,9 @@
 A model of writes to the keys of a non-versioned bucket that already hold
 objects. A key is overwritten by PutObject, CopyObject or a multipart
 completion, or removed by DeleteObject. Those operations race each other,
-part re-uploads, aborts, lifecycle and GC. A copy within one pool shares
-the source's tail through `cls_refcount`.
+part re-uploads, aborts, lifecycle, dedup, bucket listings, a reshard and
+GC. A copy within one pool, and dedup, share a tail through
+`cls_refcount`.
 
 The model follows the code on main as of `44d50f6abb9`, which includes
 the completion-lock renewal of PR 67696 (tracker #75375). Line numbers
@@ -20,9 +21,12 @@ holds stays readable. Under `cls_refcount`, an object sent to GC under one
 tag can rightly survive through another reference, so only deletion
 counts.
 
-**IndexMatchesHead.** At the end, once nothing is pending on a key's
-bucket index entry, the entry lists the object the head holds, or nothing
-if there is no head.
+**IndexMatchesHead.** At the end, after a listing has repaired the entries
+with pending ops, each key's bucket index entry lists the object the head
+holds, or nothing if there is no head.
+
+**BucketStats.** At the end, the index header's stats count every listed
+entry, in both namespaces, with its size.
 
 **NoOrphans.** At the end, after GC has run every queued chain, every data
 object is referenced by a head or by a live upload. Every entry in the
@@ -58,6 +62,18 @@ dies.
     reference from each object, falling back to the implicit one, and
     deletes an object once it has no references left. GC may run any
     queued chain before any op, and runs them all at the end.
+  - The index header's stats, adjusted as `cls_rgw` adjusts them.
+  - A listing's repair (`rgw_dir_suggest_changes`): it drops pending ops
+    whose tag timeout has expired, and applies a suggestion only when none
+    are left and no op has completed on the entry since the listing read
+    it. At the end, a listing repairs every entry with pending ops.
+  - Resharding with logrecord. In logrecord, index ops apply to the source
+    and log the entries they touch. The inventory copies each source
+    entry to the target. In progress, index ops answer
+    `-ERR_BUSY_RESHARDING`. The incremental pass copies the logged entries
+    again, taking a re-copied entry's old stats out first
+    (`check_existing`). After the commit, the old shards still answer
+    `-ERR_BUSY_RESHARDING`.
   - Each upload's meta object: its parts
     (`cls_rgw_mp_upload_part_info_update`, which carries past prefixes
     forward and bumps the `cls_version`), and the completion lock.
@@ -74,6 +90,13 @@ dies.
     - reads the head and prepares the index;
     - removes the head, with no ID-tag guard since `55f5b762c67`;
     - completes the index `DEL`, then sends the manifest it read to GC.
+  - Every write goes through `write_meta`. If its index completion fails
+    after the head write, as the FIFO bilog flush can make it, it cancels
+    the index op (which may fail too) and returns the error. PutObject
+    then deletes its tail, a copy drops its references, and a completion
+    returns before deleting the meta object.
+  - Every index op names the layout generation its request read, and on
+    `-ERR_BUSY_RESHARDING` waits for the commit and retries.
   - `CopyObject` within one pool (`copy_obj`):
     - reads the source;
     - takes a reference on each tail object under the new head's tag, and
@@ -100,6 +123,17 @@ dies.
     AbortIncompleteMultipartUpload (`RGWLC::handle_multipart_expiration`).
     Both go through `RadosMultipartUpload::abort`; only the first takes
     the lock.
+  - A bucket listing (`cls_bucket_list_ordered`, `check_disk_state`). An
+    entry with pending ops, or not marked as existing, gets a suggestion
+    from its head. For a multipart head, the listing also drops the
+    parts' index entries.
+  - Dedup (`rgw::dedup::Background::dedup_object`) of one key's object
+    onto another's with the same bytes:
+    - takes references on the source's tail under the target's ref tag;
+    - rewrites the source head, then the target head, each under
+      `cmpxattr` on its ETag and ref tag, leaving the ID tag alone;
+    - frees the target's old tail at once, not through GC.
+  - A reshard (`RGWBucketReshard::do_reshard`), step by step.
 - **`Driver`**: runs a script of phases. The requests of a phase run
   concurrently.
 
@@ -123,6 +157,10 @@ dies.
 | `SC_COPY_SELF_VS_PUT` | a copy of key 1 onto itself, and a PutObject over key 1 |
 | `SC_COPY_MPU` | a completion; a copy to key 2 and a PutObject over key 1; then key 2 deleted |
 | `SC_CRASH_COPY_RETRY` | a completion; a copy to key 2; a retry of the completion; then key 2 deleted |
+| `SC_PUT_ONE`, `SC_COPY_ONE` | one PutObject; or a copy to key 2, then key 1 deleted |
+| `SC_LIST_VS_PUT`, `SC_LIST_VS_DEL`, `SC_LIST_VS_COMPLETE` | a listing, and a PutObject, DeleteObject or completion |
+| `SC_DEDUP_*` | keys 1 and 2 hold the same bytes: dedup of key 2 onto key 1, alone or racing a PutObject over, DeleteObject of, or copy onto itself of either key |
+| `SC_RESHARD_VS_PUTS`, `SC_RESHARD_VS_DEL`, `SC_RESHARD_VS_MPU` | a reshard, and two PutObjects; a DeleteObject and a PutObject; or a completion and a part re-upload |
 
 ## Environment and assumptions
 
@@ -130,6 +168,13 @@ dies.
   `metaDeleteMayFail`). RGW may die after the head write and before
   deleting the meta object; the lock then expires. Or the delete may fail
   with an error other than `-ECANCELED`, which is only logged.
+- **An index completion may fail before it reaches the OSD**
+  (`ixCompleteMayFail`). On main, the FIFO bilog flush in `with_bilog`
+  (`a67a233ccbd`, not in tentacle) runs first and can fail. The cancel
+  that follows goes through the same path and may fail too.
+- **A request completes its index op before its pending op expires**
+  (`writersPrompt`). That is `rgw_pending_bucket_index_op_expiration`,
+  120 s by default. *`tcAssumeWritersPrompt` breaks it.*
 - **A live holder keeps the completion lock** (`lockHeld`). The lock is
   renewed while its holder lives, and a failed renewal stops the
   completion only if it happens before the `is_locked()` check.
@@ -142,7 +187,10 @@ dies.
 ## Configurations and results
 
 `../run.sh rgw_overwrite [schedules]` checks each case against
-`expect.txt`. Flags not named are as on main. Each of the 25 cases that
+`expect.txt`. Flags not named are as on main. Keep the default of 20,000
+schedules: some counterexamples, such as `tcDelsAndPutIndex`'s, need a
+rare order of three index completions, and 2,000 schedules can miss
+them. Each of the 37 cases that
 holds was also run for 100,000 schedules under each of random, PCT and
 POS scheduling (`../deep.sh`), with no bug found.
 
@@ -197,6 +245,25 @@ POS scheduling (`../deep.sh`), with no bug found.
 | `tcCopySelfGuarded` | `SC_COPY_SELF_VS_PUT` | a copy onto itself writes only over the head it copied (proposed) | holds |
 | `tcCopyMpu` | `SC_COPY_MPU` | none | holds |
 | `tcCrashCopyRetry` | `SC_CRASH_COPY_RETRY` | RGW may die before the meta delete | **violated**: HeadIntact; a copy only delays finding 3 |
+| `tcIxFailPutLoss` | `SC_PUT_ONE` | the index completion may fail | **violated**: HeadIntact (finding 8) |
+| `tcIxFailPutIndex` | `SC_PUT_ONE` | the same | **violated**: IndexMatchesHead (finding 8) |
+| `tcIxFailCopyLoss` | `SC_COPY_ONE` | the same | **violated**: HeadIntact (finding 8) |
+| `tcIxFailRetryLoss` | `SC_RETRY` | the same | **violated**: HeadIntact (findings 8 and 3) |
+| `tcIxKeepsWritePut`, `tcIxKeepsWriteCopy`, `tcIxKeepsWriteRetry` | `SC_PUT_ONE`, `SC_COPY_ONE`, `SC_RETRY` | the same, and a failed completion after the head write leaves the pending op and keeps the write (proposed) | holds |
+| `tcListVsPut`, `tcListVsDel`, `tcListVsComplete` | `SC_LIST_VS_*` | none | holds |
+| `tcAssumeWritersPrompt` | `SC_LIST_VS_PUT` | a request may stall past the pending-op expiry | violated: IndexMatchesHead (finding 11) |
+| `tcDedupThenDeletes` | `SC_DEDUP_THEN_DELETES` | none | holds |
+| `tcDedupVsPutTgtSafe` | `SC_DEDUP_VS_PUT_TGT` | none | holds |
+| `tcDedupVsPutTgtLeak` | `SC_DEDUP_VS_PUT_TGT` | none | **violated**: NoOrphans (finding 9) |
+| `tcDedupVsDelTgtLeak` | `SC_DEDUP_VS_DEL_TGT` | none | **violated**: NoOrphans (finding 9) |
+| `tcDedupVsDelTgtGuarded` | `SC_DEDUP_VS_DEL_TGT` | the delete's guard restored (M5) | violated: M5 does not cover finding 9 |
+| `tcDedupVsPutSrc` | `SC_DEDUP_VS_PUT_SRC` | none | holds |
+| `tcDedupVsCopySelfLoss` | `SC_DEDUP_VS_COPY_SELF` | none | **violated**: HeadIntact (finding 10) |
+| `tcDedupVsCopySelfGuarded` | `SC_DEDUP_VS_COPY_SELF` | a copy onto itself guarded on the tag it read (M7) | violated: M7 does not cover finding 10 |
+| `tcReshardVsPuts`, `tcReshardVsDel`, `tcReshardVsMpu` | `SC_RESHARD_*` | none | holds |
+| `tcBugReshardNoLog` | `SC_RESHARD_VS_PUTS` | no reshard log (before `55b404afeb6`) | violated: IndexMatchesHead |
+| `tcBugReshardNoCheckExisting` | `SC_RESHARD_VS_PUTS` | the incremental pass adds re-copied entries' stats again | violated: BucketStats |
+| `tcBugOldShardsOpen` | `SC_RESHARD_VS_PUTS` | the old shards accept ops after the commit | violated: IndexMatchesHead |
 
 ## What the model finds on main
 
@@ -277,6 +344,45 @@ on main. None has been reproduced on a cluster.
    GC deletes the tail the head now names. Guarding the rewrite on the
    tag the copy read closes it (`tcCopySelfGuarded`).
 
+8. **A failed index completion undoes a write that already happened.**
+   `_do_write_meta` treats any error from `index_op->complete` like a lost
+   race: it cancels the index op and returns the error
+   (`rgw_rados.cc:3670-3678`; the flush at `rgw_rados.cc:11296`). On main since `a67a233ccbd` (March 2026), a
+   FIFO-bilog bucket flushes its bilog batch before the index op, so a
+   flush error surfaces there, after the head is written. PutObject's
+   writer then deletes the tail its new head names. A copy drops its
+   references, and the source's deletion takes the tail. A completion
+   returns before deleting the meta object, which leads into finding 3. If
+   the cancel succeeds, the index also keeps the old object for good.
+   Leaving the pending op for a listing to repair, and keeping the write,
+   holds (`tcIxKeepsWrite*`).
+9. **A writer that read a head before dedup rewrote it leaks the source's
+   tail.** Dedup changes the target's manifest but not its ID tag, which
+   every writer guards on. A PutObject, DeleteObject or completion that
+   read the target before dedup still passes its guard. It then sends the
+   stale manifest to GC, which dedup had already freed. The references
+   dedup took on the source's tail, under the target's tag, are never
+   dropped.
+10. **Dedup and a copy onto itself can delete the object's data.** Dedup
+    frees the target's old tail at once, not through GC. A copy onto
+    itself that read the head before dedup writes that tail back into the
+    head. Guarding the copy on the tag it read (M7) does not help,
+    because dedup leaves the ID tag alone.
+11. **A write that stalls past the pending-op expiry is lost from the
+    index.** A listing that finds the write's op pending for more than
+    `rgw_pending_bucket_index_op_expiration` (120 s) drops the pending op,
+    and rewrites the entry from the head it reads, which may still be the
+    old one. The write's completion then fails with `-EINVAL`, and that
+    error is ignored because the completion is asynchronous. It needs a
+    request to stall for two minutes between its index prepare and
+    complete.
+
+Resharding holds under concurrent PutObject, DeleteObject and multipart
+traffic. Each of its mechanisms is needed: without the reshard log, the
+index keeps the pre-reshard object; without `check_existing`, the stats
+count re-copied entries twice; if the old shards accepted ops after the
+commit, a write would land in an index nobody reads.
+
 ## Not modelled
 
 - Versioned buckets, OLH, and conditional writes (`If-Match`,
@@ -286,7 +392,11 @@ on main. None has been reproduced on a cluster.
 - GET. HeadIntact stands in for "a GET of the current object succeeds".
 - Tail stripes, and a head that carries data. A PutObject is one tail
   object and a part is one object.
-- Bucket resharding, multisite sync and the bilog.
-- A failed index completion after a successful head write, and
-  `-ETIMEDOUT` handling.
+- Multisite sync and the bilog's contents. The bilog appears only as a
+  source of index completion failures.
+- `-ETIMEDOUT` handling.
+- Dedup's split-head mode, and its table and scan beyond the two
+  records it acts on.
+- More than one shard per generation. A reshard moves every entry from
+  one shard to another.
 - More than 3 retries of the meta object's delete (15 on main).

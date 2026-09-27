@@ -1,0 +1,74 @@
+# <test case> holds | violated <text the first failure message contains>
+# random failures
+tcCrash2                   holds
+tcCrash3                   holds
+tcRemap                    holds
+tcFull                     holds
+tcPreempt                  holds
+tcAsync                    holds
+tcLostSafety               holds
+# scripted setups, then random failures
+tcBfFull                   holds
+tcBfPreempt                holds
+tcBfCrash                  holds
+tcRecFull                  holds
+tcRecPreempt               holds
+tcRecCrash                 holds
+tcBf2Full                  holds
+tcBf2Preempt               holds
+tcRecWaitLocalFull         holds
+tcRecWaitRemoteFull        holds
+# finding: the mgr's force-recovery or scrub reaches a PG still in Reset
+# after its OSD restarted (Reset has no reaction for them)
+tcCommands                 violated in Reset
+tcCmdReset                 violated SetForceRecovery in Reset
+tcFixCmdReset              holds
+tcFixCommands              holds
+# finding: tracker 70670's AdvMap reactions, if registered, crash
+tcFixRecWaitLocalFull      violated LocalRecoveryReserved in Started/Primary/Active/NotRecovering
+tcFixRecWaitRemoteFull     violated RecoveryTooFull in Started/Primary/Active/WaitRemote
+# finding: a backfill GRANT from an earlier reservation round is counted in the
+# next, on the primary (then Backfilling gets the real one) or, for a reserver
+# callback, on the replica (RepRecovering gets it)
+tcBf2StaleGrant            violated RemoteBackfillReserved in Started/
+# finding: a preemption of the local slot is discarded while waiting for remote slots
+tcRecSlotLost              violated without its local reservation
+tcBfSlotLost               violated without its local reservation
+# proposed fixes: Reset discards the commands (above); a grant counts only
+# for the request outstanding, with callbacks tagged by request (grantFromCheck);
+# the WaitRemote states give up on a preemption (deferWhileWaiting) -- which
+# alone reintroduces stale grants
+tcFixBf2StaleGrant         holds
+tcFixRecSlotLost           holds
+tcFixBfSlotLost            holds
+tcHalfFixRecSlotLost       violated RemoteRecoveryReserved in Started/
+tcHalfFixBfSlotLost        violated RemoteBackfillReserved in Started/
+tcFixRecChaos              holds
+tcFixBf2Chaos              holds
+# finding: the delete priority changes (the OSD goes nearfull/full) while
+# the delete reservation's grant is queued; ToDelete re-requests and a second
+# DeleteReserved reaches Deleting
+tcDeleteRePriority         violated DeleteReserved in Started/ToDelete/Deleting
+tcFixDeleteRePriority      holds
+# PGs per OSD: a withheld creation resumes by a forced pg_temp once there is
+# room -- unless (finding) the OSD is a backfill target (in up, not acting)
+# and any map arrives first: consume_map drops the pending create, and the PG
+# stays activating (confirmed on a vstart cluster)
+tcMaxPgResume              holds
+tcMaxPgBackfillTarget      violated hot state 'Inactive'
+tcFixMaxPgBackfillTarget   holds
+# (finding) with the primary alone in the acting set, resume_creating_pg's
+# pg_temp [primary, NONE] is the same acting set for a replicated pool: no
+# re-peer (confirmed on vstart); fix: a second up OSD, as "pg repeer" does
+tcMaxPgSingle              violated hot state 'Inactive'
+tcFixMaxPgSingle           holds
+tcFixMaxPgChurn            holds
+# the cluster network: links fail and heal, with 2 or 1 reporters
+tcCuts2                    holds
+tcCuts1                    holds
+# by design: a link between two acting OSDs that stays down. With 2
+# reporters neither is marked down and the PG never finishes peering; with 1
+# they flap until one shuts itself down, and the PG waits for it if it took
+# writes alone
+tcCutPersist2              violated hot state 'Inactive'
+tcCutPersist1              violated hot state 'Inactive'

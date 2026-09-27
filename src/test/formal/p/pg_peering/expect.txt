@@ -1,0 +1,15 @@
+tcCrash3                   holds
+tcCrashMin1                holds
+tcRemap                    holds
+tcFlap                     holds
+tcMinSize                  holds
+tcLostSafety               holds
+tcLostOverride             holds
+tcScriptLostIncomplete     violated hot state 'Inactive'
+tcScriptLostIgnoreLes      holds
+tcScriptStaleNotify        violated without write
+tcScriptMin2StaleNotify    violated without write
+tcFixScriptStaleNotify     holds
+tcFixFlap                  holds
+tcBugNoUpThruGate          violated without write
+tcBugNoStaleFilter         violated

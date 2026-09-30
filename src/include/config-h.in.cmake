@@ -160,6 +160,12 @@
 /* define if OSD cuObject RDMA (READ_RDMA pushdown) enabled */
 #cmakedefine WITH_OSD_CUOBJ
 
+/* Define if the hipobj-rc-v2 RDMA server is built into radosgw */
+#cmakedefine WITH_RADOSGW_RDMA_RC
+
+/* Define if mlx5 direct verbs are available (DC target for OSD-direct delivery) */
+#cmakedefine HAVE_MLX5DV
+
 /* define if HAVE_THREAD_SAFE_RES_QUERY */
 #cmakedefine HAVE_THREAD_SAFE_RES_QUERY
 

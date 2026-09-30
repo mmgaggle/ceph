@@ -598,6 +598,18 @@ if(WITH_OSD_CUOBJ)
   # when WITH_RDMA (the async messenger transport) is disabled
   find_package(verbs REQUIRED)
 endif()
+cmake_dependent_option(WITH_RADOSGW_RDMA_RC
+  "hipobj-rc-v2 S3-over-RDMA (RC transport) server in RADOS Gateway"
+  ON "WITH_RADOSGW;WITH_RDMA" OFF)
+if(WITH_RADOSGW_RDMA_RC)
+  # the gateway can also stand in as a cuObject DC target for OSD-direct
+  # delivery, which needs the mlx5 direct verbs; optional
+  find_path(MLX5DV_INCLUDE_DIR infiniband/mlx5dv.h)
+  find_library(MLX5_LIBRARY mlx5)
+  if(MLX5DV_INCLUDE_DIR AND MLX5_LIBRARY)
+    set(HAVE_MLX5DV TRUE)
+  endif()
+endif()
 
 option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)
 option(WITH_SYSTEM_UTF8PROC "Use system-provided utf8proc" OFF)

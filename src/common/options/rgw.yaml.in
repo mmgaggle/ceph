@@ -4735,6 +4735,155 @@ options:
   default: false
   services:
   - rgw
+# hipobj-rc-v2 (S3 over RDMA, RC transport) server options
+- name: rgw_rdma_rc_enabled
+  type: bool
+  level: advanced
+  desc: Serve S3 object data over RDMA Reliable Connections to hipObject
+    clients (the hipobj-rc-v2 control protocol on /.hipobj-rc/). Needs a build
+    with WITH_RADOSGW_RDMA_RC and a verbs device on the gateway host.
+  default: false
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_device
+  type: str
+  level: advanced
+  desc: Verbs device name (e.g. mlx5_0) for the RC data plane; empty picks the
+    device matching rgw_rdma_rc_gid_hint, else the first device
+  default:
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_gid_hint
+  type: str
+  level: advanced
+  desc: Dotted prefix of the GID (as rendered by ibv_devinfo) selecting the
+    verbs device when rgw_rdma_rc_device is empty
+  default:
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_port
+  type: uint
+  level: advanced
+  desc: Port number on the verbs device
+  default: 1
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_gid_index
+  type: int
+  level: advanced
+  desc: GID table index to use; -1 picks a RoCEv2 entry (or the port GID on
+    InfiniBand)
+  default: -1
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_buffer_size
+  type: size
+  level: advanced
+  desc: Size of each registered session buffer; a transfer larger than this is
+    refused with 413 (the protocol caps transfers at 2 GiB - 1)
+  default: 64_M
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_buffer_count
+  type: uint
+  level: advanced
+  desc: Number of registered session buffers (pinned at startup); one is held
+    per session from PREPARE until the session ends
+  default: 16
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_max_sessions
+  type: uint
+  level: advanced
+  desc: Maximum concurrent hipobj-rc-v2 sessions
+  default: 1024
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_max_sessions_per_user
+  type: uint
+  level: advanced
+  desc: Maximum concurrent hipobj-rc-v2 sessions per authenticated user
+  default: 64
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_send_depth
+  type: uint
+  level: advanced
+  desc: Send queue depth of each session's queue pair; bounds how many stripe
+    writes a GET relay may have in flight toward the client
+  default: 64
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_prepare_timeout_ms
+  type: uint
+  level: advanced
+  desc: Milliseconds a prepared session waits for READY before it is reaped
+  default: 100000
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_exec_timeout_ms
+  type: uint
+  level: advanced
+  desc: Milliseconds a READY transfer may take, including the object read
+  default: 30000
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_crc64nvme
+  type: bool
+  level: advanced
+  desc: Report the CRC-64/NVME of the bytes an RC transfer delivered in the
+    FINAL reply (X-Amz-Rdma-Checksum), so the client can verify its landed
+    buffer. GETs the OSDs placed directly reuse the OSDs' own checksums;
+    otherwise the gateway checksums its buffer
+  default: true
+  services:
+  - rgw
+- name: rgw_rdma_rc_osd_direct
+  type: bool
+  level: advanced
+  desc: Expose the session buffers as a cuObject DC target so OSDs can push
+    stripes straight into them (rgw_cuobj_osd_passthrough must be on and the
+    gateway device must be mlx5); off, or when unavailable, stripes are
+    copied into the buffer through the gateway data path
+  default: true
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_dc_key
+  type: uint
+  level: advanced
+  desc: DC access key of the gateway's DC target; must match the OSDs'
+    osd_cuobj_dc_key
+  default: 4293844428
+  services:
+  - rgw
+  flags:
+  - startup
 - name: rgw_topic_persistency_time_to_live
   type: uint
   level: advanced

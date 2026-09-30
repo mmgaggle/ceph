@@ -454,3 +454,61 @@ Limitations
 * A PUT must arrive as one write-with-immediate that carries the whole
   object.
 * The transfer runs on the request thread, as in staged mode.
+
+UET delivery (mock-up)
+======================
+
+This branch carries a mock-up of OSD-direct delivery over Ultra Ethernet
+Transport (UET). It shows that OSDs can write GET data straight into a
+client's memory without a connection per OSD, as cuObject's DC transport
+does, but on any Ethernet NIC.
+
+The client registers a memory window with a UET provider and sends an
+ordinary S3 GET with this token in ``x-amz-rdma-token``::
+
+  <base hex>:<window size hex>:uet1:<client IPv4>:<memory key hex>
+
+The token starts with the same ``addr:size`` fields as a cuObject token,
+so the gateway treats it the same way. With
+``rgw_cuobj_osd_passthrough`` on, the gateway forwards it to the OSDs in
+each stripe read's delivery descriptor. An OSD with UET delivery enabled
+writes its stripe into the window with RMA writes in UET's RUDI mode.
+RUDI is reliable, unordered and connectionless, and it is meant for
+idempotent operations. The client keeps no state for the OSDs. It does
+not add their addresses and does no handshake. The OSD replies to the
+gateway after its writes complete, and the gateway answers the GET after
+every stripe's reply is in.
+
+OSDs choose an executor by the token's shape. A token with the ``uet1``
+tag goes to the UET executor, and any other token goes to cuObject. A
+token that no running executor serves is delivered inline, as before.
+
+The mock-up uses the UEC reference provider
+(https://github.com/ultraethernet/uet-ref-prov), a software UET stack
+over raw Ethernet sockets. Build the provider, then build Ceph with
+``-DWITH_OSD_UET=ON -DUET_REF_PROV_DIR=<provider checkout>``. Each OSD
+needs:
+
+* ``osd_uet_enabled`` set to true.
+* ``osd_uet_ifname`` set to the interface it sends and receives on. The
+  interface's IPv4 address is the OSD's fabric endpoint. The value can
+  use ``$id``, for example ``uet-o$id``.
+* The ``CAP_NET_RAW`` capability, for the raw socket. An OSD normally
+  drops every capability its block-device plugins do not need. With
+  ``osd_uet_enabled`` set, it keeps ``CAP_NET_RAW`` as well.
+
+``ceph_test_rgw_uet_get`` is a client for the mock-up. It registers a
+window, sends a signed GET with the token, and verifies the window
+against a local copy of the object. ``ceph daemon osd.N uet status``
+shows each OSD's delivery counters.
+
+The mock-up has these limits:
+
+* The provider is software. A target places incoming data only while
+  its application polls, so the client polls during the GET.
+* The provider keeps process-wide state. Each OSD has one UET endpoint,
+  and the OSD serializes every call into it.
+* Writes are sent unencrypted. The provider's security sublayer works in
+  server mode, but the mock-up does not configure it.
+* The OSD writes on the op thread and waits for completion, as the first
+  cuObject executor did.

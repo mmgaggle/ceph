@@ -177,6 +177,16 @@ namespace ceph {
       if (rc != 0) {
 	return rc;
       }
+#ifdef WITH_OSD_UET
+      // UET delivery opens a raw socket in OSD::init, after this trim;
+      // keep the one capability it needs
+      if (cct->_conf.get_val<bool>("osd_uet_enabled")) {
+	cap_value_t raw[1] = {CAP_NET_RAW};
+	if (cap_set_flag(merge_caps, CAP_PERMITTED, 1, raw, CAP_SET) < 0) {
+	  return -errno;
+	}
+      }
+#endif
       return trim_caps(cct, merge_caps);
     }
 #endif

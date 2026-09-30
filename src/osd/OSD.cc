@@ -73,6 +73,12 @@
 #ifdef WITH_OSD_CUOBJ
 #include "osd_cuobj.h"
 #endif
+#ifdef WITH_OSD_UET
+#include "osd_uet.h"
+#endif
+#ifdef HAVE_OSD_OOB_DELIVERY
+#include "oob_executor.h"
+#endif
 
 #include "PrimaryLogPG.h"
 
@@ -538,10 +544,43 @@ void OSDService::shutdown()
   delete cuobj;
   cuobj = nullptr;
 #endif
+#ifdef WITH_OSD_UET
+  delete uet;
+  uet = nullptr;
+#endif
 
   publish_map(OSDMapRef());
   next_osdmap = OSDMapRef();
 }
+
+#ifdef HAVE_OSD_OOB_DELIVERY
+OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
+{
+#ifdef WITH_OSD_UET
+  if (uet && uet->handles(token)) {
+    return uet;
+  }
+#endif
+#ifdef WITH_OSD_CUOBJ
+  if (cuobj && cuobj->handles(token)) {
+    return cuobj;
+  }
+#endif
+  return nullptr;
+}
+
+bool OSDService::has_oob_executor() const
+{
+  bool any = false;
+#ifdef WITH_OSD_UET
+  any = any || uet;
+#endif
+#ifdef WITH_OSD_CUOBJ
+  any = any || cuobj;
+#endif
+  return any;
+}
+#endif
 
 void OSDService::fast_shutdown()
 {
@@ -554,6 +593,10 @@ void OSDService::fast_shutdown()
   // op threads are stopped by now, so no RDMA writes are in flight
   delete cuobj;
   cuobj = nullptr;
+#endif
+#ifdef WITH_OSD_UET
+  delete uet;
+  uet = nullptr;
 #endif
 }
 
@@ -2874,6 +2917,14 @@ void OSD::asok_command(
     }
     f->close_section();
 #endif
+#ifdef WITH_OSD_UET
+  } else if (prefix == "uet status") {
+    f->open_object_section("uet");
+    if (service.uet) {
+      service.uet->dump_stats(f);
+    }
+    f->close_section();
+#endif
   } else if (prefix == "flush_journal") {
     store->flush_journal();
   } else if (prefix == "dump_ops_in_flight" ||
@@ -4090,6 +4141,18 @@ int OSD::init()
   }
 #endif
 
+#ifdef WITH_OSD_UET
+  if (cct->_conf.get_val<bool>("osd_uet_enabled")) {
+    auto uet = std::make_unique<OSDUet>(cct);
+    if (int r = uet->init(); r == 0) {
+      service.uet = uet.release();
+    } else {
+      derr << "WARNING: UET delivery init failed: " << cpp_strerror(r)
+	   << " (UET delivery disabled on this osd)" << dendl;
+    }
+  }
+#endif
+
   dout(10) << "ensuring pgs have consumed prior maps" << dendl;
   consume_map();
 
@@ -4134,6 +4197,13 @@ void OSD::final_init()
     r = admin_socket->register_command(
       "cuobj status", asok_hook,
       "cuObject out-of-band RDMA delivery statistics");
+    ceph_assert(r == 0);
+  }
+#endif
+#ifdef WITH_OSD_UET
+  if (service.uet) {
+    r = admin_socket->register_command(
+      "uet status", asok_hook, "UET out-of-band delivery statistics");
     ceph_assert(r == 0);
   }
 #endif

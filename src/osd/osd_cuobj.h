@@ -10,6 +10,7 @@
 
 #include "include/buffer.h"
 #include "include/common_fwd.h"
+#include "osd/oob_executor.h"
 #include "osd/oob_placement.h"
 
 namespace ceph { class Formatter; }
@@ -31,16 +32,20 @@ class cuObjServer;
  * cuObject channel (DCI); buffer-pool slots are claimed with atomic
  * compare-exchange.
  */
-class OSDCuObj {
+class OSDCuObj : public OSDOobExecutor {
 public:
   OSDCuObj(CephContext *cct, const std::string& rdma_ip, uint16_t rdma_port);
-  ~OSDCuObj();
+  ~OSDCuObj() override;
 
   OSDCuObj(const OSDCuObj&) = delete;
   OSDCuObj& operator=(const OSDCuObj&) = delete;
 
   /// true once the local RDMA session started successfully
-  bool is_available() const;
+  bool is_available() const override;
+
+  /// cuObject DC descriptors: every token another executor does not
+  /// claim (the descriptor is opaque past its addr:size prefix)
+  bool handles(const std::string& token) const override;
 
   /**
    * RDMA-write bl into the client memory window described by the
@@ -64,10 +69,10 @@ public:
   ssize_t execute_plan(const std::string& key,
 		       const std::string& token,
 		       const ceph::buffer::list& data,
-		       const ceph::osd::oob::placement_plan& plan);
+		       const ceph::osd::oob::placement_plan& plan) override;
 
   /// asok/debug counters
-  void dump_stats(ceph::Formatter* f) const;
+  void dump_stats(ceph::Formatter* f) const override;
 
 private:
   struct BufEntry {

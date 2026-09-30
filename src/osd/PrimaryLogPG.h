@@ -1316,7 +1316,7 @@ protected:
   int prepare_transaction(OpContext *ctx);
   std::list<std::pair<OpRequestRef, OpContext*> > in_progress_async_reads;
   void complete_read_ctx(int result, OpContext *ctx);
-#ifdef WITH_OSD_CUOBJ
+#ifdef HAVE_OSD_OOB_DELIVERY
   /**
    * Try to deliver the read reply's data out of band per the MOSDOp's
    * per-op rdma delivery descriptors: for each op carrying one,

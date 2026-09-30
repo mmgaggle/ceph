@@ -63,8 +63,8 @@
 #include "OpRequest.h"
 #include "PG.h"
 #include "Session.h"
-#ifdef WITH_OSD_CUOBJ
-#include "osd_cuobj.h"
+#ifdef HAVE_OSD_OOB_DELIVERY
+#include "oob_executor.h"
 #include "osd/oob_placement.h"
 #include "common/crc64nvme.h"
 #endif
@@ -9349,7 +9349,7 @@ void PrimaryLogPG::apply_stats(
   m_scrubber->stats_of_handled_objects(delta_stats, soid);
 }
 
-#ifdef WITH_OSD_CUOBJ
+#ifdef HAVE_OSD_OOB_DELIVERY
 bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
 			       std::vector<ceph::rdma::oob_result_t>& oob)
 {
@@ -9479,8 +9479,15 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
     return false;
   }
 
-  ssize_t pushed = osd->cuobj->execute_plan(m->get_hobj().oid.name, d.token,
-					    payload, plan);
+  // the descriptor is opaque here: the executor that recognizes the
+  // token's transport places the data, and a token nothing serves
+  // stays inline
+  OSDOobExecutor* exec = osd->oob_executor_for(d.token);
+  if (!exec) {
+    return false;
+  }
+  ssize_t pushed = exec->execute_plan(m->get_hobj().oid.name, d.token,
+				      payload, plan);
   if (pushed < 0) {
     dout(10) << __func__ << " op " << idx << " plan execution failed ("
 	     << pushed << "), delivering inline" << dendl;
@@ -9525,7 +9532,7 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
   }
   return true;
 }
-#endif // WITH_OSD_CUOBJ
+#endif // HAVE_OSD_OOB_DELIVERY
 
 void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
 {
@@ -9545,8 +9552,8 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
   MOSDOpReply *reply = ctx->reply;
   ctx->reply = nullptr;
 
-#ifdef WITH_OSD_CUOBJ
-  if (result >= 0 && osd->cuobj && m->has_rdma_delivery()) {
+#ifdef HAVE_OSD_OOB_DELIVERY
+  if (result >= 0 && osd->has_oob_executor() && m->has_rdma_delivery()) {
     // advisory out-of-band delivery: try to RDMA-write each
     // descriptor-bearing op's read data straight into the client
     // window; on any refusal or failure the reply simply keeps that

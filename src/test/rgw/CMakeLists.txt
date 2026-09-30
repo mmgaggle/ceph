@@ -121,6 +121,17 @@ add_executable(unittest_rgw_bencode test_rgw_bencode.cc)
 add_ceph_unittest(unittest_rgw_bencode)
 target_link_libraries(unittest_rgw_bencode ${rgw_libs})
 
+if(WITH_OSD_UET)
+  # mock-up client for OSD-direct delivery over UET (uet-ref-prov)
+  add_executable(ceph_test_rgw_uet_get uet/uet_s3_get.cc
+    ${CMAKE_SOURCE_DIR}/src/osd/uet_shim.c)
+  set_source_files_properties(${CMAKE_SOURCE_DIR}/src/osd/uet_shim.c
+    TARGET_DIRECTORY ceph_test_rgw_uet_get PROPERTIES INCLUDE_DIRECTORIES
+    "${UET_REF_PROV_DIR};${UET_REF_PROV_DIR}/util;${UET_REF_PROV_DIR}/imp_shim;${UET_REF_PROV_DIR}/nic_shim;${UET_REF_PROV_DIR}/crypto;${UET_REF_PROV_DIR}/libfabric_headers;${UET_REF_PROV_DIR}/libfabric_headers/include")
+  target_link_libraries(ceph_test_rgw_uet_get
+    ${UET_FABRIC_LIBRARY} ${FABRIC_LIBRARY} ${CURL_LIBRARIES} Threads::Threads)
+endif()
+
 # unittest_rgw_rdma_rc_wire
 add_executable(unittest_rgw_rdma_rc_wire test_rgw_rdma_rc_wire.cc)
 add_ceph_unittest(unittest_rgw_rdma_rc_wire)

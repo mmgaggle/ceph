@@ -118,6 +118,12 @@ void OSDCuObj::do_shutdown()
   m_server.reset();
 }
 
+bool OSDCuObj::handles(const std::string& token) const
+{
+  // UET descriptors carry a transport tag in their third field
+  return token.find(":uet1:") == std::string::npos;
+}
+
 bool OSDCuObj::is_available() const
 {
   return m_server && m_server->isConnected();

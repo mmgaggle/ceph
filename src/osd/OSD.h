@@ -75,6 +75,8 @@ class MonClient;
 class ObjectStore;
 class FuseStore;
 class OSDCuObj;
+class OSDUet;
+class OSDOobExecutor;
 class OSDMap;
 class MLog;
 class Objecter;
@@ -123,6 +125,16 @@ public:
   /// cuObject RDMA endpoint backing CEPH_OSD_OP_READ_RDMA; null unless
   /// osd_cuobj_enabled and the RDMA session came up
   OSDCuObj* cuobj = nullptr;
+#endif
+#ifdef WITH_OSD_UET
+  /// UET delivery endpoint; null unless osd_uet_enabled and it came up
+  OSDUet* uet = nullptr;
+#endif
+#ifdef HAVE_OSD_OOB_DELIVERY
+  /// the executor that serves a delivery token's transport, or null
+  OSDOobExecutor* oob_executor_for(const std::string& token) const;
+  /// true when any out-of-band transport is up
+  bool has_oob_executor() const;
 #endif
 
   void enqueue_back(OpSchedulerItem&& qi);

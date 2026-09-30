@@ -1625,6 +1625,56 @@ options:
   default: true
   with_legacy: true
 # cuObject RDMA (READ_RDMA pushdown) options
+- name: osd_uet_enabled
+  type: bool
+  level: dev
+  desc: Deliver reads that carry a UET delivery descriptor by RMA-writing the
+    data straight into the client's memory over Ultra Ethernet Transport
+    (mock-up on the UEC reference provider; needs a build with WITH_OSD_UET,
+    CAP_NET_RAW and osd_uet_ifname)
+  default: false
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_uet_ifname
+  type: str
+  level: dev
+  desc: Ethernet interface the UET provider sends and receives on; its IPv4
+    address is this OSD's fabric endpoint
+  default:
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_uet_tx_timeout_ms
+  type: uint
+  level: dev
+  desc: UET retransmit timeout in milliseconds (the provider's
+    UET_PDS_TX_TIMEOUT); its software crypto needs more than the 5 ms default
+  default: 200
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_uet_op_timeout_ms
+  type: uint
+  level: dev
+  desc: How long one read's UET writes may take before the OSD gives up and
+    delivers the read inline
+  default: 5000
+  services:
+  - osd
+- name: osd_uet_buffer_size
+  type: size
+  level: dev
+  desc: Registered staging region for UET writes; a read larger than this is
+    delivered inline
+  default: 16_M
+  services:
+  - osd
+  flags:
+  - startup
 - name: osd_cuobj_enabled
   type: bool
   level: advanced

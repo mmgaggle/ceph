@@ -333,3 +333,124 @@ Accounting
 Bytes moved over RDMA appear in the beast access log, the ops log and
 the usage log (attributed to bytes sent for GET, bytes received for
 PUT), even though they do not traverse the HTTP socket.
+
+Reliable Connection clients (hipObject)
+=======================================
+
+The gateway also serves clients that use Reliable Connection (RC)
+transport instead of cuObject's Dynamically Connected (DC) transport.
+DC exists only on NVIDIA ConnectX NICs. RC exists on every RDMA NIC,
+including Broadcom Thor-2 and AMD Pensando. AMD's hipObject client
+library uses RC, and its control protocol is called ``hipobj-rc-v2``.
+
+An RC transfer needs a queue pair on each side, paired before any data
+moves. A queue pair is the RDMA endpoint that carries one connection.
+The client and the gateway exchange the pairing parameters over three
+SigV4-signed HTTP requests, and the object data then moves over the
+paired queue pair:
+
+``POST /.hipobj-rc/prepare``
+  The client sends its RC token (queue pair number and GID), a packet
+  sequence number (PSN), a cookie, the operation, the object and the
+  byte range. The gateway authorizes the request as the S3 operation
+  it stands for, creates a session, and answers with the session ID
+  and its own queue pair number and PSN.
+
+``POST /.hipobj-rc/ready``
+  The client sends its queue pair number and the address and remote
+  key of its memory region. The gateway pairs its queue pair with the
+  client's queue pair, runs the transfer, and answers when the
+  transfer is complete. The answer carries the byte count, the ETag,
+  the version ID and a CRC-64/NVME of the delivered bytes.
+
+``POST /.hipobj-rc/cancel``
+  The client ends a session that it no longer needs.
+
+Every ``x-amz-rdma-*`` request header must be in the SigV4
+``SignedHeaders`` list. The gateway refuses a request with an unsigned
+protocol header, because anything on the network path could change an
+unsigned header without breaking the signature. Anonymous requests are
+refused. A session belongs to the user that prepared it. READY and
+CANCEL from any other user fail as if the session did not exist.
+
+GET relay
+---------
+
+For a GET, the gateway holds the session's buffer between the OSDs and
+the client. There are two ways for the object to reach that buffer:
+
+OSD-direct relay
+  The gateway exposes its session buffers as a cuObject DC target.
+  Each stripe read then carries a delivery descriptor for the session
+  buffer, and the OSDs RDMA-write their stripes into it, exactly as
+  in OSD passthrough mode. The gateway does not copy the object. This
+  needs an mlx5 NIC on the gateway, ``rgw_cuobj_osd_passthrough``, and
+  OSDs built with ``WITH_OSD_CUOBJ``.
+
+Staged relay
+  The object is read from RADOS as usual and copied into the session
+  buffer. The gateway uses this path when OSD-direct relay is not
+  available, and for compressed objects. It is also the fallback when
+  an OSD returns a stripe inline instead of writing it.
+
+In both cases the gateway pushes the bytes to the client while the read
+is still in progress. Each time the start of the buffer is complete up
+to a new point, the gateway RDMA-writes the new bytes to the client.
+The last write carries the session cookie as its immediate value. RC
+delivers writes in order, so the client's completion for the last
+write means that all earlier writes are in its memory.
+
+When a relay fails after the OSDs received delivery descriptors, an
+OSD can still write into the session buffer until the pool's
+``rdma_delivery_lease`` expires. The gateway keeps that buffer out of
+use for the lease plus ``rgw_cuobj_fence_drain_ms``.
+
+PUT
+---
+
+For a PUT, the gateway registers a staging buffer at PREPARE and gives
+its address to the client. The client writes the whole object with one
+RDMA write-with-immediate. The gateway then stores the buffer through
+the normal PUT path. Bucket default encryption, compression,
+notifications and object lock apply as they do to any PUT.
+
+Configuration
+-------------
+
+Build with ``-DWITH_RADOSGW_RDMA_RC=ON``. This is the default when
+``WITH_RDMA`` is on. OSD-direct relay also needs the ``mlx5`` direct
+verbs library at build time.
+
+* ``rgw_rdma_rc_enabled``: serve RC sessions. When it is off, the
+  control routes answer ``501`` with
+  ``x-amz-rdma-protocol-status: unsupported``. That answer tells a
+  hipObject client to use plain HTTP.
+* ``rgw_rdma_rc_device``, ``rgw_rdma_rc_gid_hint``,
+  ``rgw_rdma_rc_port``, ``rgw_rdma_rc_gid_index``: select the verbs
+  device, port and GID.
+* ``rgw_rdma_rc_buffer_size``, ``rgw_rdma_rc_buffer_count``: the
+  registered session buffers. Each session holds one buffer from
+  PREPARE until the session ends. A transfer larger than one buffer is
+  refused with ``413``.
+* ``rgw_rdma_rc_max_sessions``, ``rgw_rdma_rc_max_sessions_per_user``:
+  session limits. A PREPARE over a limit gets ``503 SlowDown``.
+* ``rgw_rdma_rc_send_depth``: how many writes to the client can be in
+  flight for one session.
+* ``rgw_rdma_rc_prepare_timeout_ms``, ``rgw_rdma_rc_exec_timeout_ms``:
+  how long a session waits for READY, and how long a transfer can take.
+* ``rgw_rdma_rc_osd_direct``, ``rgw_rdma_rc_dc_key``: the DC target
+  for OSD-direct relay. The key must match ``osd_cuobj_dc_key``.
+* ``rgw_rdma_rc_crc64nvme``: report a CRC-64/NVME of the delivered
+  bytes in the READY answer.
+
+Limitations
+-----------
+
+* The gateway does not serve encrypted objects, or objects with a DLO
+  or SLO manifest, over RC. PREPARE answers ``501`` with the
+  unsupported marker, and the client reads the object over HTTP.
+* A target can name a ``versionId`` for a GET. Multipart part uploads
+  and other subresources are not available over RC.
+* A PUT must arrive as one write-with-immediate that carries the whole
+  object.
+* The transfer runs on the request thread, as in staged mode.

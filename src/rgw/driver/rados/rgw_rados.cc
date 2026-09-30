@@ -8662,6 +8662,17 @@ int get_obj_data::flush_rdma(rgw::AioResultList&& results) {
     if (e.data.length() > 0) {
       return -EOPNOTSUPP;
     }
+    // the reply filled this stripe's slot: tell the callback where the
+    // bytes landed, relative to the requested range
+    if (auto it = rdma_slot_by_ofs.find(e.id); it != rdma_slot_by_ofs.end()) {
+      const auto& slot = rdma_slots[it->second];
+      if (slot.bytes > 0) {
+        int r = client_cb->handle_oob(e.id - rdma_range_start, slot.bytes);
+        if (r < 0) {
+          return r;
+        }
+      }
+    }
     results.pop_front_and_dispose(std::default_delete<rgw::AioResultEntry>{});
   }
   return 0;
@@ -8794,6 +8805,7 @@ int RGWRados::get_obj_iterate_cb(const DoutPrefixProvider *dpp,
     // the data inline, which flush_rdma treats as the fallback signal
     op.read(read_ofs, len, nullptr, nullptr);
     d->rdma_slots.emplace_back();
+    d->rdma_slot_by_ofs[obj_ofs] = d->rdma_slots.size() - 1;
     op.set_rdma_delivery(d->rdma_token,
                          uint64_t(obj_ofs) - d->rdma_range_start,
                          d->rdma_flags, &d->rdma_slots.back());

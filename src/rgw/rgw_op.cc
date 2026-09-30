@@ -2580,7 +2580,7 @@ int RGWGetObj::handle_slo_manifest(bufferlist& bl, optional_yield y)
 
 int RGWGetObj::get_data_cb(bufferlist& bl, off_t bl_ofs, off_t bl_len)
 {
-  if (rdma_mode == RdmaMode::PASSTHROUGH && bl_len > 0) {
+  if (rdma_oob_mode() && bl_len > 0) {
     // the store streamed data instead of honoring the passthrough
     // contract (rgw_sal.h) - e.g. a SAL store or filter that predates
     // params.rdma_token. Reject it before any HTTP bytes are committed
@@ -2679,6 +2679,25 @@ static bool rgw_calc_aead_obj_size(const DoutPrefixProvider* dpp,
 void RGWGetObj::select_rdma_mode(bool plain_chain)
 {
   rdma_mode = RdmaMode::NONE;
+  if (relay_window) {
+    // a subclass relays the data from a gateway window: the OSDs push
+    // into it when they can (the window has a cuObject descriptor, the
+    // data needs no transformation and fits), else the stripes are
+    // copied in
+    if (total_len > relay_window) {
+      ldpp_dout(this, 4) << "rdma relay: response larger than the gateway "
+                         << "window" << dendl;
+      return;
+    }
+    if (plain_chain && !relay_token.empty() &&
+        s->cct->_conf.get_val<bool>("rgw_cuobj_osd_passthrough")) {
+      rdma_token = relay_token;
+      rdma_mode = RdmaMode::RELAY;
+    } else {
+      rdma_mode = RdmaMode::RELAY_STAGED;
+    }
+    return;
+  }
   if (rdma_token.empty() || !get_data || get_type() != RGW_OP_GET_OBJ) {
     return;
   }
@@ -2987,7 +3006,7 @@ void RGWGetObj::execute(optional_yield y)
 
   rgw::op_counters::inc(counters, l_rgw_op_get_obj_b, end-ofs);
 
-  if (rdma_mode == RdmaMode::PASSTHROUGH) {
+  if (rdma_oob_mode()) {
     read_op->params.rdma_token = rdma_token;
     read_op->params.rdma_bytes = &rdma_bytes;
     read_op->params.rdma_crc64 = &rdma_crc64;
@@ -2995,7 +3014,7 @@ void RGWGetObj::execute(optional_yield y)
 
   op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
 
-  if (op_ret == -EOPNOTSUPP && rdma_mode == RdmaMode::PASSTHROUGH) {
+  if (op_ret == -EOPNOTSUPP && rdma_oob_mode()) {
     // an OSD (or the store) cannot push directly - old OSDs, cuObject
     // absent or disabled, an expired lease or a resent op. No HTTP
     // bytes are committed yet, so restart the whole GET in staged (or
@@ -3043,6 +3062,11 @@ void RGWGetObj::execute(optional_yield y)
     op_ret = 0;
     op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
   }
+  if (read_op->params.rdma_submitted) {
+    rdma_fence_ms = static_cast<uint64_t>(
+        std::ceil(read_op->params.rdma_lease * 1000.0)) +
+      s->cct->_conf.get_val<uint64_t>("rgw_cuobj_fence_drain_ms");
+  }
 
   if (op_ret >= 0)
     op_ret = filter->flush();
@@ -3053,7 +3077,7 @@ void RGWGetObj::execute(optional_yield y)
     goto done_err;
   }
 
-  if (rdma_mode == RdmaMode::PASSTHROUGH) {
+  if (rdma_oob_mode()) {
     if (rdma_bytes != total_len) {
       ldpp_dout(this, 0) << "ERROR: rdma passthrough delivered " << rdma_bytes
                          << " of " << total_len << " bytes" << dendl;

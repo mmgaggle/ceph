@@ -1803,6 +1803,9 @@ struct get_obj_data {
   double rdma_lease = 0;
   // per-stripe oob results, pushed in logical stripe order (stable addrs)
   std::deque<librados::ObjectReadOperation::rdma_delivery_result> rdma_slots;
+  // slot index by the stripe's logical offset (the aio result id), so a
+  // completion can report where its bytes landed
+  std::map<uint64_t, size_t> rdma_slot_by_ofs;
 
   int flush(rgw::AioResultList&& results);
   int flush_rdma(rgw::AioResultList&& results);

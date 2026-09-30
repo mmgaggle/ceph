@@ -73,6 +73,11 @@ namespace rgw::lua {
 class RGWGetDataCB {
 public:
   virtual int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) = 0;
+  /// bytes [ofs, ofs+len) of the requested range landed out of band (an
+  /// OSD wrote them into the memory window named by ReadOp::params.
+  /// rdma_token); ofs is relative to the start of the range. Ranges may
+  /// arrive in any order. Only called when a token was set.
+  virtual int handle_oob(uint64_t ofs, uint64_t len) { return 0; }
   RGWGetDataCB() {}
   virtual ~RGWGetDataCB() {}
 };

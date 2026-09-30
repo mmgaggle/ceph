@@ -358,6 +358,12 @@ public:
     }
     return 0;
   }
+  int handle_oob(uint64_t ofs, uint64_t len) override {
+    if (next) {
+      return next->handle_oob(ofs, len);
+    }
+    return 0;
+  }
   /**
    * Flushes any cached data. Used by RGWGetObjFilter.
    * Return logic same as handle_data.
@@ -472,9 +478,26 @@ protected:
     NONE,        ///< HTTP body (x-amz-rdma-reply: 501 when a token was sent)
     STAGED,      ///< staged in RGW memory, one RDMA_WRITE from the local cuObjServer
     PASSTHROUGH, ///< OSDs RDMA-write stripes directly (CEPH_OSD_OP_READ_RDMA)
+    RELAY,       ///< OSDs RDMA-write stripes into a gateway window that a
+                 ///< subclass forwards to the client (hipobj-rc-v2)
+    RELAY_STAGED,///< stripes copied into that gateway window instead
   };
   std::string rdma_token;  ///< x-amz-rdma-token header, empty if absent
   RdmaMode rdma_mode = RdmaMode::NONE;
+  /// a gateway memory window for the relay modes: the subclass serving
+  /// an RC session sets these before execute(); relay_token is the
+  /// cuObject descriptor the OSDs push into (empty = no OSD-direct
+  /// delivery, so RELAY_STAGED)
+  std::string relay_token;
+  size_t relay_window = 0;
+  /// after execute(): how long an OSD may still write into the window
+  /// (the pool's delivery lease plus the transport drain bound) when
+  /// the final read sent delivery descriptors; 0 otherwise
+  uint64_t rdma_fence_ms = 0;
+  /// true for the modes where the OSDs deliver out of band
+  bool rdma_oob_mode() const {
+    return rdma_mode == RdmaMode::PASSTHROUGH || rdma_mode == RdmaMode::RELAY;
+  }
   uint64_t rdma_bytes = 0; ///< bytes delivered out of band (passthrough)
   /// combined CRC64-NVME of the delivered bytes, when every stripe
   /// reported one (passthrough verification)
@@ -542,6 +565,8 @@ public:
   int handle_slo_manifest(bufferlist& bl, optional_yield y);
 
   int get_data_cb(bufferlist& bl, off_t ofs, off_t len);
+  /// an out-of-band stripe landed (relay modes; see RGWGetDataCB)
+  virtual int get_oob_cb(uint64_t ofs, uint64_t len) { return 0; }
 
   virtual int get_params(optional_yield y) = 0;
   virtual int send_response_data_error(optional_yield y) = 0;
@@ -581,6 +606,9 @@ public:
 
   int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) override {
     return op->get_data_cb(bl, bl_ofs, bl_len);
+  }
+  int handle_oob(uint64_t ofs, uint64_t len) override {
+    return op->get_oob_cb(ofs, len);
   }
 };
 

@@ -336,6 +336,9 @@ if(WITH_RADOSGW_CUOBJ)
   list(APPEND librgw_common_srcs rgw_cuobj.cc)
 endif()
 
+# hipobj-rc-v2 wire encoding: pure, no transport dependency
+list(APPEND librgw_common_srcs rgw_rdma_rc_wire.cc)
+
 add_library(rgw_common STATIC
   ${librgw_common_srcs}
   ${librgw_driver_srcs})

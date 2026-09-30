@@ -121,6 +121,11 @@ add_executable(unittest_rgw_bencode test_rgw_bencode.cc)
 add_ceph_unittest(unittest_rgw_bencode)
 target_link_libraries(unittest_rgw_bencode ${rgw_libs})
 
+# unittest_rgw_rdma_rc_wire
+add_executable(unittest_rgw_rdma_rc_wire test_rgw_rdma_rc_wire.cc)
+add_ceph_unittest(unittest_rgw_rdma_rc_wire)
+target_link_libraries(unittest_rgw_rdma_rc_wire ${rgw_libs})
+
 # unittest_rgw_cors
 add_executable(unittest_rgw_cors
   test_rgw_cors.cc

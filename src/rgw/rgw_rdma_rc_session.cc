@@ -182,7 +182,7 @@ int Service::do_init(CephContext* c)
 
   ldout(cct, 1) << "rgw_rdma_rc: ready on " << dev.name() << " with "
                 << buf_count << " x " << buf_size << " byte buffers, "
-                << (dct ? "OSD-direct delivery on" : "OSD-direct delivery off")
+                << (osd_direct() ? "OSD-direct delivery on" : "OSD-direct delivery off")
                 << dendl;
   return 0;
 }
@@ -222,7 +222,11 @@ void Service::do_shutdown()
 
 bool Service::osd_direct() const
 {
+#ifdef HAVE_MLX5DV
   return static_cast<bool>(dct);
+#else
+  return false;
+#endif
 }
 
 Buffer* Service::acquire_buffer(size_t needed)

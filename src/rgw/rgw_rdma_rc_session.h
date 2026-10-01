@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "acconfig.h"
 #include "include/common_fwd.h"
 #include "rgw_rdma_rc_transport.h"
 #include "rgw_rdma_rc_wire.h"
@@ -221,7 +222,9 @@ class Service {
 
   CephContext* cct = nullptr;
   Device dev;
+#ifdef HAVE_MLX5DV
   std::unique_ptr<dc::Target> dct;
+#endif
   std::vector<Buffer> pool;
   size_t buf_size = 0;
 

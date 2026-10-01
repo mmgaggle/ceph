@@ -577,66 +577,62 @@ Limitations
 * Every endpoint of one provider must use the same address family.
   Mixed IPv4 and IPv6 endpoints are not tested.
 
-UET delivery (mock-up)
-======================
+UET through libfabric
+=====================
 
-This branch carries a mock-up of OSD-direct delivery over Ultra Ethernet
-Transport (UET). It shows that OSDs can write GET data straight into a
-client's memory without a connection per OSD, as cuObject's DC transport
-does, but on any Ethernet NIC.
+Ultra Ethernet Transport (UET) reaches Ceph through the libfabric
+executor, like any other provider. UET's RUDI mode is reliable,
+unordered and connectionless, and it is meant for idempotent
+operations. A window owner keeps no state for the OSDs that write into
+it. cuObject's DC transport has the same property, but UET runs on any
+Ethernet NIC.
 
-The client registers a memory window with a UET provider and sends an
-ordinary S3 GET with this token in ``x-amz-rdma-token``::
+The UEC reference provider (https://github.com/ultraethernet/uet-ref-prov)
+is a software UET stack over raw Ethernet sockets. It does not register
+itself with libfabric. The tests for this feature used a wrapper that
+registers it as the libfabric provider ``uet``. Point
+``FI_PROVIDER_PATH`` at the directory that holds the wrapper in the
+environment of every daemon and client.
 
-  <base hex>:<window size hex>:uet1:<client IPv4>:<memory key hex>
+Each OSD needs these settings:
 
-The token starts with the same ``addr:size`` fields as a cuObject token,
-so the gateway treats it the same way. With
-``rgw_cuobj_osd_passthrough`` on, the gateway forwards it to the OSDs in
-each stripe read's delivery descriptor. An OSD with UET delivery enabled
-writes its stripe into the window with RMA writes in UET's RUDI mode.
-RUDI is reliable, unordered and connectionless, and it is meant for
-idempotent operations. The client keeps no state for the OSDs. It does
-not add their addresses and does no handshake. The OSD replies to the
-gateway after its writes complete, and the gateway answers the GET after
-every stripe's reply is in.
-
-OSDs choose an executor by the token's shape. A token with the ``uet1``
-tag goes to the UET executor, and any other token goes to cuObject. A
-token that no running executor serves is delivered inline, as before.
-
-The mock-up uses the UEC reference provider
-(https://github.com/ultraethernet/uet-ref-prov), a software UET stack
-over raw Ethernet sockets. Build the provider, then build Ceph with
-``-DWITH_OSD_UET=ON -DUET_REF_PROV_DIR=<provider checkout>``. Each OSD
-needs:
-
-* ``osd_uet_enabled`` set to true.
-* ``osd_uet_ifname`` set to the interface it sends and receives on. The
-  interface's IPv4 address is the OSD's fabric endpoint. The value can
-  use ``$id``, for example ``uet-o$id``.
+* ``osd_ofi_enabled`` set to true, and ``osd_ofi_provider`` set to
+  ``uet``.
+* ``osd_ofi_domain`` set to the interface that the OSD sends and
+  receives on. The interface's IPv4 address is the OSD's fabric
+  endpoint. The value can use ``$id``, for example ``uet-o$id``.
 * The ``CAP_NET_RAW`` capability, for the raw socket. An OSD normally
-  drops every capability its block-device plugins do not need. With
-  ``osd_uet_enabled`` set, it keeps ``CAP_NET_RAW`` as well.
+  drops every capability that its block-device plugins do not need.
+  When ``osd_ofi_enabled`` is set and ``osd_ofi_provider`` is ``uet``,
+  the OSD also keeps ``CAP_NET_RAW``.
 
-``ceph_test_rgw_uet_get`` is a client for the mock-up. It registers a
-window, sends a signed GET with the token, and verifies the window
-against a local copy of the object. ``ceph daemon osd.N uet status``
-shows each OSD's delivery counters.
+The gateway's relay windows need ``rgw_rdma_rc_ofi_provider`` set to
+``uet``, an interface in ``rgw_rdma_rc_ofi_domain``, and
+``CAP_NET_RAW``.
 
-The mock-up has these limits:
+The reference provider has these limits:
 
-* The provider is software. A target places incoming data only while
-  its application polls, so the client polls during the GET.
-* The provider keeps process-wide state. Each OSD has one UET endpoint,
-  and the OSD serializes every call into it.
-* Writes are sent unencrypted. The provider's security sublayer works in
-  server mode, but the mock-up does not configure it.
-* The OSD writes on the op thread and waits for completion, as the first
-  cuObject executor did.
+* It is software. A window owner places incoming data only while it
+  polls its endpoint.
+* It keeps process-wide state, so each process has one interface and
+  one endpoint. Processes on one host need separate interfaces and
+  addresses.
+* The first write to a new peer runs ``ip route``, ``arp`` and
+  ``ping`` to find the next hop, and the endpoint waits until ``ping``
+  returns. If the peer does not answer the ping, the wait is 10
+  seconds. The OSD's write then times out, and the read is delivered
+  inline.
+* It sends writes unencrypted, because the security sublayer is not
+  configured.
+* It supports IPv4 only.
 
-Gathering erasure-coded reads out of band (mock-up)
----------------------------------------------------
+To test several endpoints on one host, put each UET interface in its
+own VRF, the gateway's interface included. The provider resolves peers
+with ``ip route get``. Without VRFs, a peer's address is a local address
+of the host, so resolution fails or the ping gets no answer.
+
+Gathering erasure-coded reads out of band
+=========================================
 
 The primary of an erasure-coded read normally collects the shards it
 needs from its peers in the sub-read replies, over the messenger. With
@@ -662,13 +658,11 @@ the primary did not consume stays out of use for the pool's
 replied inline, and a read that was cancelled or restarted. A peer that
 received the window's token could still write into it until then.
 
-Each executor can lend windows. When several are up, the libfabric
+Both executors can lend windows. When both are up, the libfabric
 executor lends them:
 
 * libfabric lends them from a pool registered for remote writes on the
   OSD's endpoint. Peers need the same provider to push into them.
-* UET lends them from a receive pool registered next to its staging
-  region.
 * cuObject lends them from a pool behind a DC target on the OSD's RDMA
   device, so peers' cuObject servers can push into it. This needs an
   mlx5 NIC, and in this branch it is compiled only, not tested.
@@ -683,8 +677,3 @@ The options are:
 The sub-read message carries the token as a new trailing field, and the
 reply carries the pushed extents, so peers on older releases ignore the
 token and reply inline.
-
-To test several OSDs on one host with the UEC reference provider, put
-each OSD's UET interface in its own VRF. The provider resolves peers
-with ``ip route get``. Without VRFs, a peer OSD's address is a local
-address of the host, and resolution fails.

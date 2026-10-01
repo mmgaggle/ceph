@@ -54,6 +54,15 @@
   session buffer (``rgw_rdma_rc_osd_direct``), and the gateway relays them to
   the client while the read is still in progress. Enable with
   ``rgw_rdma_rc_enabled``. See ``doc/radosgw/s3-rdma.rst``.
+* RADOS/RGW: Out-of-band delivery can now run over libfabric (build with
+  ``WITH_OOB_OFI``, enable with ``osd_ofi_enabled`` and choose the provider
+  with ``osd_ofi_provider``). The provider selects the wire: ``tcp`` or
+  ``shm`` need no special hardware, ``verbs;ofi_rxm`` runs RDMA reliable
+  connections, ``efa`` runs AWS SRD, and a UET provider runs Ultra Ethernet.
+  The same transport carries erasure-coded shard reads to the gathering
+  primary (``osd_oob_gather``) and stripes into the gateway's relay windows
+  for Reliable Connection clients (``rgw_rdma_rc_ofi_provider``), so neither
+  needs an mlx5 NIC. See ``doc/radosgw/s3-rdma.rst``.
 * RGW: New S3 Control APIs to apply PublicAccessBlock configuration to User Accounts.
 * ceph-volume: Raw BlueStore OSD preparation now pre-formats NVMe devices and
   skips the slower BlueStore discard phase,reducing mkfs time on

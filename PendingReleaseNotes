@@ -29,40 +29,38 @@
   index, so only objects written or restored after this upgrade will populate
   the field. Existing objects are unaffected.
 
-* RGW/RADOS: S3 objects can now be served over RDMA using the NVIDIA cuObject
-  library (``x-amz-rdma-token``). In addition to the gateway-staged mode
-  (``WITH_RADOSGW_CUOBJ`` + ``rgw_cuobj_enabled``), a new OSD passthrough mode
-  (``rgw_cuobj_osd_passthrough`` with OSDs built with ``WITH_OSD_CUOBJ`` and
-  ``osd_cuobj_enabled``) forwards the client's RDMA descriptor to the OSDs as
-  a per-operation advisory delivery field on the RADOS request, so GET data is DMA-written
-  directly from each OSD into client (or client GPU) memory without traversing
-  the gateway; replicated and erasure-coded pools are supported, including a
-  shard-direct interleave for EC split reads. Any OSD that cannot push (older
-  release, feature absent or disabled, expired delivery lease, retransmitted
-  request) returns the data inline as a normal read, so mixed-version clusters
-  degrade transparently to ordinary behavior. librados gains
-  ``ObjectReadOperation::set_rdma_delivery()``. OSDs can additionally
-  checksum (CRC64-NVME) each stripe as it is RDMA-written, and the gateway
-  verifies whole-object GETs against the stored full-object ``crc64nvme``
-  checksum before responding (``rgw_cuobj_crc64nvme``, on by default),
-  which catches corruption at the storage node and inside the cluster
-  before the client is answered. See ``doc/radosgw/s3-rdma.rst``.
+* RGW/RADOS: S3 objects can now be served over RDMA (``x-amz-rdma-token``).
+  In OSD passthrough mode (``rgw_rdma_osd_passthrough``) the gateway forwards
+  the client's token to the OSDs as a per-operation advisory delivery field
+  on the RADOS request, so GET data is written directly from each OSD into
+  client (or client GPU) memory without traversing the gateway. Replicated
+  and erasure-coded pools are supported, including a shard-direct interleave
+  for EC split reads, and an EC primary can gather its shards out of band
+  (``osd_oob_gather``). Any OSD that cannot deliver (older release, no
+  executor for the token's transport, expired delivery lease, retransmitted
+  request) returns the data inline as a normal read, so mixed-version
+  clusters degrade transparently. librados gains
+  ``ObjectReadOperation::set_rdma_delivery()``. ``osd_oob_transports`` and
+  ``rgw_rdma_transports`` choose the transports: ``cuobj`` uses NVIDIA's
+  cuObject library (DC transport on ConnectX; build with ``WITH_OSD_CUOBJ``
+  and ``WITH_RADOSGW_CUOBJ``), which also serves gateway-staged GET and PUT,
+  and ``ofi`` uses libfabric (build with ``WITH_OOB_OFI``), whose provider
+  (``osd_ofi_provider``) selects the wire: ``tcp`` or ``shm`` need no special
+  hardware, ``verbs;ofi_rxm`` runs RDMA reliable connections, ``efa`` runs
+  AWS SRD, and a UET provider runs Ultra Ethernet. OSDs can checksum
+  (CRC64-NVME) each stripe they deliver, and the gateway compares
+  whole-object GETs with the stored full-object ``crc64nvme`` checksum
+  before responding (``rgw_rdma_crc64nvme``, on by default), which catches
+  corruption at the storage node and inside the cluster before the client
+  is answered. See ``doc/radosgw/s3-rdma.rst``.
 * RGW: The gateway now serves S3 over RDMA to clients that use Reliable
   Connection transport, such as AMD's hipObject library (the ``hipobj-rc-v2``
   control protocol on ``/.hipobj-rc/``). These clients do not need NVIDIA
   ConnectX NICs. For a GET, the OSDs can write the stripes into a gateway
-  session buffer (``rgw_rdma_rc_osd_direct``), and the gateway relays them to
-  the client while the read is still in progress. Enable with
-  ``rgw_rdma_rc_enabled``. See ``doc/radosgw/s3-rdma.rst``.
-* RADOS/RGW: Out-of-band delivery can now run over libfabric (build with
-  ``WITH_OOB_OFI``, enable with ``osd_ofi_enabled`` and choose the provider
-  with ``osd_ofi_provider``). The provider selects the wire: ``tcp`` or
-  ``shm`` need no special hardware, ``verbs;ofi_rxm`` runs RDMA reliable
-  connections, ``efa`` runs AWS SRD, and a UET provider runs Ultra Ethernet.
-  The same transport carries erasure-coded shard reads to the gathering
-  primary (``osd_oob_gather``) and stripes into the gateway's relay windows
-  for Reliable Connection clients (``rgw_rdma_rc_ofi_provider``), so neither
-  needs an mlx5 NIC. See ``doc/radosgw/s3-rdma.rst``.
+  session buffer over the first transport in ``rgw_rdma_transports`` that
+  can expose it, and the gateway relays them to the client while the read
+  is still in progress. Enable with ``rgw_rdma_rc_enabled``. See
+  ``doc/radosgw/s3-rdma.rst``.
 * RGW: New S3 Control APIs to apply PublicAccessBlock configuration to User Accounts.
 * ceph-volume: Raw BlueStore OSD preparation now pre-formats NVMe devices and
   skips the slower BlueStore discard phase,reducing mkfs time on

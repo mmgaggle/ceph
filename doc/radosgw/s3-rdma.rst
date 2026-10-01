@@ -56,33 +56,41 @@ Reliable Connection clients
 Data paths
 ----------
 
-Gateway-staged mode
-  The gateway reads the object from RADOS and collects it in a
-  registered buffer. Then it writes the buffer to the client in one
-  transfer with its own cuObject server. This mode serves cuObject
-  clients. It is also the mode that serves their PUT requests, because
-  an upload must pass through the gateway's checksum, compression and
-  encryption filters.
+Object data takes one of two paths, whatever the client's transport.
 
-OSD passthrough mode
-  The gateway forwards the client's token to the OSDs in each stripe
-  read. Each OSD writes its stripe directly into the client's window.
-  The object data never passes through the gateway, and the transfer
-  bandwidth grows with the number of OSDs. This mode serves GET
-  requests from cuObject and libfabric clients. The gateway itself
-  needs no RDMA adapter and no transport library in this mode.
+OSD-direct
+  The OSDs write each stripe straight into a window. For cuObject and
+  libfabric clients, the window is the client's own memory, and the
+  object data never passes through the gateway. This is OSD passthrough
+  mode, and its bandwidth grows with the number of OSDs. The gateway
+  needs no RDMA adapter and no transport library for it. For RC
+  clients, the window is a gateway session buffer. The gateway writes
+  the buffer to the client over the paired queue pair while the
+  stripes arrive. This is OSD-direct relay. ``rgw_rdma_osd_passthrough``
+  turns on both.
 
-RC relay
-  The OSDs write the stripes into a gateway session buffer. The gateway
-  writes the buffer to the client over the paired queue pair while the
-  stripes arrive. This mode serves RC clients.
+Gateway-staged
+  The gateway reads the object from RADOS into a registered buffer and
+  writes it to the client over the client's transport. For cuObject
+  clients, the gateway's cuObject server writes the buffer in one
+  transfer. For RC clients, the gateway writes the session buffer while
+  the stripes arrive, which is staged relay. Libfabric clients have no
+  gateway-staged mode yet, so they fall back to HTTP. Every PUT that
+  the gateway serves out of band is gateway-staged, for cuObject and RC
+  clients. An upload must pass through the gateway's checksum,
+  compression and encryption filters.
+
+The gateway uses OSD-direct when it can, and gateway-staged otherwise.
 
 Transports
 ----------
 
 An OSD reaches a window through an executor. An executor is a
 transport that writes the bytes of a read into the window that a token
-names. Two executors exist:
+names. ``osd_oob_transports`` lists the executors that an OSD starts,
+and ``rgw_rdma_transports`` lists the transports that the gateway
+starts. Both name the transports ``ofi`` and ``cuobj``. Two executors
+exist:
 
 cuObject executor
   Writes to DC descriptors with NVIDIA's ``cuobjserver`` library. It
@@ -131,11 +139,13 @@ no descriptor. An OSD replies inline in these cases:
 Executors and tokens
 --------------------
 
-An OSD chooses an executor by the shape of the token. A token whose
-third field is ``ofi1`` goes to the libfabric executor, but only when
-the token names the OSD's own provider (``osd_ofi_provider``). Any
-other token goes to the cuObject executor. A token that no running
-executor serves is delivered inline.
+An OSD starts the executors that ``osd_oob_transports`` lists. It
+skips, with a warning, a transport that it was built without or that
+fails to start. It chooses an executor for each token by the shape of
+the token. A token whose third field is ``ofi1`` goes to the libfabric
+executor, but only when the token names the OSD's own provider
+(``osd_ofi_provider``). Any other token goes to the cuObject executor.
+A token that no running executor serves is delivered inline.
 
 Placement plans
 ---------------
@@ -186,7 +196,7 @@ Fallback order
 
 The gateway tries these modes in order, for each request:
 
-#. Passthrough, when the request has a token, ``rgw_cuobj_osd_passthrough``
+#. Passthrough, when the request has a token, ``rgw_rdma_osd_passthrough``
    is on and the request is eligible. If any stripe comes back inline,
    the gateway restarts the whole GET in the next mode. The client does
    not see the restart, because the gateway has not sent HTTP bytes
@@ -194,7 +204,8 @@ The gateway tries these modes in order, for each request:
    first waits for the fence described in
    `Fencing a window before reuse`_.
 #. Gateway-staged mode, when the token is a cuObject descriptor and the
-   gateway has a working cuObject server.
+   gateway runs its cuObject server (``cuobj`` in
+   ``rgw_rdma_transports``).
 #. The HTTP body, with ``x-amz-rdma-reply: 501``. The cuObject protocol
    defines this value as the signal to fall back to HTTP.
 
@@ -220,7 +231,7 @@ use again:
   OSD can still start a transfer. This covers an OSD that disappears
   during the request, and an operation that the gateway's RADOS client
   sent again. Before a fallback rewrites the window, the gateway waits
-  for the lease plus ``rgw_cuobj_fence_drain_ms``. That outlasts the
+  for the lease plus ``rgw_rdma_fence_drain_ms``. That outlasts the
   lease and the transport's drain, so the window is quiet before it is
   written again.
 
@@ -285,10 +296,10 @@ A window whose data the primary did not use stays out of use for the
 pool's ``rdma_delivery_lease`` plus a drain bound. This covers a shard
 that replied inline, and a read that was cancelled or restarted.
 
-The libfabric executor lends the windows when it runs. Otherwise the
-cuObject executor lends them, from a pool behind a DC target on the
-OSD's adapter. Peers must run the same transport to write into a
-window.
+The first transport in ``osd_oob_transports`` that started lends the
+windows. The libfabric executor registers them on its endpoint. The
+cuObject executor puts them behind a DC target on the OSD's adapter.
+Peers must run the same transport to write into a window.
 
 The token travels in a new trailing field of the sub-read message, and
 the pushed extents in a new trailing field of the reply. An OSD of an
@@ -343,15 +354,16 @@ OSD-direct relay
   The gateway exposes its session buffers to the OSDs. Each stripe read
   carries a delivery descriptor for the session buffer, and the OSDs
   write their stripes into it, as in passthrough mode. The gateway does
-  not copy the object. The buffers are exposed over libfabric when
-  ``rgw_rdma_rc_ofi_provider`` is set. This works on any adapter that
-  the provider supports. Otherwise they are exposed as a cuObject DC
-  target, which needs an mlx5 adapter on the gateway. Both ways need
-  ``rgw_cuobj_osd_passthrough``.
+  not copy the object. This needs ``rgw_rdma_osd_passthrough``, and a
+  transport in ``rgw_rdma_transports`` that can expose the buffers.
+  The first one that can does so. With ``ofi``, the buffers are exposed
+  over libfabric, on any adapter that the provider supports. With
+  ``cuobj``, they are exposed as a cuObject DC target, which needs an
+  mlx5 adapter on the gateway.
 
 Staged relay
-  The gateway reads the object from RADOS as usual and copies it into
-  the session buffer. The gateway uses this path when OSD-direct relay
+  This is gateway-staged mode for RC clients. The gateway reads the
+  object from RADOS as usual and copies it into the session buffer. The gateway uses this path when OSD-direct relay
   is not available, and for compressed objects. It is also the fallback
   when an OSD returns a stripe inline.
 
@@ -365,7 +377,7 @@ client that all earlier writes are in its memory.
 When a relay fails after the OSDs received delivery descriptors, an OSD
 can still write into the session buffer until the pool's
 ``rdma_delivery_lease`` expires. The gateway keeps that buffer out of
-use for the lease plus ``rgw_cuobj_fence_drain_ms``.
+use for the lease plus ``rgw_rdma_fence_drain_ms``.
 
 PUT
 ---
@@ -387,11 +399,12 @@ read only its leading address and size fields. The rest names the
 client's remote key and DC target. Every writer needs the DC key that
 the client library uses, which is ``0xffeeddcc`` by default.
 
-The OSD executor needs ``osd_cuobj_enabled``, a build with
-``WITH_OSD_CUOBJ``, a ConnectX-5 or newer adapter, ``rdma-core``, and
-NVIDIA's proprietary ``cuobjserver`` library. Gateway-staged mode needs
-``rgw_cuobj_enabled``, a build with ``WITH_RADOSGW_CUOBJ``, and the
-same adapter and library on the gateway host. No GPU is needed on the
+The OSD executor needs ``cuobj`` in ``osd_oob_transports``, a build
+with ``WITH_OSD_CUOBJ``, a ConnectX-5 or newer adapter, ``rdma-core``,
+and NVIDIA's proprietary ``cuobjserver`` library. Gateway-staged mode
+for cuObject clients needs ``cuobj`` in ``rgw_rdma_transports``, a
+build with ``WITH_RADOSGW_CUOBJ``, and the same adapter and library on
+the gateway host. No GPU is needed on the
 OSD, gateway or client hosts. Only GPU memory targets on the client
 need CUDA.
 
@@ -411,8 +424,9 @@ does not name the real cause.
   cuObject cannot start a session.
 
 Locked memory must be raised
-  Every OSD registers ``osd_cuobj_buffer_count`` times
-  ``osd_cuobj_buffer_size`` of memory, which is 256 MiB at the defaults.
+  Every OSD registers ``osd_oob_buffer_count`` times
+  ``osd_oob_buffer_size`` of memory for each executor, which is 256 MiB
+  at the defaults.
   That is far above the usual 8 MiB ``memlock`` limit. Give the OSDs,
   and the gateway in staged mode, ``LimitMEMLOCK=infinity``. For a
   vstart cluster, run ``ulimit -l unlimited``.
@@ -519,19 +533,19 @@ that holds the wrapper, in the environment of every daemon and client.
 
 Each OSD needs these settings:
 
-* ``osd_ofi_enabled`` set to true, and ``osd_ofi_provider`` set to
+* ``ofi`` in ``osd_oob_transports``, and ``osd_ofi_provider`` set to
   ``uet``.
 * ``osd_ofi_domain`` set to the interface that the OSD sends and
   receives on. The interface's IPv4 address is the OSD's fabric
   endpoint. The value can use ``$id``, for example ``uet-o$id``.
 * The ``CAP_NET_RAW`` capability, for the raw socket. An OSD normally
   drops every capability that its block-device plugins do not need.
-  When ``osd_ofi_enabled`` is set and ``osd_ofi_provider`` is ``uet``,
-  the OSD also keeps ``CAP_NET_RAW``.
+  When ``osd_oob_transports`` names ``ofi`` and ``osd_ofi_provider`` is
+  ``uet``, the OSD also keeps ``CAP_NET_RAW``.
 
-The gateway's relay windows need ``rgw_rdma_rc_ofi_provider`` set to
-``uet``, an interface in ``rgw_rdma_rc_ofi_domain``, and
-``CAP_NET_RAW``.
+The gateway's relay windows need ``ofi`` in ``rgw_rdma_transports``,
+``rgw_ofi_provider`` set to ``uet``, an interface in
+``rgw_ofi_domain``, and ``CAP_NET_RAW``.
 
 The reference provider has these limits:
 
@@ -557,7 +571,7 @@ Integrity
 =========
 
 The gateway does not touch passthrough data, so it cannot compute a
-checksum itself. When ``rgw_cuobj_crc64nvme`` is on, the gateway asks
+checksum itself. When ``rgw_rdma_crc64nvme`` is on, the gateway asks
 each OSD for a CRC-64/NVME of the data that the OSD delivered. The OSD
 computes the values from the bytes that it writes. For an erasure-coded
 primary read, those are the bytes after reconstruction. The OSD reports
@@ -583,7 +597,7 @@ whole-object checksum, so a sparse read with several extents is not
 compared.
 
 RC clients get a checksum of the delivered bytes in the READY answer
-(``X-Amz-Rdma-Checksum``), when ``rgw_rdma_rc_crc64nvme`` is on. An RC
+(``X-Amz-Rdma-Checksum``), when ``rgw_rdma_crc64nvme`` is on. An RC
 client can compare that value with the bytes in its own buffer, which
 also covers the final write.
 
@@ -623,25 +637,41 @@ Pool option
 Gateway options
 ---------------
 
-Passthrough and integrity:
+Transports and out-of-band behavior:
 
-* ``rgw_cuobj_osd_passthrough``: forward tokens to the OSDs for GET.
-  The default is false.
-* ``rgw_cuobj_crc64nvme``: ask the OSDs for checksums and compare
-  whole-object GETs with the stored checksum. The default is true.
-* ``rgw_cuobj_fence_drain_ms``: the transport drain bound added to the
-  lease before a fallback rewrites a window. Make it cover the
-  transport's retry budget, which is about two seconds at the cuObject
-  defaults. The default is 3000.
+* ``rgw_rdma_transports``: the transports that the gateway starts, in
+  order of preference. ``cuobj`` starts the gateway's cuObject server
+  for gateway-staged mode, and can expose the RC relay windows as a DC
+  target. ``ofi`` opens a libfabric endpoint that can expose the relay
+  windows. The default is empty.
+* ``rgw_rdma_osd_passthrough``: have the OSDs write GET data directly,
+  into client windows and into RC relay windows. The default is false.
+* ``rgw_rdma_crc64nvme``: compute checksums of out-of-band transfers.
+  The gateway compares whole-object passthrough GETs with the stored
+  checksum, and reports a checksum to RC clients. The default is true.
+* ``rgw_rdma_fence_drain_ms``: the transport drain bound added to the
+  lease before the gateway rewrites or reuses a window that OSDs can
+  still write. Make it cover the transport's retry budget, which is
+  about two seconds at the cuObject defaults. The default is 3000.
 
-Gateway-staged mode:
+libfabric endpoint (``ofi``):
 
-* ``rgw_cuobj_enabled``: run the gateway's cuObject server.
+* ``rgw_ofi_provider``: the provider. It must match the OSDs'
+  ``osd_ofi_provider``. The default is ``tcp``.
+* ``rgw_ofi_domain`` and ``rgw_ofi_node``: the domain and the local
+  address to bind. The address must be reachable from the OSDs. When
+  they are empty, the provider chooses.
+
+cuObject server (``cuobj``):
+
 * ``rgw_cuobj_rdma_ip`` and ``rgw_cuobj_rdma_port``: its address and
   port. The default port is 20886.
 * ``rgw_cuobj_buffer_size`` and ``rgw_cuobj_buffer_count``: the staging
   buffers, 128 buffers of 8 MiB by default.
 * ``rgw_cuobj_num_dcis``: the DC initiators, 128 by default.
+* ``rgw_cuobj_dc_key``: the DC key of the server and of the relay DC
+  target. It must match the clients' key and ``osd_cuobj_dc_key``. The
+  default is ``0xffeeddcc``.
 
 RC clients:
 
@@ -660,59 +690,49 @@ RC clients:
   flight for one session, 64 by default.
 * ``rgw_rdma_rc_prepare_timeout_ms`` and ``rgw_rdma_rc_exec_timeout_ms``:
   how long a session waits for READY, and how long a transfer can take.
-* ``rgw_rdma_rc_osd_direct``: expose the session buffers for OSD-direct
-  relay. The default is true.
-* ``rgw_rdma_rc_ofi_provider``, ``rgw_rdma_rc_ofi_domain`` and
-  ``rgw_rdma_rc_ofi_node``: expose the session buffers over libfabric.
-  The provider must match the OSDs' ``osd_ofi_provider``, and the
-  address must be reachable from the OSDs. When the provider is empty,
-  the gateway uses a DC target.
-* ``rgw_rdma_rc_dc_key``: the key of the DC target. It must match
-  ``osd_cuobj_dc_key``.
-* ``rgw_rdma_rc_crc64nvme``: report a checksum of the delivered bytes
-  in the READY answer. The default is true.
 
 OSD options
 -----------
 
-cuObject executor:
+Executors and out-of-band behavior:
 
-* ``osd_cuobj_enabled``: start the executor. The default is false.
-* ``osd_cuobj_rdma_ip``: the RDMA interface address. The default is the
-  OSD's public address. You must set it when the RDMA adapter is not
-  the public-network interface.
-* ``osd_cuobj_rdma_port``: the local ``rdma_cm`` port. The default, 0,
-  lets the library choose. Clients never connect to this port.
-* ``osd_cuobj_buffer_size`` and ``osd_cuobj_buffer_count``: the staging
-  buffers, 32 buffers of 8 MiB by default. A buffer must hold the
-  largest stripe read (``rgw_get_obj_max_req_size``, 4 MiB by default).
-  A read that does not fit uses a slower one-time registration.
-* ``osd_cuobj_num_dcis``: the DC initiators, 128 by default. Use at
-  least the number of OSD op worker threads.
-* ``osd_cuobj_dc_key``: the DC key. It must match the key of the client
-  library across the cluster. The default is ``0xffeeddcc``, the
-  library's default.
-
-libfabric executor:
-
-* ``osd_ofi_enabled``: start the executor. The default is false.
-* ``osd_ofi_provider``: the provider. The default is ``tcp``.
-* ``osd_ofi_domain`` and ``osd_ofi_node``: the domain, such as an RDMA
-  device or a network interface, and the local address to bind. When
-  they are empty, the provider chooses.
-* ``osd_ofi_buffer_size`` and ``osd_ofi_buffer_count``: the staging
-  buffers, 8 buffers of 16 MiB by default. A read larger than a buffer,
-  or a read that finds no free buffer, is delivered inline.
-* ``osd_ofi_op_timeout_ms``: how long the writes of one read can take,
+* ``osd_oob_transports``: the executors that the OSD starts, in order
+  of preference. ``ofi`` starts the libfabric executor and ``cuobj``
+  starts the cuObject executor. The default is empty.
+* ``osd_oob_buffer_size`` and ``osd_oob_buffer_count``: the staging
+  buffers of each executor, 16 buffers of 16 MiB by default. A buffer
+  must hold the largest read that is delivered out of band, such as a
+  gateway stripe (``rgw_get_obj_max_req_size``, 4 MiB by default). The
+  libfabric executor delivers a read inline when it does not fit or
+  finds no free buffer. The cuObject executor registers a one-time
+  buffer for it instead, which is slower.
+* ``osd_oob_op_timeout_ms``: how long the writes of one read can take,
   5000 by default. After that the read is delivered inline.
-
-Gathering shard reads:
-
 * ``osd_oob_gather``: lend windows when this OSD is the primary of an
   erasure-coded read. The default is false.
 * ``osd_oob_window_size`` and ``osd_oob_window_count``: the window
   pool, 16 windows of 8 MiB by default. A shard read larger than a
   window, or a gather that finds no free window, uses inline replies.
+
+libfabric executor (``ofi``):
+
+* ``osd_ofi_provider``: the provider. The default is ``tcp``.
+* ``osd_ofi_domain`` and ``osd_ofi_node``: the domain, such as an RDMA
+  device or a network interface, and the local address to bind. When
+  they are empty, the provider chooses.
+
+cuObject executor (``cuobj``):
+
+* ``osd_cuobj_rdma_ip``: the RDMA interface address. The default is the
+  OSD's public address. You must set it when the RDMA adapter is not
+  the public-network interface.
+* ``osd_cuobj_rdma_port``: the local ``rdma_cm`` port. The default, 0,
+  lets the library choose. Clients never connect to this port.
+* ``osd_cuobj_num_dcis``: the DC initiators, 128 by default. Use at
+  least the number of OSD op worker threads.
+* ``osd_cuobj_dc_key``: the DC key. It must match the key of the client
+  library across the cluster. The default is ``0xffeeddcc``, the
+  library's default.
 
 Operations
 ==========
@@ -763,8 +783,8 @@ Limitations
   family. Mixed IPv4 and IPv6 endpoints are not tested.
 * Shard-direct erasure-coded reads deliver sparse reads inline.
 * Only cuObject clients can PUT with ``x-amz-rdma-token``, in
-  gateway-staged mode. A libfabric token on a GET that cannot use
-  passthrough gets the HTTP body.
+  gateway-staged mode. Libfabric clients have no gateway-staged mode,
+  so a libfabric GET that cannot use passthrough gets the HTTP body.
 * The gateway does not serve encrypted objects, or objects with a DLO
   or SLO manifest, to RC clients. PREPARE answers ``501`` with the
   unsupported marker, and the client reads the object over HTTP.

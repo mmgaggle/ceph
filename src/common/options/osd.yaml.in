@@ -1624,7 +1624,7 @@ options:
   level: dev
   default: true
   with_legacy: true
-# cuObject RDMA (READ_RDMA pushdown) options
+# out-of-band delivery options: cuObject (DC), libfabric, EC gather windows
 - name: osd_oob_gather
   type: bool
   level: dev
@@ -1738,9 +1738,9 @@ options:
 - name: osd_cuobj_enabled
   type: bool
   level: advanced
-  desc: Serve CEPH_OSD_OP_READ_RDMA by RDMA-writing object data directly into
-    client memory via NVIDIA cuObject (requires a build with WITH_OSD_CUOBJ and
-    an RDMA-capable NIC)
+  desc: Deliver reads that carry a cuObject delivery descriptor by RDMA-writing
+    the data directly into the requester's memory via NVIDIA cuObject (requires
+    a build with WITH_OSD_CUOBJ and an RDMA-capable NIC)
   default: false
   services:
   - osd

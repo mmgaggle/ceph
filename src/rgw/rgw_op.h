@@ -477,7 +477,7 @@ protected:
   enum class RdmaMode {
     NONE,        ///< HTTP body (x-amz-rdma-reply: 501 when a token was sent)
     STAGED,      ///< staged in RGW memory, one RDMA_WRITE from the local cuObjServer
-    PASSTHROUGH, ///< OSDs RDMA-write stripes directly (CEPH_OSD_OP_READ_RDMA)
+    PASSTHROUGH, ///< OSDs RDMA-write stripes directly (delivery descriptor)
     RELAY,       ///< OSDs RDMA-write stripes into a gateway window that a
                  ///< subclass forwards to the client (hipobj-rc-v2)
     RELAY_STAGED,///< stripes copied into that gateway window instead

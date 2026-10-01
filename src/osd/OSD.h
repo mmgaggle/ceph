@@ -122,7 +122,7 @@ public:
   md_config_cacher_t<bool> osd_skip_data_digest;
 
 #ifdef WITH_OSD_CUOBJ
-  /// cuObject RDMA endpoint backing CEPH_OSD_OP_READ_RDMA; null unless
+  /// cuObject out-of-band delivery endpoint; null unless
   /// osd_cuobj_enabled and the RDMA session came up
   OSDCuObj* cuobj = nullptr;
 #endif

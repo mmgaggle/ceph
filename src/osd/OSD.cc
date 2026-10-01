@@ -4156,7 +4156,7 @@ int OSD::init()
       service.cuobj = cuobj.release();
     } else {
       derr << "WARNING: cuObject RDMA init failed on " << cuobj_ip
-	   << " (READ_RDMA disabled on this osd)" << dendl;
+	   << " (cuObject delivery disabled on this osd)" << dendl;
     }
   }
 #endif

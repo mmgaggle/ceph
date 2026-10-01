@@ -282,7 +282,8 @@ bool ECBackend::_handle_message(
     reply->pgid = get_parent()->primary_spg_t();
     reply->map_epoch = switcher->get_osdmap_epoch();
     reply->min_epoch = get_parent()->get_interval_start_epoch();
-    handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace);
+    handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace,
+		    _op->get_req()->get_recv_stamp());
     reply->trace = _op->pg_trace;
     reply->pgid.reset_shard(op->op.from.shard);
     get_parent()->send_message_osd_cluster(
@@ -519,7 +520,8 @@ void ECBackend::handle_sub_read(
   pg_shard_t from,
   const ECSubRead &op,
   ECSubReadReply *reply,
-  const ZTracer::Trace &trace) {
+  const ZTracer::Trace &trace,
+  utime_t received) {
   trace.event("handle sub read");
   shard_id_t shard = get_parent()->whoami_shard().shard;
   for (auto &&[hoid, to_read]: op.to_read) {
@@ -737,11 +739,13 @@ void ECBackend::handle_sub_read(
   reply->tid = op.tid;
 
   if (!op.push_token.empty()) {
-    push_sub_read(op, reply);
+    push_sub_read(op, reply,
+		  received.is_zero() ? ceph_clock_now() : received);
   }
 }
 
-void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply)
+void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
+			      utime_t received)
 {
   // the primary lent us a window: place everything read there, back to
   // back in reply order, and return only the extents. Any refusal or
@@ -762,8 +766,22 @@ void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply)
   if (all.length() == 0) {
     return;
   }
+  // the same bounds as client delivery: start within the pool's lease
+  // of receipt, land (or be cut off) within lease plus drain. The
+  // primary keeps an unused window out of use for that long.
+  const auto& pool = get_parent()->get_pool();
+  const double age = ceph_clock_now() - received;
+  if (age > pool.get_rdma_delivery_lease()) {
+    dout(10) << __func__ << ": lease expired (" << age << "s), replying inline"
+	     << dendl;
+    return;
+  }
+  const double bound = pool.get_rdma_delivery_lease() +
+    pool.get_rdma_delivery_drain() - age;
   auto plan = ceph::osd::oob::linear_plan(0, all.length());
-  ssize_t r = exec->execute_plan("ec gather", op.push_token, all, plan);
+  ssize_t r = exec->execute_plan(
+    "ec gather", op.push_token, all, plan,
+    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)));
   if (r != static_cast<ssize_t>(all.length())) {
     dout(10) << __func__ << ": push to the primary failed (" << r
 	     << "), replying inline" << dendl;

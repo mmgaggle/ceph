@@ -1189,11 +1189,12 @@ class Object {
         /// out: true when iterate() sent at least one descriptor-bearing
         /// operation to the OSDs (fence-wait gating on fallback)
         bool rdma_submitted{false};
-        /// out: the longest rdma_delivery_lease (seconds) among the pools
-        /// those operations were sent to; an OSD may start a write up to
-        /// this long after receiving one, so a fallback that rewrites the
-        /// window waits at least this long first
-        double rdma_lease{0};
+        /// out: the longest rdma_delivery_lease plus rdma_delivery_drain
+        /// (seconds) among the pools those operations were sent to; an
+        /// OSD's writes land, or are cut off, within this long of its
+        /// receiving one, so a fallback that rewrites the window, or a
+        /// reuse of it, waits this long first
+        double rdma_fence{0};
       } params;
 
       virtual ~ReadOp() = default;

@@ -73,7 +73,8 @@ public:
   ssize_t execute_plan(const std::string& key,
 		       const std::string& token,
 		       const ceph::buffer::list& data,
-		       const ceph::osd::oob::placement_plan& plan) override;
+		       const ceph::osd::oob::placement_plan& plan,
+		       std::chrono::milliseconds budget) override;
 
   /// asok/debug counters
   void dump_stats(ceph::Formatter* f) const override;

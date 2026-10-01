@@ -4708,19 +4708,6 @@ options:
   default: true
   services:
   - rgw
-- name: rgw_rdma_fence_drain_ms
-  type: uint
-  level: advanced
-  desc: Transport drain bound added to the pool's rdma_delivery_lease before
-    the gateway reuses or rewrites a window that OSDs could still write
-  long_desc: When a passthrough GET that already reached the OSDs restarts in a
-    fallback mode, or a relay session ends uncleanly, the gateway waits the
-    lease plus this bound. A write that an OSD started within its lease, but
-    that is still queued or retrying in its transport, cannot land afterward.
-    Make it cover the transport's retry budget.
-  default: 3000
-  services:
-  - rgw
 - name: rgw_ofi_provider
   type: str
   level: advanced

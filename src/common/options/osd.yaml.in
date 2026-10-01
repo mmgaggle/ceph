@@ -1672,16 +1672,6 @@ options:
   - osd
   flags:
   - startup
-- name: osd_oob_op_timeout_ms
-  type: uint
-  level: advanced
-  desc: How long the out-of-band writes of one read may take before the OSD
-    gives up and delivers the read inline
-  default: 5000
-  services:
-  - osd
-  flags:
-  - startup
 - name: osd_oob_gather
   type: bool
   level: dev

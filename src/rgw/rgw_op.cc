@@ -3029,18 +3029,15 @@ void RGWGetObj::execute(optional_yield y)
       // track of (an OSD marked down mid-request, or the original
       // attempt of an op the Objecter resent) may still start until
       // the pool's delivery lease runs out from the OSD's receipt of
-      // the op, and then sit in a NIC retry queue for the transport
-      // drain bound. Every op has completed by now, so waiting lease
-      // plus drain from here covers both before the fallback rewrites
-      // the same client ranges.
-      const auto lease_ms = static_cast<uint64_t>(
-        std::ceil(read_op->params.rdma_lease * 1000.0));
-      const auto wait_ms = lease_ms +
-        s->cct->_conf.get_val<uint64_t>("rgw_rdma_fence_drain_ms");
+      // the op, and land until the pool's drain runs out after that,
+      // when the OSD cuts it off. Every op has completed by now, so
+      // waiting lease plus drain from here covers both before the
+      // fallback rewrites the same client ranges.
+      const auto wait_ms = static_cast<uint64_t>(
+        std::ceil(read_op->params.rdma_fence * 1000.0));
       if (wait_ms) {
         ldpp_dout(this, 4) << "rdma fence: waiting " << wait_ms
-                           << "ms (lease " << lease_ms
-                           << "ms + drain) before fallback" << dendl;
+                           << "ms (lease + drain) before fallback" << dendl;
         if (s->yield) {
           auto& yctx = s->yield.get_yield_context();
           boost::asio::steady_timer timer(yctx.get_executor());
@@ -3067,8 +3064,7 @@ void RGWGetObj::execute(optional_yield y)
   }
   if (read_op->params.rdma_submitted) {
     rdma_fence_ms = static_cast<uint64_t>(
-        std::ceil(read_op->params.rdma_lease * 1000.0)) +
-      s->cct->_conf.get_val<uint64_t>("rgw_rdma_fence_drain_ms");
+        std::ceil(read_op->params.rdma_fence * 1000.0));
   }
 
   if (op_ret >= 0)

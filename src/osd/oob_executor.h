@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <sys/types.h>
@@ -40,11 +41,18 @@ public:
    * nothing: returns the total bytes placed only if every triple
    * completed, else a negative errno, and the caller then delivers
    * inline. Blocks until the transfer completes.
+   *
+   * The budget bounds when the writes may still land: the caller
+   * derives it from the pool's delivery lease and drain, counted from
+   * receipt of the request. An executor that cannot finish within it
+   * cuts its writes off, or does not start them, so that nothing lands
+   * after the window's owner may reuse the window.
    */
   virtual ssize_t execute_plan(const std::string& key,
 			       const std::string& token,
 			       const ceph::buffer::list& data,
-			       const ceph::osd::oob::placement_plan& plan) = 0;
+			       const ceph::osd::oob::placement_plan& plan,
+			       std::chrono::milliseconds budget) = 0;
 
   /// asok/debug counters
   virtual void dump_stats(ceph::Formatter* f) const = 0;

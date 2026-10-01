@@ -9486,8 +9486,17 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
   if (!exec) {
     return false;
   }
-  ssize_t pushed = exec->execute_plan(m->get_hobj().oid.name, d.token,
-				      payload, plan);
+  // the writes must land, or be cut off, by receipt plus the pool's
+  // lease plus its drain: past that the window's owner may reuse it
+  const double bound = pool.info.get_rdma_delivery_lease() +
+    pool.info.get_rdma_delivery_drain() -
+    (ceph_clock_now() - m->get_recv_stamp());
+  if (bound <= 0) {
+    return false;
+  }
+  ssize_t pushed = exec->execute_plan(
+    m->get_hobj().oid.name, d.token, payload, plan,
+    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)));
   if (pushed < 0) {
     dout(10) << __func__ << " op " << idx << " plan execution failed ("
 	     << pushed << "), delivering inline" << dendl;

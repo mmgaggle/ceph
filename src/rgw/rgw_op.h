@@ -491,8 +491,8 @@ protected:
   std::string relay_token;
   size_t relay_window = 0;
   /// after execute(): how long an OSD may still write into the window
-  /// (the pool's delivery lease plus the transport drain bound) when
-  /// the final read sent delivery descriptors; 0 otherwise
+  /// (the pool's delivery lease plus its drain) when the final read
+  /// sent delivery descriptors; 0 otherwise
   uint64_t rdma_fence_ms = 0;
   /// true for the modes where the OSDs deliver out of band
   bool rdma_oob_mode() const {

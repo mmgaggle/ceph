@@ -78,15 +78,19 @@ class ECBackend : public ECCommon {
       const ZTracer::Trace &trace,
       ECListener &eclistener
     ) override;
+  /// received: when the sub-read arrived, which the pool's delivery
+  /// lease and drain bound a push from (now, for a local read)
   void handle_sub_read(
       pg_shard_t from,
       const ECSubRead &op,
       ECSubReadReply *reply,
-      const ZTracer::Trace &trace
+      const ZTracer::Trace &trace,
+      utime_t received = utime_t()
     );
   /// push a sub-read's data into the primary's gather window (the
   /// op's push_token), returning only extents in the reply
-  void push_sub_read(const ECSubRead &op, ECSubReadReply *reply);
+  void push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
+		     utime_t received);
 
   void handle_sub_read_n_reply(
     pg_shard_t from,

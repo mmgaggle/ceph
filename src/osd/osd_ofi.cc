@@ -37,8 +37,6 @@ int OSDOfi::init()
   cfg.node = conf.get_val<std::string>("osd_ofi_node");
   cfg.stage_size = conf.get_val<Option::size_t>("osd_oob_buffer_size");
   cfg.stage_count = conf.get_val<uint64_t>("osd_oob_buffer_count");
-  cfg.op_timeout = std::chrono::milliseconds(
-    conf.get_val<uint64_t>("osd_oob_op_timeout_ms"));
   const bool gather = conf.get_val<bool>("osd_oob_gather");
   // windows only fill while someone polls a manual-progress provider
   cfg.progress_thread = gather;
@@ -76,6 +74,13 @@ int OSDOfi::init()
 	  << cfg.stage_count << " x " << cfg.stage_size << " bytes, "
 	  << slots.size() << " gather windows of " << slot_size << " bytes"
 	  << dendl;
+  if (ep->provider() == "tcp" || ep->provider() == "sockets") {
+    // closing a socket does not discard what the kernel already queued
+    // on it, so a cut-off write can still land after the pool's drain
+    dout(0) << "WARNING: " << ep->provider() << " cannot cut off writes "
+	    << "that miss their deadline: the kernel still delivers what it "
+	    << "queued. Use it for tests only." << dendl;
+  }
   if (!ep->delivery_complete()) {
     dout(0) << "WARNING: " << ep->provider() << " does not promise "
 	    << "delivery-complete writes; a reply may race the bytes it "
@@ -101,7 +106,8 @@ bool OSDOfi::handles(const std::string& token) const
 ssize_t OSDOfi::execute_plan(const std::string& key,
 			     const std::string& token,
 			     const ceph::buffer::list& data,
-			     const ceph::osd::oob::placement_plan& plan)
+			     const ceph::osd::oob::placement_plan& plan,
+			     std::chrono::milliseconds budget)
 {
   auto t = ceph::ofi::parse_token(token);
   if (!ep || !t) {
@@ -120,11 +126,12 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
     writes.push_back({tr.local_ofs, tr.len, tr.client_ofs});
   }
   plans_started++;
-  const int r = ep->write(*t, iov.data(), iov.size(), writes);
+  const int r = ep->write(*t, iov.data(), iov.size(), writes, budget);
   if (r < 0) {
     plans_failed++;
     dout(5) << "plan for " << key << " failed: " << cpp_strerror(r)
-	    << (r == -EIO || r == -ETIMEDOUT ? " (" + ep->last_error() + ")" :
+	    << (r == -EIO || r == -ETIMEDOUT || r == -ECANCELED ?
+		" (" + ep->last_error() + ")" :
 		std::string{}) << dendl;
     return r;
   }
@@ -203,6 +210,7 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("peers_inserted", s.peers_inserted);
   f->dump_unsigned("staging_busy", s.staging_busy);
   f->dump_unsigned("timeouts", s.timeouts);
+  f->dump_unsigned("cutoffs", s.resets);
   f->dump_unsigned("windows_acquired", windows_acquired);
   f->dump_unsigned("windows_exhausted", windows_exhausted);
   f->dump_string("last_error", ep->last_error());

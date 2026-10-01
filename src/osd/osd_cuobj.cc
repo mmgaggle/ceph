@@ -23,6 +23,13 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "osd_cuobj "
 
+namespace {
+/// how long a posted cuObject write can keep retrying after the OSD
+/// stops waiting for it: the RC/DC retry budget at the library's
+/// defaults
+constexpr std::chrono::milliseconds CUOBJ_RETRY_BUDGET{2000};
+}
+
 thread_local uint16_t OSDCuObj::tls_channel_id = 0;
 thread_local bool OSDCuObj::tls_channel_valid = false;
 
@@ -326,7 +333,8 @@ ssize_t OSDCuObj::rdma_write(const std::string& key,
 ssize_t OSDCuObj::execute_plan(const std::string& key,
 			       const std::string& token,
 			       const ceph::buffer::list& data,
-			       const ceph::osd::oob::placement_plan& plan)
+			       const ceph::osd::oob::placement_plan& plan,
+			       std::chrono::milliseconds budget)
 {
   if (!is_available()) {
     return -EOPNOTSUPP;
@@ -390,8 +398,15 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   // to completion on the same channel (the library caps poll() at 16
   // events and documents no larger per-channel bound)
   constexpr int POLL_BATCH = 16;
+  // cuObject cannot cancel a write it posted: one still in flight when
+  // the OSD stops waiting keeps retrying for the DC transport's retry
+  // budget. Stop waiting that much before the caller's budget runs out,
+  // and do not start at all when the budget does not cover it.
+  if (budget <= CUOBJ_RETRY_BUDGET) {
+    return -ETIMEDOUT;
+  }
   utime_t deadline = ceph_clock_now();
-  deadline += m_cct->_conf.get_val<uint64_t>("osd_oob_op_timeout_ms") / 1000.0;
+  deadline += std::chrono::duration<double>(budget - CUOBJ_RETRY_BUDGET).count();
   size_t next = 0;
   size_t outstanding = 0;
   size_t completed = 0;

@@ -522,10 +522,6 @@ void ECCommon::ReadPipeline::start_read_op(
   do_read_op(op);
 }
 
-/// transport drain bound added to the delivery lease when a gather
-/// window may still receive a late push
-static constexpr uint64_t GATHER_DRAIN_MS = 3000;
-
 void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
   const int priority = rop.priority;
   const ceph_tid_t tid = rop.tid;
@@ -604,9 +600,12 @@ void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
     rop.for_recovery ? nullptr : get_parent()->oob_gather_executor();
   if (gather_exec) {
     rop.gather.exec = gather_exec;
+    // a shard holding the window's token may start a push within the
+    // pool's lease of receiving the sub-read, and its writes land or
+    // are cut off within the drain after that
     rop.gather.quarantine_ms = static_cast<uint64_t>(
-      get_parent()->get_pool().get_rdma_delivery_lease() * 1000.0) +
-      GATHER_DRAIN_MS;
+      (get_parent()->get_pool().get_rdma_delivery_lease() +
+       get_parent()->get_pool().get_rdma_delivery_drain()) * 1000.0);
   }
   for (auto &&[pg_shard, read]: messages) {
     rop.in_progress.insert(pg_shard);

@@ -380,12 +380,15 @@ For a GET, the gateway holds the session's buffer between the OSDs and
 the client. There are two ways for the object to reach that buffer:
 
 OSD-direct relay
-  The gateway exposes its session buffers as a cuObject DC target.
-  Each stripe read then carries a delivery descriptor for the session
-  buffer, and the OSDs RDMA-write their stripes into it, exactly as
-  in OSD passthrough mode. The gateway does not copy the object. This
-  needs an mlx5 NIC on the gateway, ``rgw_cuobj_osd_passthrough``, and
-  OSDs built with ``WITH_OSD_CUOBJ``.
+  The gateway exposes its session buffers to the OSDs. Each stripe
+  read then carries a delivery descriptor for the session buffer, and
+  the OSDs write their stripes into it, exactly as in OSD passthrough
+  mode. The gateway does not copy the object. The buffers are exposed
+  over libfabric when ``rgw_rdma_rc_ofi_provider`` is set, which works
+  on any NIC the provider supports. Otherwise they are exposed as a
+  cuObject DC target, which needs an mlx5 NIC on the gateway and OSDs
+  built with ``WITH_OSD_CUOBJ``. Both need
+  ``rgw_cuobj_osd_passthrough``.
 
 Staged relay
   The object is read from RADOS as usual and copied into the session
@@ -438,8 +441,14 @@ verbs library at build time.
   flight for one session.
 * ``rgw_rdma_rc_prepare_timeout_ms``, ``rgw_rdma_rc_exec_timeout_ms``:
   how long a session waits for READY, and how long a transfer can take.
-* ``rgw_rdma_rc_osd_direct``, ``rgw_rdma_rc_dc_key``: the DC target
-  for OSD-direct relay. The key must match ``osd_cuobj_dc_key``.
+* ``rgw_rdma_rc_osd_direct``: expose the session buffers for
+  OSD-direct relay.
+* ``rgw_rdma_rc_ofi_provider``, ``rgw_rdma_rc_ofi_domain``,
+  ``rgw_rdma_rc_ofi_node``: expose them over libfabric. The provider
+  must match the OSDs' ``osd_ofi_provider``, and the address must be
+  reachable from the OSDs. See `Delivery over libfabric`_.
+* ``rgw_rdma_rc_dc_key``: the key of the DC target, used when no
+  libfabric provider is set. The key must match ``osd_cuobj_dc_key``.
 * ``rgw_rdma_rc_crc64nvme``: report a CRC-64/NVME of the delivered
   bytes in the READY answer.
 
@@ -454,6 +463,119 @@ Limitations
 * A PUT must arrive as one write-with-immediate that carries the whole
   object.
 * The transfer runs on the request thread, as in staged mode.
+
+Delivery over libfabric
+=======================
+
+OSDs and the gateway can move object data over libfabric, the fabric
+interface that the UEC specification uses. One executor then serves
+every out-of-band transfer in which Ceph runs both ends, or in which
+the client uses libfabric:
+
+* An OSD writes a GET's stripes into a client's window.
+* A shard writes its sub-read into the window of a primary that
+  gathers an erasure-coded read.
+* An OSD writes a stripe into a gateway relay window for a hipObject
+  RC client.
+
+The libfabric provider selects the wire. The ``tcp`` and ``shm``
+providers need no special hardware. ``verbs;ofi_rxm`` runs RDMA
+reliable connections on any verbs device, including soft-RoCE. The
+``efa`` provider runs AWS SRD, and a UET provider runs Ultra Ethernet.
+
+The token
+---------
+
+The owner of a window sends this token::
+
+  <base hex>:<size hex>:ofi1:<provider>:<endpoint name hex>:<memory key hex>
+
+The fields are:
+
+* ``base``: the remote address of the first byte of the window, as the
+  owner's provider reads it. That is a virtual address when the
+  provider uses ``FI_MR_VIRT_ADDR``, and an offset into the region
+  otherwise. A writer writes byte ``i`` of the window at ``base + i``.
+* ``size``: the length of the window.
+* ``provider``: the provider's name as ``fi_info`` reports it, for
+  example ``tcp`` or ``verbs;ofi_rxm``. Both ends must use the same
+  provider.
+* ``endpoint name``: the bytes that ``fi_getname()`` returns for the
+  owner's endpoint. A writer passes them to ``fi_av_insert()``.
+* ``memory key``: the key of the region behind the window. Providers
+  with keys longer than 8 bytes are not supported.
+
+The owner never adds a writer to its address vector, so any OSD that
+holds the token can write into the window. cuObject's DC transport has
+the same property. An OSD serves a token only when the token names the
+OSD's own provider. Any other token is delivered inline.
+
+The token starts with the same ``addr:size`` fields as a cuObject
+token, so the gateway forwards it in passthrough mode without parsing
+the rest.
+
+The OSD asks the provider for delivery-complete writes. A completion
+then means that the bytes are in the owner's memory, and the OSD
+replies only after every write of the read completes. A provider that
+cannot promise this still works, but the OSD logs a warning at
+startup.
+
+Configuration
+-------------
+
+Build with ``-DWITH_OOB_OFI=ON``. The build needs the libfabric headers
+and library, at API version 1.18 or later. Then set these options:
+
+* ``osd_ofi_enabled``: serve libfabric tokens, and lend gather windows
+  over libfabric when ``osd_oob_gather`` is on.
+* ``osd_ofi_provider``: the provider. The default is ``tcp``.
+* ``osd_ofi_domain`` and ``osd_ofi_node``: the domain, such as an RDMA
+  device or a network interface, and the local address to bind. Both
+  can be empty, and then the provider chooses.
+* ``osd_ofi_buffer_size`` and ``osd_ofi_buffer_count``: the registered
+  staging buffers. The OSD copies each read into one before it writes.
+  A read larger than a buffer, or a read that finds no free buffer, is
+  delivered inline.
+* ``osd_ofi_op_timeout_ms``: how long the writes of one read can take.
+  After that, the read is delivered inline.
+* ``rgw_rdma_rc_ofi_provider``, ``rgw_rdma_rc_ofi_domain`` and
+  ``rgw_rdma_rc_ofi_node``: the gateway's relay windows. See
+  `Reliable Connection clients (hipObject)`_.
+
+Providers that progress manually place incoming data only while the
+application polls them. Each window owner in Ceph polls its endpoint
+from a thread. A client must also poll, or use a provider with
+automatic progress.
+
+On soft-RoCE, ``verbs;ofi_rxm`` fails to open with "Unable to create
+verbs CQ". The rxm provider sizes its completion queues by the universe
+size, and soft-RoCE allows 32767 entries per queue. Set
+``FI_UNIVERSE_SIZE=16`` in the environment of every process.
+
+Testing
+-------
+
+``unittest_ofi_rma`` checks the token format, and writes over the
+``tcp`` and ``shm`` providers. ``ceph_test_rgw_ofi_get`` is an S3 client
+for OSD-direct delivery::
+
+  ceph_test_rgw_ofi_get <provider> <domain|-> <node|-> <endpoint> \
+    <bucket> <key> <access key> <secret> <expected file>
+
+It registers a window, sends a signed GET with the token, and compares
+the window with a local copy of the object. ``ceph daemon osd.N ofi
+status`` shows the counters of each OSD.
+
+Limitations
+-----------
+
+* The OSD copies each read into a staging buffer. It does not register
+  the read's own buffers.
+* Every call into one endpoint is serialized. This matches the
+  ``FI_THREAD_DOMAIN`` threading level that the endpoint asks for.
+* The endpoint name in a token can be at most 192 bytes.
+* Every endpoint of one provider must use the same address family.
+  Mixed IPv4 and IPv6 endpoints are not tested.
 
 UET delivery (mock-up)
 ======================
@@ -540,10 +662,13 @@ the primary did not consume stays out of use for the pool's
 replied inline, and a read that was cancelled or restarted. A peer that
 received the window's token could still write into it until then.
 
-Both executors can lend windows:
+Each executor can lend windows. When several are up, the libfabric
+executor lends them:
 
+* libfabric lends them from a pool registered for remote writes on the
+  OSD's endpoint. Peers need the same provider to push into them.
 * UET lends them from a receive pool registered next to its staging
-  region. This is the configuration tested with the mock-up.
+  region.
 * cuObject lends them from a pool behind a DC target on the OSD's RDMA
   device, so peers' cuObject servers can push into it. This needs an
   mlx5 NIC, and in this branch it is compiled only, not tested.

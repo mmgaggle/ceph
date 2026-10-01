@@ -608,6 +608,14 @@ if(WITH_OSD_UET)
     NO_DEFAULT_PATH REQUIRED)
   find_library(FABRIC_LIBRARY fabric REQUIRED)
 endif()
+# out-of-band delivery over libfabric: one transport for the OSD
+# executor, EC gather windows and the gateway's relay window, on any
+# provider (tcp, shm, verbs, efa, a UET provider)
+option(WITH_OOB_OFI "out-of-band delivery over libfabric" OFF)
+if(WITH_OOB_OFI)
+  find_path(FABRIC_INCLUDE_DIR rdma/fabric.h REQUIRED)
+  find_library(FABRIC_LIBRARY fabric REQUIRED)
+endif()
 cmake_dependent_option(WITH_RADOSGW_RDMA_RC
   "hipobj-rc-v2 S3-over-RDMA (RC transport) server in RADOS Gateway"
   ON "WITH_RADOSGW;WITH_RDMA" OFF)

@@ -289,6 +289,15 @@ endif()
 target_link_libraries(crc32
   arch)
 
+if(WITH_OOB_OFI)
+  # libfabric RMA for out-of-band delivery; no Ceph dependencies, so
+  # test clients link it alone
+  add_library(ofi_rma STATIC ofi_rma.cc)
+  set_target_properties(ofi_rma PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_include_directories(ofi_rma PUBLIC ${FABRIC_INCLUDE_DIR})
+  target_link_libraries(ofi_rma PUBLIC ${FABRIC_LIBRARY} Threads::Threads)
+endif()
+
 add_library(common_utf8 STATIC utf8.c)
 
 if(HAVE_KEYUTILS)

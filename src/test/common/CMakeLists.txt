@@ -272,6 +272,14 @@ add_executable(unittest_rdma_token
 add_ceph_unittest(unittest_rdma_token)
 target_link_libraries(unittest_rdma_token ceph-common)
 
+if(WITH_OOB_OFI)
+  # unittest_ofi_rma: token encoding, and writes over the tcp and shm
+  # providers, which need no special hardware
+  add_executable(unittest_ofi_rma test_ofi_rma.cc)
+  add_ceph_unittest(unittest_ofi_rma)
+  target_link_libraries(unittest_ofi_rma ofi_rma)
+endif()
+
 # unittest_interval_map
 add_executable(unittest_interval_map
   test_interval_map.cc

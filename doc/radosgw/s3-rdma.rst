@@ -572,6 +572,11 @@ The gateway's relay windows need ``ofi`` in ``rgw_rdma_transports``,
 ``rgw_ofi_provider`` set to ``uet``, an interface in
 ``rgw_ofi_domain``, and ``CAP_NET_RAW``.
 
+The wrapper must discard an endpoint's writes when the endpoint closes,
+as ``fi_endpoint(3)`` requires. The OSD relies on that to cut off a late
+write. A wrapper that drains its writes on close instead lets a cut-off
+write land after the deadline.
+
 The reference provider has these limits:
 
 * It is software. A window owner places incoming data only while it

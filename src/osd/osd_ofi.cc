@@ -35,15 +35,15 @@ int OSDOfi::init()
   cfg.provider = conf.get_val<std::string>("osd_ofi_provider");
   cfg.domain = conf.get_val<std::string>("osd_ofi_domain");
   cfg.node = conf.get_val<std::string>("osd_ofi_node");
-  cfg.stage_size = conf.get_val<Option::size_t>("osd_ofi_buffer_size");
-  cfg.stage_count = conf.get_val<uint64_t>("osd_ofi_buffer_count");
+  cfg.stage_size = conf.get_val<Option::size_t>("osd_oob_buffer_size");
+  cfg.stage_count = conf.get_val<uint64_t>("osd_oob_buffer_count");
   cfg.op_timeout = std::chrono::milliseconds(
-    conf.get_val<uint64_t>("osd_ofi_op_timeout_ms"));
+    conf.get_val<uint64_t>("osd_oob_op_timeout_ms"));
   const bool gather = conf.get_val<bool>("osd_oob_gather");
   // windows only fill while someone polls a manual-progress provider
   cfg.progress_thread = gather;
   if (cfg.stage_size == 0 || cfg.stage_count == 0) {
-    derr << "osd_ofi_buffer_size and osd_ofi_buffer_count must be nonzero"
+    derr << "osd_oob_buffer_size and osd_oob_buffer_count must be nonzero"
 	 << dendl;
     return -EINVAL;
   }

@@ -123,14 +123,18 @@ public:
 
 #ifdef WITH_OSD_CUOBJ
   /// cuObject out-of-band delivery endpoint; null unless
-  /// osd_cuobj_enabled and the RDMA session came up
+  /// osd_oob_transports names "cuobj" and the RDMA session came up
   OSDCuObj* cuobj = nullptr;
 #endif
 #ifdef WITH_OOB_OFI
-  /// libfabric delivery endpoint; null unless osd_ofi_enabled and it came up
+  /// libfabric delivery endpoint; null unless osd_oob_transports names
+  /// "ofi" and it came up
   OSDOfi* ofi = nullptr;
 #endif
 #ifdef HAVE_OSD_OOB_DELIVERY
+  /// the executors that started, in osd_oob_transports order (owned
+  /// through cuobj and ofi above)
+  std::vector<OSDOobExecutor*> oob_executors;
   /// the executor that serves a delivery token's transport, or null
   OSDOobExecutor* oob_executor_for(const std::string& token) const;
   /// true when any out-of-band transport is up

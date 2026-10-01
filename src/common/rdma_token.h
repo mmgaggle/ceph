@@ -32,6 +32,17 @@ inline constexpr size_t RDMA_TOKEN_MAX_LEN = 512;
 /// malformed input.
 std::optional<token_window> parse_rdma_token(std::string_view token);
 
+/// out-of-band transport names, as osd_oob_transports and
+/// rgw_rdma_transports list them
+inline constexpr std::string_view TRANSPORT_OFI = "ofi";
+inline constexpr std::string_view TRANSPORT_CUOBJ = "cuobj";
+
+/// Split a transport list option ("ofi,cuobj") into its names, in
+/// order, lower-cased, without duplicates or empty entries. Names are
+/// not checked against the known transports: the caller reports one it
+/// cannot start.
+std::vector<std::string> parse_transport_list(std::string_view list);
+
 /**
  * Per-op out-of-band delivery descriptor carried on a MOSDOp.
  *

@@ -28,7 +28,7 @@ class OSDDcTarget;
  * Owns one cuObjServer (a DC initiator bound to the OSD's RDMA NIC)
  * and a pool of pre-registered host buffers that stripe data is staged
  * through on its way into client memory. Instantiated by OSD::init()
- * when osd_cuobj_enabled is set; PrimaryLogPG reaches it through
+ * when osd_oob_transports names "cuobj"; PrimaryLogPG reaches it through
  * OSDService::oob_executor_for() for cuObject tokens.
  *
  * Thread safety: rdma_write() may be called concurrently from any

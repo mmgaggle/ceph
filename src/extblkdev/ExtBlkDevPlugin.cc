@@ -22,9 +22,12 @@
 
 #include <errno.h>
 
+#include <algorithm>
+
 #include "ceph_ver.h"
 #include "ExtBlkDevPlugin.h"
 #include "common/errno.h"
+#include "common/rdma_token.h"
 #include "include/dlfcn_compat.h"
 #include "include/str_list.h"
 #include "include/ceph_assert.h"
@@ -181,7 +184,10 @@ namespace ceph {
       // the UEC reference provider ("uet") sends and receives on raw
       // sockets it opens in OSD::init, after this trim; keep the one
       // capability it needs
-      if (cct->_conf.get_val<bool>("osd_ofi_enabled") &&
+      const auto transports = ceph::rdma::parse_transport_list(
+	cct->_conf.get_val<std::string>("osd_oob_transports"));
+      if (std::find(transports.begin(), transports.end(),
+		    ceph::rdma::TRANSPORT_OFI) != transports.end() &&
 	  cct->_conf.get_val<std::string>("osd_ofi_provider") == "uet") {
 	cap_value_t raw[1] = {CAP_NET_RAW};
 	if (cap_set_flag(merge_caps, CAP_PERMITTED, 1, raw, CAP_SET) < 0) {

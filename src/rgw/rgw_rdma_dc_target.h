@@ -22,7 +22,7 @@
 /**
  * A cuObject Dynamically Connected target owned by the gateway.
  *
- * OSD-direct delivery (rgw_cuobj_osd_passthrough) has each OSD push
+ * OSD-direct delivery (rgw_rdma_osd_passthrough) has each OSD push
  * its stripe with the cuObject server library, which speaks DC: the
  * writer needs only a token naming a DC target, an rkey and an address
  * window, with no per-pair handshake. When the S3 client speaks RC

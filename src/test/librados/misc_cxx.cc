@@ -885,8 +885,8 @@ TEST_P(LibRadosMiscPP, CmpExtPP) {
 
 TEST_P(LibRadosMiscPP, RdmaDeliveryInlineFallbackPP) {
   // exercises the advisory rdma delivery descriptor against an OSD
-  // without RDMA support (not built with cuObject, osd_cuobj_enabled
-  // off, or an OSD that predates the MOSDOp field): the read must
+  // without an executor for the token (no transport in
+  // osd_oob_transports, or an OSD that predates the MOSDOp field): the read must
   // succeed with the data returned INLINE and zero bytes reported as
   // delivered out of band - the transparent degradation the RGW
   // passthrough fallback keys on

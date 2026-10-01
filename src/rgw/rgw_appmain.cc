@@ -79,6 +79,8 @@
 #include "rgw_sal_dbstore.h"
 #endif
 #ifdef WITH_RADOSGW_CUOBJ
+#include <algorithm>
+#include "common/rdma_token.h"
 #include "rgw_cuobj.h"
 #endif
 #ifdef WITH_RADOSGW_RDMA_RC
@@ -522,7 +524,9 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
   ratelimiter->start();
 
 #ifdef WITH_RADOSGW_CUOBJ
-  if (g_conf().get_val<bool>("rgw_cuobj_enabled")) {
+  if (const auto t = ceph::rdma::parse_transport_list(
+        g_conf().get_val<std::string>("rgw_rdma_transports"));
+      std::find(t.begin(), t.end(), ceph::rdma::TRANSPORT_CUOBJ) != t.end()) {
     int cuobj_r = RGWCuObjServer::init(dpp->get_cct());
     if (cuobj_r < 0) {
       derr << "WARNING: cuObj RDMA server init failed: " << cuobj_r

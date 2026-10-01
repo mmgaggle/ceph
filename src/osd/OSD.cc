@@ -77,6 +77,7 @@
 #include "osd_ofi.h"
 #endif
 #ifdef HAVE_OSD_OOB_DELIVERY
+#include "common/rdma_token.h"
 #include "oob_executor.h"
 #endif
 
@@ -539,6 +540,9 @@ void OSDService::shutdown()
     f->stop();
   }
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+  oob_executors.clear();
+#endif
 #ifdef WITH_OSD_CUOBJ
   // op threads are stopped by now, so no RDMA writes are in flight
   delete cuobj;
@@ -556,16 +560,11 @@ void OSDService::shutdown()
 #ifdef HAVE_OSD_OOB_DELIVERY
 OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
 {
-#ifdef WITH_OOB_OFI
-  if (ofi && ofi->handles(token)) {
-    return ofi;
+  for (auto* e : oob_executors) {
+    if (e->handles(token)) {
+      return e;
+    }
   }
-#endif
-#ifdef WITH_OSD_CUOBJ
-  if (cuobj && cuobj->handles(token)) {
-    return cuobj;
-  }
-#endif
   return nullptr;
 }
 
@@ -574,31 +573,14 @@ OSDOobExecutor* OSDService::oob_gather_executor() const
   if (!cct->_conf.get_val<bool>("osd_oob_gather")) {
     return nullptr;
   }
-  // the first transport that is up lends the windows; peers need the
-  // same transport to push into them, and reply inline otherwise
-#ifdef WITH_OOB_OFI
-  if (ofi) {
-    return ofi;
-  }
-#endif
-#ifdef WITH_OSD_CUOBJ
-  if (cuobj) {
-    return cuobj;
-  }
-#endif
-  return nullptr;
+  // the preferred transport that started lends the windows; peers need
+  // the same transport to push into them, and reply inline otherwise
+  return oob_executors.empty() ? nullptr : oob_executors.front();
 }
 
 bool OSDService::has_oob_executor() const
 {
-  bool any = false;
-#ifdef WITH_OOB_OFI
-  any = any || ofi;
-#endif
-#ifdef WITH_OSD_CUOBJ
-  any = any || cuobj;
-#endif
-  return any;
+  return !oob_executors.empty();
 }
 #endif
 
@@ -609,6 +591,9 @@ void OSDService::fast_shutdown()
     std::lock_guard l(watch_lock);
     watch_timer.shutdown();
   }
+#ifdef HAVE_OSD_OOB_DELIVERY
+  oob_executors.clear();
+#endif
 #ifdef WITH_OSD_CUOBJ
   // op threads are stopped by now, so no RDMA writes are in flight
   delete cuobj;
@@ -4141,35 +4126,50 @@ int OSD::init()
 
   check_config();
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // start the out-of-band executors the OSD is asked for, in order of
+  // preference
+  for (const auto& t : ceph::rdma::parse_transport_list(
+	 cct->_conf.get_val<std::string>("osd_oob_transports"))) {
+    if (t == ceph::rdma::TRANSPORT_CUOBJ) {
 #ifdef WITH_OSD_CUOBJ
-  if (cct->_conf.get_val<bool>("osd_cuobj_enabled")) {
-    std::string cuobj_ip = cct->_conf.get_val<std::string>("osd_cuobj_rdma_ip");
-    if (cuobj_ip.empty()) {
-      // default to the public-network address; deployments whose RDMA
-      // NIC is a different interface must set osd_cuobj_rdma_ip
-      cuobj_ip = client_messenger->get_myaddrs().front().ip_only_to_str();
-    }
-    auto cuobj_port = static_cast<uint16_t>(
-      cct->_conf.get_val<uint64_t>("osd_cuobj_rdma_port"));
-    auto cuobj = std::make_unique<OSDCuObj>(cct, cuobj_ip, cuobj_port);
-    if (cuobj->is_available()) {
-      service.cuobj = cuobj.release();
-    } else {
-      derr << "WARNING: cuObject RDMA init failed on " << cuobj_ip
-	   << " (cuObject delivery disabled on this osd)" << dendl;
-    }
-  }
+      std::string cuobj_ip = cct->_conf.get_val<std::string>("osd_cuobj_rdma_ip");
+      if (cuobj_ip.empty()) {
+	// default to the public-network address; deployments whose RDMA
+	// NIC is a different interface must set osd_cuobj_rdma_ip
+	cuobj_ip = client_messenger->get_myaddrs().front().ip_only_to_str();
+      }
+      auto cuobj_port = static_cast<uint16_t>(
+	cct->_conf.get_val<uint64_t>("osd_cuobj_rdma_port"));
+      auto cuobj = std::make_unique<OSDCuObj>(cct, cuobj_ip, cuobj_port);
+      if (cuobj->is_available()) {
+	service.cuobj = cuobj.release();
+	service.oob_executors.push_back(service.cuobj);
+      } else {
+	derr << "WARNING: cuObject RDMA init failed on " << cuobj_ip
+	     << " (cuObject delivery disabled on this osd)" << dendl;
+      }
+      continue;
 #endif
-
+    } else if (t == ceph::rdma::TRANSPORT_OFI) {
 #ifdef WITH_OOB_OFI
-  if (cct->_conf.get_val<bool>("osd_ofi_enabled")) {
-    auto ofi = std::make_unique<OSDOfi>(cct);
-    if (int r = ofi->init(); r == 0) {
-      service.ofi = ofi.release();
+      auto ofi = std::make_unique<OSDOfi>(cct);
+      if (int r = ofi->init(); r == 0) {
+	service.ofi = ofi.release();
+	service.oob_executors.push_back(service.ofi);
+      } else {
+	derr << "WARNING: libfabric delivery init failed: " << cpp_strerror(r)
+	     << " (libfabric delivery disabled on this osd)" << dendl;
+      }
+      continue;
+#endif
     } else {
-      derr << "WARNING: libfabric delivery init failed: " << cpp_strerror(r)
-	   << " (libfabric delivery disabled on this osd)" << dendl;
+      derr << "WARNING: osd_oob_transports names unknown transport '" << t
+	   << "'" << dendl;
+      continue;
     }
+    derr << "WARNING: osd_oob_transports names '" << t << "', which this "
+	 << "osd was built without" << dendl;
   }
 #endif
 

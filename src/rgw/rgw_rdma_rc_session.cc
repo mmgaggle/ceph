@@ -24,6 +24,7 @@
 #include "common/config.h"
 #include "common/dout.h"
 #include "common/errno.h"
+#include "common/rdma_token.h"
 
 #ifdef HAVE_MLX5DV
 #include "rgw_rdma_dc_target.h"
@@ -141,44 +142,53 @@ int Service::do_init(CephContext* c)
     return -EINVAL;
   }
 
-  [[maybe_unused]] bool ofi_relay = false;
+  // expose the session buffers to the OSDs over the first transport in
+  // rgw_rdma_transports that can; with none, stripes are staged through
+  // the gateway
+  if (conf.get_val<bool>("rgw_rdma_osd_passthrough")) {
+    for (const auto& t : ceph::rdma::parse_transport_list(
+           conf.get_val<std::string>("rgw_rdma_transports"))) {
+      if (osd_direct()) {
+        break;
+      }
 #ifdef WITH_OOB_OFI
-  // a libfabric provider, when named, carries the OSD hop on any NIC;
-  // the DC target below needs mlx5
-  if (const auto prov = conf.get_val<std::string>("rgw_rdma_rc_ofi_provider");
-      conf.get_val<bool>("rgw_rdma_rc_osd_direct") && !prov.empty()) {
-    ceph::ofi::config_t oc;
-    oc.provider = prov;
-    oc.domain = conf.get_val<std::string>("rgw_rdma_rc_ofi_domain");
-    oc.node = conf.get_val<std::string>("rgw_rdma_rc_ofi_node");
-    // OSD writes land only while a manual-progress provider is polled
-    oc.progress_thread = true;
-    std::string err;
-    ofi_ep = ceph::ofi::Endpoint::open(oc, &err);
-    if (ofi_ep) {
-      ofi_relay = true;
-      ldout(cct, 1) << "rgw_rdma_rc: OSD-direct relay windows over libfabric: "
-                    << ofi_ep->describe() << dendl;
-    } else {
-      ldout(cct, 1) << "rgw_rdma_rc: libfabric relay windows unavailable ("
-                    << err << ")" << dendl;
-    }
-  }
+      if (t == ceph::rdma::TRANSPORT_OFI) {
+        ceph::ofi::config_t oc;
+        oc.provider = conf.get_val<std::string>("rgw_ofi_provider");
+        oc.domain = conf.get_val<std::string>("rgw_ofi_domain");
+        oc.node = conf.get_val<std::string>("rgw_ofi_node");
+        // OSD writes land only while a manual-progress provider is polled
+        oc.progress_thread = true;
+        std::string err;
+        ofi_ep = ceph::ofi::Endpoint::open(oc, &err);
+        if (ofi_ep) {
+          ldout(cct, 1) << "rgw_rdma_rc: OSD-direct relay windows over "
+                        << "libfabric: " << ofi_ep->describe() << dendl;
+        } else {
+          ldout(cct, 1) << "rgw_rdma_rc: libfabric relay windows unavailable ("
+                        << err << ")" << dendl;
+        }
+      }
 #endif
 #ifdef HAVE_MLX5DV
-  if (!ofi_relay && conf.get_val<bool>("rgw_rdma_rc_osd_direct")) {
-    auto target = std::make_unique<dc::Target>();
-    const auto dc_key = conf.get_val<uint64_t>("rgw_rdma_rc_dc_key");
-    int r = target->open(cct, dev, dc_key);
-    if (r == 0) {
-      dct = std::move(target);
-    } else {
-      ldout(cct, 1) << "rgw_rdma_rc: DC target unavailable (" << cpp_strerror(-r)
-                    << "); OSD-direct delivery disabled, objects will be "
-                    << "staged through the gateway" << dendl;
+      if (t == ceph::rdma::TRANSPORT_CUOBJ) {
+        auto target = std::make_unique<dc::Target>();
+        const auto dc_key = conf.get_val<uint64_t>("rgw_cuobj_dc_key");
+        if (int r = target->open(cct, dev, dc_key); r == 0) {
+          dct = std::move(target);
+        } else {
+          ldout(cct, 1) << "rgw_rdma_rc: DC target unavailable ("
+                        << cpp_strerror(-r) << ")" << dendl;
+        }
+      }
+#endif
+    }
+    if (!osd_direct()) {
+      ldout(cct, 1) << "rgw_rdma_rc: no transport in rgw_rdma_transports "
+                    << "exposes relay windows; objects will be staged through "
+                    << "the gateway" << dendl;
     }
   }
-#endif
 
   pool.resize(buf_count);
   for (size_t i = 0; i < buf_count; i++) {

@@ -66,6 +66,7 @@ int RGWCuObjServer::do_init(CephContext* cct)
 
   cuObjRDMATunable params;
   params.setNumDcis(num_dcis);
+  params.setDcKey(cct->_conf.get_val<uint64_t>("rgw_cuobj_dc_key"));
 
   ldout(cct, 1) << "rgw_cuobj: initializing cuObjServer on "
                 << rdma_ip << ":" << rdma_port

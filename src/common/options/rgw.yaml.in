@@ -4652,11 +4652,114 @@ options:
   - startup
   with_legacy: true
 # cuObject RDMA server options
-- name: rgw_cuobj_enabled
+- name: rgw_rdma_transports
+  type: str
+  level: advanced
+  desc: Out-of-band transports the gateway starts for S3 over RDMA, in order
+    of preference
+  long_desc: A comma-separated list. "cuobj" starts the gateway's NVIDIA
+    cuObject server, which serves gateway-staged mode for cuObject clients
+    (rgw_cuobj_* options), and lets the hipobj-rc-v2 server expose its relay
+    windows as a cuObject DC target, which needs an mlx5 device. "ofi" opens a
+    libfabric endpoint (rgw_ofi_* options) that exposes the relay windows. The
+    first transport in the list that can expose the relay windows does so.
+    Empty starts neither. OSD passthrough (rgw_rdma_osd_passthrough) needs no
+    gateway transport, and RC clients (rgw_rdma_rc_enabled) need only a verbs
+    device.
+  default:
+  services:
+  - rgw
+  flags:
+  - startup
+  see_also:
+  - rgw_rdma_osd_passthrough
+  - rgw_rdma_rc_enabled
+- name: rgw_rdma_osd_passthrough
   type: bool
   level: advanced
-  desc: Enable cuObject S3 RDMA server support for PUT/GET operations
+  desc: Have the OSDs write GET data straight into the requester's memory
+  long_desc: The gateway forwards the client's x-amz-rdma-token to the OSDs in
+    each stripe read's delivery descriptor, so object data is written
+    directly from the OSDs into client memory and bypasses the gateway. The
+    same applies to the relay windows of hipobj-rc-v2 sessions, when a
+    transport in rgw_rdma_transports exposes them. The OSDs need an executor
+    for the token's transport (osd_oob_transports). A stripe that an OSD
+    returns inline restarts the GET in gateway-staged mode or over plain
+    HTTP. Only plain objects qualify; compressed or encrypted objects always
+    take the fallback.
   default: false
+  services:
+  - rgw
+  see_also:
+  - rgw_rdma_transports
+  - osd_oob_transports
+- name: rgw_rdma_crc64nvme
+  type: bool
+  level: advanced
+  desc: Compute CRC-64/NVME checksums of out-of-band transfers
+  long_desc: For OSD passthrough, the gateway asks the OSDs to checksum each
+    stripe as they deliver it, combines the values, and compares whole-object
+    GETs with the object's stored full-object crc64nvme checksum before it
+    responds. This covers the storage node and the data's path inside the
+    cluster; the write into client memory relies on the transport's own
+    integrity checks. For hipobj-rc-v2 sessions, the gateway reports the
+    checksum of the delivered bytes in the READY answer
+    (X-Amz-Rdma-Checksum), which lets the client test its own buffer.
+  default: true
+  services:
+  - rgw
+- name: rgw_rdma_fence_drain_ms
+  type: uint
+  level: advanced
+  desc: Transport drain bound added to the pool's rdma_delivery_lease before
+    the gateway reuses or rewrites a window that OSDs could still write
+  long_desc: When a passthrough GET that already reached the OSDs restarts in a
+    fallback mode, or a relay session ends uncleanly, the gateway waits the
+    lease plus this bound. A write that an OSD started within its lease, but
+    that is still queued or retrying in its transport, cannot land afterward.
+    Make it cover the transport's retry budget.
+  default: 3000
+  services:
+  - rgw
+- name: rgw_ofi_provider
+  type: str
+  level: advanced
+  desc: libfabric provider of the gateway's libfabric endpoint
+    (rgw_rdma_transports "ofi"), as fi_info names it; it must match the OSDs'
+    osd_ofi_provider
+  default: tcp
+  services:
+  - rgw
+  flags:
+  - startup
+  see_also:
+  - osd_ofi_provider
+- name: rgw_ofi_domain
+  type: str
+  level: advanced
+  desc: libfabric domain of the gateway's endpoint, such as an RDMA device or a
+    network interface; empty lets the provider choose
+  default:
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_ofi_node
+  type: str
+  level: advanced
+  desc: Local address the gateway's libfabric endpoint binds to; it must be
+    reachable from the OSDs. Empty lets the provider choose.
+  default:
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_cuobj_dc_key
+  type: uint
+  level: advanced
+  desc: DC access key of the gateway's cuObject server and of its relay DC
+    target; it must match the clients' and the OSDs' osd_cuobj_dc_key
+  default: 4293844428
   services:
   - rgw
   flags:
@@ -4700,45 +4803,6 @@ options:
   default: 128
   services:
   - rgw
-- name: rgw_cuobj_crc64nvme
-  type: bool
-  level: advanced
-  desc: Ask OSDs to CRC64-NVME each passthrough stripe as they deliver it;
-    the gateway combines the per-stripe values and compares whole-object GETs
-    with the object's stored full-object crc64nvme checksum before
-    responding. This covers the storage node and the data's path inside the
-    cluster; the write into client memory relies on the transport's own
-    integrity checks
-  default: true
-  services:
-  - rgw
-- name: rgw_cuobj_fence_drain_ms
-  type: uint
-  level: advanced
-  desc: Transport drain bound added to the pool's rdma_delivery_lease when a
-    passthrough GET that already reached the OSDs restarts in a fallback mode.
-    The gateway waits lease plus this before the fallback rewrites the same
-    client ranges, so an RDMA write an OSD started within its lease but that
-    is still queued or retrying in its NIC cannot land afterward; size it to
-    cover the RDMA transport's retry budget
-  default: 3000
-  services:
-  - rgw
-- name: rgw_cuobj_osd_passthrough
-  type: bool
-  level: advanced
-  desc: Serve S3-over-RDMA GETs by forwarding the client RDMA token to the OSDs
-    in each stripe read's delivery descriptor, so object data is written
-    directly from the OSDs into client memory, bypassing the radosgw data path
-    entirely; requires OSDs with an executor for the token's transport
-    (osd_cuobj_enabled for cuObject tokens, osd_ofi_enabled for libfabric
-    tokens), and falls back to the staged RDMA path (or plain HTTP) when a
-    stripe cannot be pushed. Only plain objects qualify - compressed or
-    encrypted objects always use the fallback.
-  default: false
-  services:
-  - rgw
-# hipobj-rc-v2 (S3 over RDMA, RC transport) server options
 - name: rgw_rdma_rc_enabled
   type: bool
   level: advanced
@@ -4851,73 +4915,6 @@ options:
   level: advanced
   desc: Milliseconds a READY transfer may take, including the object read
   default: 30000
-  services:
-  - rgw
-  flags:
-  - startup
-- name: rgw_rdma_rc_crc64nvme
-  type: bool
-  level: advanced
-  desc: Report the CRC-64/NVME of the bytes an RC transfer delivered in the
-    FINAL reply (X-Amz-Rdma-Checksum), so the client can verify its landed
-    buffer. GETs the OSDs placed directly reuse the OSDs' own checksums;
-    otherwise the gateway checksums its buffer
-  default: true
-  services:
-  - rgw
-- name: rgw_rdma_rc_osd_direct
-  type: bool
-  level: advanced
-  desc: Expose the session buffers to the OSDs so they can push stripes
-    straight into them (rgw_cuobj_osd_passthrough must be on), over libfabric
-    when rgw_rdma_rc_ofi_provider is set and otherwise as a cuObject DC target,
-    which needs an mlx5 device; off, or when unavailable, stripes are copied
-    into the buffer through the gateway data path
-  default: true
-  services:
-  - rgw
-  flags:
-  - startup
-- name: rgw_rdma_rc_ofi_provider
-  type: str
-  level: advanced
-  desc: libfabric provider the OSDs write relay windows through (for example
-    tcp, or "verbs;ofi_rxm"); it must match the OSDs' osd_ofi_provider. Empty
-    uses the cuObject DC target instead. Needs a build with WITH_OOB_OFI.
-  default:
-  services:
-  - rgw
-  flags:
-  - startup
-  see_also:
-  - rgw_rdma_rc_osd_direct
-  - osd_ofi_provider
-- name: rgw_rdma_rc_ofi_domain
-  type: str
-  level: advanced
-  desc: libfabric domain for the relay windows, such as an RDMA device or a
-    network interface; empty lets the provider choose
-  default:
-  services:
-  - rgw
-  flags:
-  - startup
-- name: rgw_rdma_rc_ofi_node
-  type: str
-  level: advanced
-  desc: Local address the gateway's libfabric endpoint binds to; it must be
-    reachable from the OSDs. Empty lets the provider choose.
-  default:
-  services:
-  - rgw
-  flags:
-  - startup
-- name: rgw_rdma_rc_dc_key
-  type: uint
-  level: advanced
-  desc: DC access key of the gateway's DC target; must match the OSDs'
-    osd_cuobj_dc_key
-  default: 4293844428
   services:
   - rgw
   flags:

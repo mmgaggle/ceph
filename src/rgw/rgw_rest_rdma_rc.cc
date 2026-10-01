@@ -554,7 +554,7 @@ void GetOp::execute_ready(optional_yield y)
     if (rdma_crc64 && rdma_mode == RdmaMode::RELAY) {
       // the OSDs' own checksums of the bytes they placed
       final_crc = *rdma_crc64;
-    } else if (s->cct->_conf.get_val<bool>("rgw_rdma_rc_crc64nvme")) {
+    } else if (s->cct->_conf.get_val<bool>("rgw_rdma_crc64nvme")) {
       final_crc = ceph::crc64nvme(0, sess->buf->ptr, total_len);
     }
     if (auto it = attrs.find(RGW_ATTR_ETAG); it != attrs.end()) {
@@ -726,7 +726,7 @@ void PutOp::execute(optional_yield y)
   if (outcome == Outcome::OK) {
     bytes_done = sess->size;
     s->content_length = sess->size;
-    if (s->cct->_conf.get_val<bool>("rgw_rdma_rc_crc64nvme")) {
+    if (s->cct->_conf.get_val<bool>("rgw_rdma_crc64nvme")) {
       final_crc = ceph::crc64nvme(0, sess->buf->ptr, sess->size);
     }
     RGWPutObj_ObjStore_S3::execute(y);

@@ -5,6 +5,7 @@
 #include "common/crc64nvme.h"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 
 namespace ceph::rdma {
@@ -67,6 +68,30 @@ std::optional<uint64_t> fold_crc64_ranges(std::vector<crc_range_t> ranges)
     next += r.len;
   }
   return crc;
+}
+
+std::vector<std::string> parse_transport_list(std::string_view list)
+{
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos <= list.size()) {
+    const size_t end = list.find_first_of(", \t", pos);
+    auto name = list.substr(pos, end == std::string_view::npos ?
+			    std::string_view::npos : end - pos);
+    if (!name.empty()) {
+      std::string n{name};
+      std::transform(n.begin(), n.end(), n.begin(),
+		     [](unsigned char c) { return std::tolower(c); });
+      if (std::find(out.begin(), out.end(), n) == out.end()) {
+	out.push_back(std::move(n));
+      }
+    }
+    if (end == std::string_view::npos) {
+      break;
+    }
+    pos = end + 1;
+  }
+  return out;
 }
 
 } // namespace ceph::rdma

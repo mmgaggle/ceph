@@ -1625,6 +1625,63 @@ options:
   default: true
   with_legacy: true
 # out-of-band delivery options: cuObject (DC), libfabric, EC gather windows
+- name: osd_oob_transports
+  type: str
+  level: advanced
+  desc: Out-of-band delivery transports this OSD starts, in order of preference
+  long_desc: A comma-separated list. "ofi" starts the libfabric executor, and
+    osd_ofi_provider chooses its wire. "cuobj" starts the NVIDIA cuObject
+    executor. Each executor serves the delivery descriptors of its own
+    transport, and a descriptor that no executor serves is delivered inline.
+    When osd_oob_gather is on, the first transport that started lends the
+    gather windows. The OSD skips, with a warning, a transport that it was
+    built without or that fails to start. Empty turns out-of-band delivery
+    off.
+  default:
+  services:
+  - osd
+  flags:
+  - startup
+  see_also:
+  - osd_ofi_provider
+  - osd_oob_gather
+- name: osd_oob_buffer_size
+  type: size
+  level: advanced
+  desc: Size of each registered staging buffer that an executor copies a read
+    into before it writes the read out of band
+  long_desc: A buffer must hold the largest read that is delivered out of
+    band, such as a gateway stripe (rgw_get_obj_max_req_size) or a shard read
+    pushed into a gather window (osd_oob_window_size). The libfabric executor
+    delivers a larger read inline. The cuObject executor registers a
+    one-time buffer for it, which is slower.
+  default: 16_M
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_oob_buffer_count
+  type: uint
+  level: advanced
+  desc: Number of staging buffers per executor, and so of reads that one
+    executor places at once
+  long_desc: The libfabric executor delivers a read that finds no free buffer
+    inline. The cuObject executor registers a one-time buffer for it.
+  default: 16
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_oob_op_timeout_ms
+  type: uint
+  level: advanced
+  desc: How long the out-of-band writes of one read may take before the OSD
+    gives up and delivers the read inline
+  default: 5000
+  services:
+  - osd
+  flags:
+  - startup
 - name: osd_oob_gather
   type: bool
   level: dev
@@ -1656,25 +1713,11 @@ options:
   - osd
   flags:
   - startup
-- name: osd_ofi_enabled
-  type: bool
-  level: advanced
-  desc: Deliver reads that carry a libfabric delivery descriptor by
-    RMA-writing the data straight into the requester's memory, and lend gather
-    windows over libfabric when osd_oob_gather is set (needs a build with
-    WITH_OOB_OFI)
-  default: false
-  services:
-  - osd
-  flags:
-  - startup
-  see_also:
-  - osd_ofi_provider
-  - osd_oob_gather
 - name: osd_ofi_provider
   type: str
   level: advanced
-  desc: libfabric provider for out-of-band delivery, as fi_info names it
+  desc: libfabric provider of the libfabric executor (osd_oob_transports
+    "ofi"), as fi_info names it
   long_desc: The provider picks the wire. tcp and shm need no special
     hardware, "verbs;ofi_rxm" runs RDMA reliable connections, efa runs AWS SRD,
     and a UET provider runs Ultra Ethernet. A delivery descriptor names its
@@ -1705,47 +1748,6 @@ options:
   - osd
   flags:
   - startup
-- name: osd_ofi_buffer_size
-  type: size
-  level: advanced
-  desc: Size of each registered staging buffer for libfabric writes; a read
-    larger than this is delivered inline
-  default: 16_M
-  services:
-  - osd
-  flags:
-  - startup
-- name: osd_ofi_buffer_count
-  type: uint
-  level: advanced
-  desc: Number of staging buffers, and so of reads the OSD places at once
-    over libfabric; a read that finds none free is delivered inline
-  default: 8
-  services:
-  - osd
-  flags:
-  - startup
-- name: osd_ofi_op_timeout_ms
-  type: uint
-  level: advanced
-  desc: How long one read's libfabric writes may take before the OSD gives up
-    and delivers the read inline
-  default: 5000
-  services:
-  - osd
-  flags:
-  - startup
-- name: osd_cuobj_enabled
-  type: bool
-  level: advanced
-  desc: Deliver reads that carry a cuObject delivery descriptor by RDMA-writing
-    the data directly into the requester's memory via NVIDIA cuObject (requires
-    a build with WITH_OSD_CUOBJ and an RDMA-capable NIC)
-  default: false
-  services:
-  - osd
-  flags:
-  - startup
 - name: osd_cuobj_rdma_ip
   type: str
   level: advanced
@@ -1763,26 +1765,6 @@ options:
     clients never need to reach this port, it only names the local rdma_cm
     binding)
   default: 0
-  services:
-  - osd
-  flags:
-  - startup
-- name: osd_cuobj_buffer_size
-  type: size
-  level: advanced
-  desc: Size of each pre-registered RDMA staging buffer; must cover the largest
-    RGW stripe read (rgw_get_obj_max_req_size)
-  default: 8_M
-  services:
-  - osd
-  flags:
-  - startup
-- name: osd_cuobj_buffer_count
-  type: uint
-  level: advanced
-  desc: Number of pre-registered RDMA staging buffers; overflow requests fall
-    back to slower one-shot registrations
-  default: 32
   services:
   - osd
   flags:

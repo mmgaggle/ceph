@@ -53,3 +53,17 @@ TEST(RdmaToken, MaxValues)
   EXPECT_EQ(~0ull, w->addr);
   EXPECT_EQ(0xffffffffull, w->size);
 }
+
+TEST(RdmaToken, TransportList)
+{
+  using ceph::rdma::parse_transport_list;
+  using V = std::vector<std::string>;
+  EXPECT_EQ(parse_transport_list(""), V{});
+  EXPECT_EQ(parse_transport_list("ofi"), V{"ofi"});
+  // order is preference; separators are commas, spaces and tabs
+  EXPECT_EQ(parse_transport_list("cuobj,ofi"), (V{"cuobj", "ofi"}));
+  EXPECT_EQ(parse_transport_list(" OFI ,\tcuobj , "), (V{"ofi", "cuobj"}));
+  // duplicates and empty entries drop; unknown names stay for the
+  // caller to report
+  EXPECT_EQ(parse_transport_list("ofi,,ofi,foo"), (V{"ofi", "foo"}));
+}

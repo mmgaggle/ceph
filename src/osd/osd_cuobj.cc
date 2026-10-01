@@ -49,9 +49,9 @@ int OSDCuObj::do_init(const std::string& rdma_ip, uint16_t rdma_port)
     m_cct->_conf.get_val<uint64_t>("osd_cuobj_num_dcis"));
   auto dc_key = m_cct->_conf.get_val<uint64_t>("osd_cuobj_dc_key");
   auto buf_size = static_cast<size_t>(
-    m_cct->_conf.get_val<Option::size_t>("osd_cuobj_buffer_size"));
+    m_cct->_conf.get_val<Option::size_t>("osd_oob_buffer_size"));
   auto buf_count = static_cast<size_t>(
-    m_cct->_conf.get_val<uint64_t>("osd_cuobj_buffer_count"));
+    m_cct->_conf.get_val<uint64_t>("osd_oob_buffer_count"));
 
   cuObjRDMATunable params;
   params.setNumDcis(num_dcis);
@@ -219,7 +219,7 @@ OSDCuObj::BufEntry* OSDCuObj::acquire_buffer(size_t needed, bool* transient)
   if (needed > m_buf_size * 4) {
     derr << "ERROR: " << needed << " bytes exceeds the transient RDMA "
 	 << "registration cap (" << m_buf_size * 4
-	 << "); raise osd_cuobj_buffer_size" << dendl;
+	 << "); raise osd_oob_buffer_size" << dendl;
     return nullptr;
   }
   dout(10) << "buffer pool exhausted, registering transient buffer of "
@@ -390,7 +390,8 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   // to completion on the same channel (the library caps poll() at 16
   // events and documents no larger per-channel bound)
   constexpr int POLL_BATCH = 16;
-  const utime_t deadline = ceph_clock_now() + utime_t(60, 0);
+  utime_t deadline = ceph_clock_now();
+  deadline += m_cct->_conf.get_val<uint64_t>("osd_oob_op_timeout_ms") / 1000.0;
   size_t next = 0;
   size_t outstanding = 0;
   size_t completed = 0;

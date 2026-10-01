@@ -2618,7 +2618,7 @@ bool RGWGetObj::prefetch_data()
   /* when the OSDs may push data straight into client memory, inline
    * head data staged in RGW memory would defeat the passthrough */
   if (s->info.env->exists("HTTP_X_AMZ_RDMA_TOKEN") &&
-      s->cct->_conf.get_val<bool>("rgw_cuobj_osd_passthrough")) {
+      s->cct->_conf.get_val<bool>("rgw_rdma_osd_passthrough")) {
     return false;
   }
 
@@ -2690,7 +2690,7 @@ void RGWGetObj::select_rdma_mode(bool plain_chain)
       return;
     }
     if (plain_chain && !relay_token.empty() &&
-        s->cct->_conf.get_val<bool>("rgw_cuobj_osd_passthrough")) {
+        s->cct->_conf.get_val<bool>("rgw_rdma_osd_passthrough")) {
       rdma_token = relay_token;
       rdma_mode = RdmaMode::RELAY;
     } else {
@@ -2702,7 +2702,7 @@ void RGWGetObj::select_rdma_mode(bool plain_chain)
     return;
   }
   if (plain_chain &&
-      s->cct->_conf.get_val<bool>("rgw_cuobj_osd_passthrough")) {
+      s->cct->_conf.get_val<bool>("rgw_rdma_osd_passthrough")) {
     // the whole response must fit the client's registered window for
     // per-stripe scatter writes to be valid
     auto window = ceph::rdma::parse_rdma_token(rdma_token);
@@ -3036,7 +3036,7 @@ void RGWGetObj::execute(optional_yield y)
       const auto lease_ms = static_cast<uint64_t>(
         std::ceil(read_op->params.rdma_lease * 1000.0));
       const auto wait_ms = lease_ms +
-        s->cct->_conf.get_val<uint64_t>("rgw_cuobj_fence_drain_ms");
+        s->cct->_conf.get_val<uint64_t>("rgw_rdma_fence_drain_ms");
       if (wait_ms) {
         ldpp_dout(this, 4) << "rdma fence: waiting " << wait_ms
                            << "ms (lease " << lease_ms
@@ -3068,7 +3068,7 @@ void RGWGetObj::execute(optional_yield y)
   if (read_op->params.rdma_submitted) {
     rdma_fence_ms = static_cast<uint64_t>(
         std::ceil(read_op->params.rdma_lease * 1000.0)) +
-      s->cct->_conf.get_val<uint64_t>("rgw_cuobj_fence_drain_ms");
+      s->cct->_conf.get_val<uint64_t>("rgw_rdma_fence_drain_ms");
   }
 
   if (op_ret >= 0)

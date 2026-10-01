@@ -8844,7 +8844,7 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
     data.rdma = true;
     data.rdma_token = params.rdma_token;
     data.rdma_range_start = ofs;
-    if (cct->_conf.get_val<bool>("rgw_cuobj_crc64nvme")) {
+    if (cct->_conf.get_val<bool>("rgw_rdma_crc64nvme")) {
       data.rdma_flags |=
         librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC64;
     }

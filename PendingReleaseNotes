@@ -52,7 +52,11 @@
   whole-object GETs with the stored full-object ``crc64nvme`` checksum
   before responding (``rgw_rdma_crc64nvme``, on by default), which catches
   corruption at the storage node and inside the cluster before the client
-  is answered. See ``doc/radosgw/s3-rdma.rst``.
+  is answered. Two pool options bound every out-of-band transfer, and the
+  OSDs enforce both: ``rdma_delivery_lease`` bounds when a write may start,
+  and ``rdma_delivery_drain`` bounds when it may still land. A write that
+  misses the drain is cut off. A client or the gateway waits lease plus
+  drain before it reuses a window. See ``doc/radosgw/s3-rdma.rst``.
 * RGW: The gateway now serves S3 over RDMA to clients that use Reliable
   Connection transport, such as AMD's hipObject library (the ``hipobj-rc-v2``
   control protocol on ``/.hipobj-rc/``). These clients do not need NVIDIA

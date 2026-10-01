@@ -130,7 +130,8 @@ no descriptor. An OSD replies inline in these cases:
 
 * No running executor serves the token.
 * The pool's ``rdma_delivery_lease`` expired before the transfer
-  started. See `Fencing a window before reuse`_.
+  started, or too little of the pool's ``rdma_delivery_drain`` is left
+  to finish it. See `Fencing a window before reuse`_.
 * The request is a retransmission. RADOS resends reads after peering
   changes, and an inline reply makes sure that a stripe is never
   written twice.
@@ -165,6 +166,9 @@ reply to offsets in the window. The shape of the plan follows the read:
 The OSD copies the reply into a registered staging buffer, writes each
 range, and waits until every write completes. Only then does it send
 the reply. A reply therefore means that the bytes are in the window.
+The OSD waits at most until the deadline that
+`Fencing a window before reuse`_ describes. It cuts off the writes that
+are still in flight then, and delivers the read inline.
 
 Before an OSD starts a transfer, it reads its PG read lease
 (``readable_until``) again. The readability test at dispatch does not
@@ -227,18 +231,35 @@ use again:
   reply. A drained reply is therefore the interlock for every OSD that
   is still in contact.
 * An OSD delivers a retransmitted request inline.
-* The pool's ``rdma_delivery_lease`` bounds how long after receipt an
-  OSD can still start a transfer. This covers an OSD that disappears
-  during the request, and an operation that the gateway's RADOS client
-  sent again. Before a fallback rewrites the window, the gateway waits
-  for the lease plus ``rgw_rdma_fence_drain_ms``. That outlasts the
-  lease and the transport's drain, so the window is quiet before it is
-  written again.
+* Two pool options bound every transfer, and the OSD enforces both.
+  An OSD starts a transfer only within ``rdma_delivery_lease`` of
+  receiving the operation. Every write it started lands, or is cut
+  off, within ``rdma_delivery_drain`` after the lease. This covers an
+  OSD that disappears during the request, and an operation that the
+  gateway's RADOS client sent again. Before a fallback rewrites the
+  window, the gateway waits for the lease plus the drain, which it
+  reads from the OSDMap. The window is then quiet before it is written
+  again.
 
-The lease bounds the OSD side only. It is not a bound on how long a
-client keeps a window registered. The lease is measured against the
-wall clock, so it is a best-effort fence across clock steps. Give it
-some slack.
+How an OSD cuts off a write depends on the transport:
+
+* The libfabric executor closes its endpoint and opens a new one. A
+  libfabric provider discards the operations of an endpoint that
+  closes. The cut-off also fails the other writes in flight on that
+  endpoint, and those reads are delivered inline.
+* cuObject cannot cancel a posted write. A posted write keeps retrying
+  for the retry budget of the DC transport, about two seconds. So the
+  cuObject executor stops waiting that long before the deadline, and
+  does not start a transfer when less than that is left.
+* The ``tcp`` provider cannot cut off a write. Closing a socket does not
+  discard the bytes that the kernel already queued on it, and the
+  kernel delivers them later. The OSD logs a warning at startup. Use
+  ``tcp`` for tests only.
+
+The lease and the drain bound the OSD side only. They are not a bound
+on how long a client keeps a window registered. Both are measured
+against the wall clock, so they are a best-effort fence across clock
+steps. Give them some slack.
 
 Erasure-coded pools
 ===================
@@ -292,9 +313,11 @@ from the window and returns the window to its pool. The primary still
 reads its own shard directly.
 
 The gather is advisory too. A shard that cannot write replies inline.
-A window whose data the primary did not use stays out of use for the
-pool's ``rdma_delivery_lease`` plus a drain bound. This covers a shard
-that replied inline, and a read that was cancelled or restarted.
+A shard follows the same bounds as for client delivery, counted from
+when the sub-read arrived. A window whose data the primary did not use
+stays out of use for the pool's ``rdma_delivery_lease`` plus its
+``rdma_delivery_drain``. This covers a shard that replied inline, and
+a read that was cancelled or restarted.
 
 The first transport in ``osd_oob_transports`` that started lends the
 windows. The libfabric executor registers them on its endpoint. The
@@ -374,10 +397,11 @@ last write carries the session cookie as its immediate value. RC
 delivers writes in order, so the completion of the last write tells the
 client that all earlier writes are in its memory.
 
-When a relay fails after the OSDs received delivery descriptors, an OSD
-can still write into the session buffer until the pool's
-``rdma_delivery_lease`` expires. The gateway keeps that buffer out of
-use for the lease plus ``rgw_rdma_fence_drain_ms``.
+A relay can fail after the OSDs received delivery descriptors. An OSD
+can then still start a write into the session buffer until the pool's
+``rdma_delivery_lease`` expires. That write can land until the pool's
+``rdma_delivery_drain`` runs out after the lease. The gateway keeps the
+buffer out of use for the lease plus the drain.
 
 PUT
 ---
@@ -500,7 +524,8 @@ These providers are known to work:
 
 ``tcp``
   Needs no special hardware. Set ``osd_ofi_node`` to the address the
-  OSD sends from.
+  OSD sends from. It cannot cut off a write that misses its deadline,
+  so use it for tests only.
 
 ``shm``
   Works between processes on one host. It is useful for tests.
@@ -623,16 +648,24 @@ Build options
   is on. The DC target for OSD-direct relay also needs the ``mlx5``
   direct verbs library at build time.
 
-Pool option
------------
+Pool options
+------------
+
+The OSDs enforce both options, and the gateway reads the same values
+from the OSDMap, so no daemon setting must agree with them. Set them
+with ``ceph osd pool set <pool> <option> <seconds>``. A value of 0
+restores the default.
 
 ``rdma_delivery_lease``
   How long, in seconds, after it receives a stripe operation an OSD can
   still start a transfer against its delivery descriptor. A transfer
-  that would start later is delivered inline. The default is 5. Set it
-  with ``ceph osd pool set <pool> rdma_delivery_lease <seconds>``. The
-  OSDs enforce the value, and the gateway reads the same value from the
-  OSDMap, so no daemon setting must agree with it.
+  that would start later is delivered inline. The default is 5.
+
+``rdma_delivery_drain``
+  How long, in seconds, after the lease every write that an OSD started
+  lands or is cut off. Make it longer than a transport needs to cut off
+  its writes. That is about two seconds for cuObject. For libfabric, it
+  is the time an endpoint takes to close and reopen. The default is 3.
 
 Gateway options
 ---------------
@@ -649,10 +682,6 @@ Transports and out-of-band behavior:
 * ``rgw_rdma_crc64nvme``: compute checksums of out-of-band transfers.
   The gateway compares whole-object passthrough GETs with the stored
   checksum, and reports a checksum to RC clients. The default is true.
-* ``rgw_rdma_fence_drain_ms``: the transport drain bound added to the
-  lease before the gateway rewrites or reuses a window that OSDs can
-  still write. Make it cover the transport's retry budget, which is
-  about two seconds at the cuObject defaults. The default is 3000.
 
 libfabric endpoint (``ofi``):
 
@@ -706,8 +735,6 @@ Executors and out-of-band behavior:
   libfabric executor delivers a read inline when it does not fit or
   finds no free buffer. The cuObject executor registers a one-time
   buffer for it instead, which is slower.
-* ``osd_oob_op_timeout_ms``: how long the writes of one read can take,
-  5000 by default. After that the read is delivered inline.
 * ``osd_oob_gather``: lend windows when this OSD is the primary of an
   erasure-coded read. The default is false.
 * ``osd_oob_window_size`` and ``osd_oob_window_count``: the window

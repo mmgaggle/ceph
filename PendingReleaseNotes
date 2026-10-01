@@ -45,8 +45,8 @@
   checksum (CRC64-NVME) each stripe as it is RDMA-written, and the gateway
   verifies whole-object GETs against the stored full-object ``crc64nvme``
   checksum before responding (``rgw_cuobj_crc64nvme``, on by default),
-  giving end-to-end integrity across client memory, the fabric and the
-  storage node. See ``doc/radosgw/s3-rdma.rst``.
+  which catches corruption at the storage node and inside the cluster
+  before the client is answered. See ``doc/radosgw/s3-rdma.rst``.
 * RGW: The gateway now serves S3 over RDMA to clients that use Reliable
   Connection transport, such as AMD's hipObject library (the ``hipobj-rc-v2``
   control protocol on ``/.hipobj-rc/``). These clients do not need NVIDIA

@@ -4703,11 +4703,12 @@ options:
 - name: rgw_cuobj_crc64nvme
   type: bool
   level: advanced
-  desc: Ask OSDs to CRC64-NVME each passthrough stripe as it is RDMA-written;
-    the gateway combines the per-stripe values and verifies whole-object GETs
-    against the object's stored full-object crc64nvme checksum before
-    responding, giving end-to-end integrity across client memory, the fabric
-    and the storage node
+  desc: Ask OSDs to CRC64-NVME each passthrough stripe as they deliver it;
+    the gateway combines the per-stripe values and compares whole-object GETs
+    with the object's stored full-object crc64nvme checksum before
+    responding. This covers the storage node and the data's path inside the
+    cluster; the write into client memory relies on the transport's own
+    integrity checks
   default: true
   services:
   - rgw

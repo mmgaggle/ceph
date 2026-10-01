@@ -30,6 +30,7 @@
 #include "rgw_rdma_rc_wire.h"
 
 namespace rgw::rdma::dc { class Target; }
+namespace ceph::ofi { class Endpoint; }
 
 /**
  * hipobj-rc-v2 session service.
@@ -55,7 +56,9 @@ struct Buffer {
   void* ptr = nullptr;
   size_t size = 0;
   ibv_mr* mr = nullptr;
-  std::string dc_token;  ///< cuObject descriptor for this window (OSD hop)
+  /// delivery descriptor OSDs write this window through: a cuObject DC
+  /// descriptor or a libfabric one; empty when OSD-direct is off
+  std::string osd_token;
   bool in_use = false;
   /// an OSD may still push into a window a failed relay abandoned;
   /// the window stays out of the pool until this passes
@@ -171,7 +174,8 @@ class Service {
 
   /// true once the device is open and the pool registered
   bool available() const { return dev.is_open(); }
-  /// true when the gateway exposes a DC target the OSDs can push into
+  /// true when the gateway exposes its windows to the OSDs, over a DC
+  /// target or libfabric
   bool osd_direct() const;
   size_t buffer_size() const { return buf_size; }
   uint32_t queue_depth() const { return send_depth; }
@@ -224,6 +228,9 @@ class Service {
   Device dev;
 #ifdef HAVE_MLX5DV
   std::unique_ptr<dc::Target> dct;
+#endif
+#ifdef WITH_OOB_OFI
+  std::unique_ptr<ceph::ofi::Endpoint> ofi_ep;
 #endif
   std::vector<Buffer> pool;
   size_t buf_size = 0;

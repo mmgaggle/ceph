@@ -4865,11 +4865,46 @@ options:
 - name: rgw_rdma_rc_osd_direct
   type: bool
   level: advanced
-  desc: Expose the session buffers as a cuObject DC target so OSDs can push
-    stripes straight into them (rgw_cuobj_osd_passthrough must be on and the
-    gateway device must be mlx5); off, or when unavailable, stripes are
-    copied into the buffer through the gateway data path
+  desc: Expose the session buffers to the OSDs so they can push stripes
+    straight into them (rgw_cuobj_osd_passthrough must be on), over libfabric
+    when rgw_rdma_rc_ofi_provider is set and otherwise as a cuObject DC target,
+    which needs an mlx5 device; off, or when unavailable, stripes are copied
+    into the buffer through the gateway data path
   default: true
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_ofi_provider
+  type: str
+  level: advanced
+  desc: libfabric provider the OSDs write relay windows through (for example
+    tcp, or "verbs;ofi_rxm"); it must match the OSDs' osd_ofi_provider. Empty
+    uses the cuObject DC target instead. Needs a build with WITH_OOB_OFI.
+  default:
+  services:
+  - rgw
+  flags:
+  - startup
+  see_also:
+  - rgw_rdma_rc_osd_direct
+  - osd_ofi_provider
+- name: rgw_rdma_rc_ofi_domain
+  type: str
+  level: advanced
+  desc: libfabric domain for the relay windows, such as an RDMA device or a
+    network interface; empty lets the provider choose
+  default:
+  services:
+  - rgw
+  flags:
+  - startup
+- name: rgw_rdma_rc_ofi_node
+  type: str
+  level: advanced
+  desc: Local address the gateway's libfabric endpoint binds to; it must be
+    reachable from the OSDs. Empty lets the provider choose.
+  default:
   services:
   - rgw
   flags:

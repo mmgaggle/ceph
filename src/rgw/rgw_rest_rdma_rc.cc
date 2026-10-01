@@ -533,7 +533,7 @@ void GetOp::execute_ready(optional_yield y)
   range_ofs = sess->offset;
   range_size = sess->size;
   relay_window = sess->size;
-  relay_token = svc->osd_direct() ? sess->buf->dc_token : std::string{};
+  relay_token = svc->osd_direct() ? sess->buf->osd_token : std::string{};
   get_data = true;
 
   RGWGetObj::execute(y);

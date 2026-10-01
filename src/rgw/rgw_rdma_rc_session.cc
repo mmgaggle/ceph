@@ -28,6 +28,9 @@
 #ifdef HAVE_MLX5DV
 #include "rgw_rdma_dc_target.h"
 #endif
+#ifdef WITH_OOB_OFI
+#include "common/ofi_rma.h"
+#endif
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -138,8 +141,32 @@ int Service::do_init(CephContext* c)
     return -EINVAL;
   }
 
+  [[maybe_unused]] bool ofi_relay = false;
+#ifdef WITH_OOB_OFI
+  // a libfabric provider, when named, carries the OSD hop on any NIC;
+  // the DC target below needs mlx5
+  if (const auto prov = conf.get_val<std::string>("rgw_rdma_rc_ofi_provider");
+      conf.get_val<bool>("rgw_rdma_rc_osd_direct") && !prov.empty()) {
+    ceph::ofi::config_t oc;
+    oc.provider = prov;
+    oc.domain = conf.get_val<std::string>("rgw_rdma_rc_ofi_domain");
+    oc.node = conf.get_val<std::string>("rgw_rdma_rc_ofi_node");
+    // OSD writes land only while a manual-progress provider is polled
+    oc.progress_thread = true;
+    std::string err;
+    ofi_ep = ceph::ofi::Endpoint::open(oc, &err);
+    if (ofi_ep) {
+      ofi_relay = true;
+      ldout(cct, 1) << "rgw_rdma_rc: OSD-direct relay windows over libfabric: "
+                    << ofi_ep->describe() << dendl;
+    } else {
+      ldout(cct, 1) << "rgw_rdma_rc: libfabric relay windows unavailable ("
+                    << err << ")" << dendl;
+    }
+  }
+#endif
 #ifdef HAVE_MLX5DV
-  if (conf.get_val<bool>("rgw_rdma_rc_osd_direct")) {
+  if (!ofi_relay && conf.get_val<bool>("rgw_rdma_rc_osd_direct")) {
     auto target = std::make_unique<dc::Target>();
     const auto dc_key = conf.get_val<uint64_t>("rgw_rdma_rc_dc_key");
     int r = target->open(cct, dev, dc_key);
@@ -173,7 +200,25 @@ int Service::do_init(CephContext* c)
     }
 #ifdef HAVE_MLX5DV
     if (dct) {
-      b.dc_token = dct->token(ptr, static_cast<uint32_t>(buf_size), b.mr->rkey);
+      b.osd_token = dct->token(ptr, static_cast<uint32_t>(buf_size), b.mr->rkey);
+    }
+#endif
+#ifdef WITH_OOB_OFI
+    if (ofi_ep) {
+      ceph::ofi::Endpoint::window_t w;
+      if (int r = ofi_ep->register_window(static_cast<char*>(ptr), buf_size, &w);
+          r == 0) {
+        b.osd_token = ofi_ep->window_token(w, 0, buf_size);
+      }
+      if (b.osd_token.empty()) {
+        ldout(cct, 1) << "rgw_rdma_rc: registering relay window " << i
+                      << " over libfabric failed (" << ofi_ep->last_error()
+                      << "); OSD-direct delivery disabled" << dendl;
+        for (auto& prev : pool) {
+          prev.osd_token.clear();
+        }
+        ofi_ep.reset();
+      }
     }
 #endif
   }
@@ -207,6 +252,11 @@ void Service::do_shutdown()
     }
     sessions.clear();
   }
+#ifdef WITH_OOB_OFI
+  // closes the relay windows' regions and stops polling before the
+  // memory goes away
+  ofi_ep.reset();
+#endif
   for (auto& b : pool) {
     Device::deregister_memory(b.mr);
     b.mr = nullptr;
@@ -222,6 +272,11 @@ void Service::do_shutdown()
 
 bool Service::osd_direct() const
 {
+#ifdef WITH_OOB_OFI
+  if (ofi_ep) {
+    return true;
+  }
+#endif
 #ifdef HAVE_MLX5DV
   return static_cast<bool>(dct);
 #else

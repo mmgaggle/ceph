@@ -76,6 +76,7 @@ class ObjectStore;
 class FuseStore;
 class OSDCuObj;
 class OSDUet;
+class OSDOfi;
 class OSDOobExecutor;
 class OSDMap;
 class MLog;
@@ -129,6 +130,10 @@ public:
 #ifdef WITH_OSD_UET
   /// UET delivery endpoint; null unless osd_uet_enabled and it came up
   OSDUet* uet = nullptr;
+#endif
+#ifdef WITH_OOB_OFI
+  /// libfabric delivery endpoint; null unless osd_ofi_enabled and it came up
+  OSDOfi* ofi = nullptr;
 #endif
 #ifdef HAVE_OSD_OOB_DELIVERY
   /// the executor that serves a delivery token's transport, or null

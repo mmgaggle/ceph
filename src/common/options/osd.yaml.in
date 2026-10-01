@@ -1696,6 +1696,85 @@ options:
   - osd
   flags:
   - startup
+- name: osd_ofi_enabled
+  type: bool
+  level: advanced
+  desc: Deliver reads that carry a libfabric delivery descriptor by
+    RMA-writing the data straight into the requester's memory, and lend gather
+    windows over libfabric when osd_oob_gather is set (needs a build with
+    WITH_OOB_OFI)
+  default: false
+  services:
+  - osd
+  flags:
+  - startup
+  see_also:
+  - osd_ofi_provider
+  - osd_oob_gather
+- name: osd_ofi_provider
+  type: str
+  level: advanced
+  desc: libfabric provider for out-of-band delivery, as fi_info names it
+  long_desc: The provider picks the wire. tcp and shm need no special
+    hardware, "verbs;ofi_rxm" runs RDMA reliable connections, efa runs AWS SRD,
+    and a UET provider runs Ultra Ethernet. A delivery descriptor names its
+    provider, and this OSD serves only descriptors of its own provider; others
+    are delivered inline.
+  default: tcp
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_ofi_domain
+  type: str
+  level: advanced
+  desc: libfabric domain to open, such as an RDMA device or a network
+    interface; empty lets the provider choose
+  default:
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_ofi_node
+  type: str
+  level: advanced
+  desc: Local address the libfabric endpoint binds to; empty lets the
+    provider choose
+  default:
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_ofi_buffer_size
+  type: size
+  level: advanced
+  desc: Size of each registered staging buffer for libfabric writes; a read
+    larger than this is delivered inline
+  default: 16_M
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_ofi_buffer_count
+  type: uint
+  level: advanced
+  desc: Number of staging buffers, and so of reads the OSD places at once
+    over libfabric; a read that finds none free is delivered inline
+  default: 8
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_ofi_op_timeout_ms
+  type: uint
+  level: advanced
+  desc: How long one read's libfabric writes may take before the OSD gives up
+    and delivers the read inline
+  default: 5000
+  services:
+  - osd
+  flags:
+  - startup
 - name: osd_uet_buffer_size
   type: size
   level: dev

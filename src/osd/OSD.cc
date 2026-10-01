@@ -76,6 +76,9 @@
 #ifdef WITH_OSD_UET
 #include "osd_uet.h"
 #endif
+#ifdef WITH_OOB_OFI
+#include "osd_ofi.h"
+#endif
 #ifdef HAVE_OSD_OOB_DELIVERY
 #include "oob_executor.h"
 #endif
@@ -548,6 +551,10 @@ void OSDService::shutdown()
   delete uet;
   uet = nullptr;
 #endif
+#ifdef WITH_OOB_OFI
+  delete ofi;
+  ofi = nullptr;
+#endif
 
   publish_map(OSDMapRef());
   next_osdmap = OSDMapRef();
@@ -556,6 +563,11 @@ void OSDService::shutdown()
 #ifdef HAVE_OSD_OOB_DELIVERY
 OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
 {
+#ifdef WITH_OOB_OFI
+  if (ofi && ofi->handles(token)) {
+    return ofi;
+  }
+#endif
 #ifdef WITH_OSD_UET
   if (uet && uet->handles(token)) {
     return uet;
@@ -574,6 +586,13 @@ OSDOobExecutor* OSDService::oob_gather_executor() const
   if (!cct->_conf.get_val<bool>("osd_oob_gather")) {
     return nullptr;
   }
+  // the first transport that is up lends the windows; peers need the
+  // same transport to push into them, and reply inline otherwise
+#ifdef WITH_OOB_OFI
+  if (ofi) {
+    return ofi;
+  }
+#endif
 #ifdef WITH_OSD_UET
   if (uet) {
     return uet;
@@ -590,6 +609,9 @@ OSDOobExecutor* OSDService::oob_gather_executor() const
 bool OSDService::has_oob_executor() const
 {
   bool any = false;
+#ifdef WITH_OOB_OFI
+  any = any || ofi;
+#endif
 #ifdef WITH_OSD_UET
   any = any || uet;
 #endif
@@ -615,6 +637,10 @@ void OSDService::fast_shutdown()
 #ifdef WITH_OSD_UET
   delete uet;
   uet = nullptr;
+#endif
+#ifdef WITH_OOB_OFI
+  delete ofi;
+  ofi = nullptr;
 #endif
 }
 
@@ -2943,6 +2969,14 @@ void OSD::asok_command(
     }
     f->close_section();
 #endif
+#ifdef WITH_OOB_OFI
+  } else if (prefix == "ofi status") {
+    f->open_object_section("ofi");
+    if (service.ofi) {
+      service.ofi->dump_stats(f);
+    }
+    f->close_section();
+#endif
   } else if (prefix == "flush_journal") {
     store->flush_journal();
   } else if (prefix == "dump_ops_in_flight" ||
@@ -4171,6 +4205,18 @@ int OSD::init()
   }
 #endif
 
+#ifdef WITH_OOB_OFI
+  if (cct->_conf.get_val<bool>("osd_ofi_enabled")) {
+    auto ofi = std::make_unique<OSDOfi>(cct);
+    if (int r = ofi->init(); r == 0) {
+      service.ofi = ofi.release();
+    } else {
+      derr << "WARNING: libfabric delivery init failed: " << cpp_strerror(r)
+	   << " (libfabric delivery disabled on this osd)" << dendl;
+    }
+  }
+#endif
+
   dout(10) << "ensuring pgs have consumed prior maps" << dendl;
   consume_map();
 
@@ -4222,6 +4268,13 @@ void OSD::final_init()
   if (service.uet) {
     r = admin_socket->register_command(
       "uet status", asok_hook, "UET out-of-band delivery statistics");
+    ceph_assert(r == 0);
+  }
+#endif
+#ifdef WITH_OOB_OFI
+  if (service.ofi) {
+    r = admin_socket->register_command(
+      "ofi status", asok_hook, "libfabric out-of-band delivery statistics");
     ceph_assert(r == 0);
   }
 #endif

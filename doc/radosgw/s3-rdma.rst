@@ -512,3 +512,54 @@ The mock-up has these limits:
   server mode, but the mock-up does not configure it.
 * The OSD writes on the op thread and waits for completion, as the first
   cuObject executor did.
+
+Gathering erasure-coded reads out of band (mock-up)
+---------------------------------------------------
+
+The primary of an erasure-coded read normally collects the shards it
+needs from its peers in the sub-read replies, over the messenger. With
+``osd_oob_gather`` on, the peers push their shard data into the
+primary's memory instead, over the same out-of-band transport the OSDs
+use to reach clients. The primary then decodes as before, and its
+existing client delivery writes the logical data into the client's
+window. Object data then crosses the cluster network as out-of-band
+writes on both hops: from the shards to the primary, and from the
+primary to the client.
+
+The primary lends one registered window to each peer shard that it
+reads from. The window's token goes in the sub-read. The shard reads as
+usual, writes everything it read into the window back to back, and
+replies with only the extents. The primary rebuilds the shard buffers
+from the window and returns the window to its pool. Its own shard is
+still read directly.
+
+The push is advisory, like client delivery. A shard that cannot push
+replies inline, and the gather continues as before. A window whose data
+the primary did not consume stays out of use for the pool's
+``rdma_delivery_lease`` plus a drain bound. That covers a shard that
+replied inline, and a read that was cancelled or restarted. A peer that
+received the window's token could still write into it until then.
+
+Both executors can lend windows:
+
+* UET lends them from a receive pool registered next to its staging
+  region. This is the configuration tested with the mock-up.
+* cuObject lends them from a pool behind a DC target on the OSD's RDMA
+  device, so peers' cuObject servers can push into it. This needs an
+  mlx5 NIC, and in this branch it is compiled only, not tested.
+
+The options are:
+
+* ``osd_oob_gather``: lend windows for client erasure-coded reads.
+* ``osd_oob_window_size`` and ``osd_oob_window_count``: the window pool.
+  A shard read larger than a window, or a gather that finds no free
+  window, uses inline replies.
+
+The sub-read message carries the token as a new trailing field, and the
+reply carries the pushed extents, so peers on older releases ignore the
+token and reply inline.
+
+To test several OSDs on one host with the UEC reference provider, put
+each OSD's UET interface in its own VRF. The provider resolves peers
+with ``ip route get``. Without VRFs, a peer OSD's address is a local
+address of the host, and resolution fails.

@@ -955,6 +955,30 @@ TEST_P(LibRadosMiscPP, RdmaDeliveryLeasePP) {
   ASSERT_DOUBLE_EQ(5.0, lease);
 }
 
+TEST_P(LibRadosMiscPP, RdmaDeliveryDrainPP) {
+  // the drain bound is a pool option too, read the same way
+  double drain = 0;
+  ASSERT_EQ(0, ioctx.pool_rdma_delivery_drain(&drain));
+  ASSERT_DOUBLE_EQ(3.0, drain);
+  ASSERT_EQ(-EINVAL, ioctx.pool_rdma_delivery_drain(nullptr));
+
+  auto set_drain = [&](const std::string& val) {
+    bufferlist inbl, outbl;
+    std::string outs;
+    ASSERT_EQ(0, cluster.mon_command(
+      "{\"prefix\": \"osd pool set\", \"pool\": \"" + pool_name +
+      "\", \"var\": \"rdma_delivery_drain\", \"val\": \"" + val +
+      "\"}", std::move(inbl), &outbl, &outs)) << outs;
+    ASSERT_EQ(0, cluster.wait_for_latest_osdmap());
+  };
+  set_drain("1.5");
+  ASSERT_EQ(0, ioctx.pool_rdma_delivery_drain(&drain));
+  ASSERT_DOUBLE_EQ(1.5, drain);
+  set_drain("0");  // 0 clears the option, restoring the default
+  ASSERT_EQ(0, ioctx.pool_rdma_delivery_drain(&drain));
+  ASSERT_DOUBLE_EQ(3.0, drain);
+}
+
 TEST_P(LibRadosMiscPP, Applications) {
   // Applications are pool-level, not namespace-level, so they persist across
   // parameterized test runs. Skip this test for split_ops to avoid conflicts.

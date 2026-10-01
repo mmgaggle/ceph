@@ -1411,7 +1411,9 @@ static opt_mapping_t opt_mapping = boost::assign::map_list_of
 	   ("pct_update_delay", pool_opts_t::opt_desc_t(
              pool_opts_t::PCT_UPDATE_DELAY, pool_opts_t::INT))
 	   ("rdma_delivery_lease", pool_opts_t::opt_desc_t(
-             pool_opts_t::RDMA_DELIVERY_LEASE, pool_opts_t::DOUBLE));
+             pool_opts_t::RDMA_DELIVERY_LEASE, pool_opts_t::DOUBLE))
+	   ("rdma_delivery_drain", pool_opts_t::opt_desc_t(
+             pool_opts_t::RDMA_DELIVERY_DRAIN, pool_opts_t::DOUBLE));
 
 bool pool_opts_t::is_opt_name(const std::string& name)
 {

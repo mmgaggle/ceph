@@ -1158,6 +1158,20 @@ public:
      * Unset means pg_pool_t::DEFAULT_RDMA_DELIVERY_LEASE.
      */
     RDMA_DELIVERY_LEASE,
+    /**
+     * RDMA_DELIVERY_DRAIN
+     *
+     * Seconds after the delivery lease runs out by which every
+     * out-of-band write an OSD started for a read has landed or been
+     * cut off. The lease bounds when a write may start, the drain when
+     * it may still land: an OSD stops waiting for its writes at receipt
+     * plus lease plus drain and cuts off any still in flight, and a
+     * window owner that gave up on a request waits lease plus drain
+     * before it writes the window again. A pool option for the same
+     * reason as the lease. Unset means
+     * pg_pool_t::DEFAULT_RDMA_DELIVERY_DRAIN.
+     */
+    RDMA_DELIVERY_DRAIN,
   };
 
   enum type_t {
@@ -1693,6 +1707,13 @@ public:
   double get_rdma_delivery_lease() const {
     return opts.value_or(pool_opts_t::RDMA_DELIVERY_LEASE,
 			 double{DEFAULT_RDMA_DELIVERY_LEASE});
+  }
+  /// default for pool_opts_t::RDMA_DELIVERY_DRAIN (seconds); a
+  /// constant for the same reason as the lease's
+  static constexpr double DEFAULT_RDMA_DELIVERY_DRAIN = 3.0;
+  double get_rdma_delivery_drain() const {
+    return opts.value_or(pool_opts_t::RDMA_DELIVERY_DRAIN,
+			 double{DEFAULT_RDMA_DELIVERY_DRAIN});
   }
 
   typedef enum {

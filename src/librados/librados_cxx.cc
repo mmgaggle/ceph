@@ -1261,6 +1261,11 @@ int librados::IoCtx::pool_rdma_delivery_lease(double *seconds)
   return io_ctx_impl->client->pool_rdma_delivery_lease(get_id(), seconds);
 }
 
+int librados::IoCtx::pool_rdma_delivery_drain(double *seconds)
+{
+  return io_ctx_impl->client->pool_rdma_delivery_drain(get_id(), seconds);
+}
+
 std::string librados::IoCtx::get_pool_name()
 {
   std::string s;

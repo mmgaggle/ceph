@@ -601,6 +601,15 @@ You may set values for the following keys:
    :Type: Double
    :Default: ``5``
 
+.. _rdma_delivery_drain:
+
+.. describe:: rdma_delivery_drain
+
+   :Description: Sets how long (in seconds) after its delivery lease runs out every out-of-band write that an OSD started for a read has landed or been cut off. An OSD stops waiting for its writes at receipt plus ``rdma_delivery_lease`` plus this value, and cuts off any write that is still in flight. A client or daemon that gave up on a request waits the lease plus this value before it writes the memory window again. Make it longer than the time a transport needs to cut off its writes, which is about two seconds for cuObject. Setting ``0`` restores the built-in default.
+
+   :Type: Double
+   :Default: ``3``
+
 .. _recovery_priority:
 
 .. describe:: recovery_priority

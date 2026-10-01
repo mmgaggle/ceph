@@ -615,11 +615,13 @@ inline namespace v14_2_0 {
      * result->bytes = 0, so degradation is always plain in-band data.
      * An OSD will not initiate a transfer against the descriptor
      * later than the pool's rdma_delivery_lease after receiving the
-     * op. That bounds the OSD's side only; on this path it also means
-     * a caller that abandoned a request may reuse the window once
-     * that long (see IoCtx::pool_rdma_delivery_lease()) plus its
-     * transport's drain bound have elapsed, because nothing else
-     * will write it. Passing
+     * op, and every write it started has landed or been cut off by
+     * the pool's rdma_delivery_drain after that. On this path it also
+     * means a caller that abandoned a request may reuse the window
+     * once lease plus drain have elapsed (see
+     * IoCtx::pool_rdma_delivery_lease() and
+     * IoCtx::pool_rdma_delivery_drain()), because nothing else will
+     * write it. Passing
      * RDMA_DELIVERY_WANT_CRC64 in flags asks the OSD to also report
      * the canonical CRC-64/NVME of the delivered bytes; it is valid
      * only when result->flags has RDMA_DELIVERY_CRC64_VALID set (best
@@ -960,6 +962,14 @@ inline namespace v14_2_0 {
      * must keep a window registered.
      */
     int pool_rdma_delivery_lease(double *seconds);
+    /**
+     * The pool's rdma_delivery_drain in seconds: how long after the
+     * delivery lease runs out every out-of-band write an OSD started
+     * for an operation has landed or been cut off. A caller that gave
+     * up on a request may write its window again once lease plus drain
+     * have elapsed since it sent the request.
+     */
+    int pool_rdma_delivery_drain(double *seconds);
 
     // create an object
     int create(const std::string& oid, bool exclusive);

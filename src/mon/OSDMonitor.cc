@@ -5586,7 +5586,7 @@ namespace {
     PG_AUTOSCALE_BIAS, DEDUP_TIER, DEDUP_CHUNK_ALGORITHM, 
     DEDUP_CDC_CHUNK_SIZE, POOL_EIO, BULK, PG_NUM_MAX, READ_RATIO,
     EC_OPTIMIZATIONS, EC_DATA_SHARD_COUNT, EC_CODING_SHARD_COUNT,
-    SUPPORTS_OMAP, RDMA_DELIVERY_LEASE };
+    SUPPORTS_OMAP, RDMA_DELIVERY_LEASE, RDMA_DELIVERY_DRAIN };
 
   std::set<osd_pool_get_choices>
     subtract_second_from_first(const std::set<osd_pool_get_choices>& first,
@@ -6397,6 +6397,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
       {"ec_coding_shard_count", EC_CODING_SHARD_COUNT},
       {"supports_omap", SUPPORTS_OMAP},
       {"rdma_delivery_lease", RDMA_DELIVERY_LEASE},
+      {"rdma_delivery_drain", RDMA_DELIVERY_DRAIN},
     };
 
     typedef std::set<osd_pool_get_choices> choices_set_t;
@@ -6645,6 +6646,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
 	  case DEDUP_CDC_CHUNK_SIZE:
           case READ_RATIO:
 	  case RDMA_DELIVERY_LEASE:
+	  case RDMA_DELIVERY_DRAIN:
 	    {
 	      pool_opts_t::key_t key = pool_opts_t::get_opt_desc(i->first).key;
 	      if (p->opts.is_set(key)) {
@@ -6827,6 +6829,7 @@ bool OSDMonitor::preprocess_command(MonOpRequestRef op)
 	  case DEDUP_CDC_CHUNK_SIZE:
           case READ_RATIO:
 	  case RDMA_DELIVERY_LEASE:
+	  case RDMA_DELIVERY_DRAIN:
 	    for (i = ALL_CHOICES.begin(); i != ALL_CHOICES.end(); ++i) {
 	      if (i->second == *it)
 		break;
@@ -9532,14 +9535,14 @@ int OSDMonitor::prepare_command_pool_set(const cmdmap_t& cmdmap,
         ss << "read_ratio must be between 0 and 100";
         return -ERANGE;
       }
-    } else if (var == "rdma_delivery_lease") {
+    } else if (var == "rdma_delivery_lease" || var == "rdma_delivery_drain") {
       if (floaterr.length()) {
         ss << "error parsing floating point value '" << val << "': "
            << floaterr;
         return -EINVAL;
       }
       if (f < 0) {
-        ss << "rdma_delivery_lease must be >= 0 (0 restores the default)";
+        ss << var << " must be >= 0 (0 restores the default)";
         return -ERANGE;
       }
     }

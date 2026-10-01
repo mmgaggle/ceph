@@ -73,9 +73,6 @@
 #ifdef WITH_OSD_CUOBJ
 #include "osd_cuobj.h"
 #endif
-#ifdef WITH_OSD_UET
-#include "osd_uet.h"
-#endif
 #ifdef WITH_OOB_OFI
 #include "osd_ofi.h"
 #endif
@@ -547,10 +544,6 @@ void OSDService::shutdown()
   delete cuobj;
   cuobj = nullptr;
 #endif
-#ifdef WITH_OSD_UET
-  delete uet;
-  uet = nullptr;
-#endif
 #ifdef WITH_OOB_OFI
   delete ofi;
   ofi = nullptr;
@@ -566,11 +559,6 @@ OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
 #ifdef WITH_OOB_OFI
   if (ofi && ofi->handles(token)) {
     return ofi;
-  }
-#endif
-#ifdef WITH_OSD_UET
-  if (uet && uet->handles(token)) {
-    return uet;
   }
 #endif
 #ifdef WITH_OSD_CUOBJ
@@ -593,11 +581,6 @@ OSDOobExecutor* OSDService::oob_gather_executor() const
     return ofi;
   }
 #endif
-#ifdef WITH_OSD_UET
-  if (uet) {
-    return uet;
-  }
-#endif
 #ifdef WITH_OSD_CUOBJ
   if (cuobj) {
     return cuobj;
@@ -611,9 +594,6 @@ bool OSDService::has_oob_executor() const
   bool any = false;
 #ifdef WITH_OOB_OFI
   any = any || ofi;
-#endif
-#ifdef WITH_OSD_UET
-  any = any || uet;
 #endif
 #ifdef WITH_OSD_CUOBJ
   any = any || cuobj;
@@ -633,10 +613,6 @@ void OSDService::fast_shutdown()
   // op threads are stopped by now, so no RDMA writes are in flight
   delete cuobj;
   cuobj = nullptr;
-#endif
-#ifdef WITH_OSD_UET
-  delete uet;
-  uet = nullptr;
 #endif
 #ifdef WITH_OOB_OFI
   delete ofi;
@@ -2961,14 +2937,6 @@ void OSD::asok_command(
     }
     f->close_section();
 #endif
-#ifdef WITH_OSD_UET
-  } else if (prefix == "uet status") {
-    f->open_object_section("uet");
-    if (service.uet) {
-      service.uet->dump_stats(f);
-    }
-    f->close_section();
-#endif
 #ifdef WITH_OOB_OFI
   } else if (prefix == "ofi status") {
     f->open_object_section("ofi");
@@ -4193,18 +4161,6 @@ int OSD::init()
   }
 #endif
 
-#ifdef WITH_OSD_UET
-  if (cct->_conf.get_val<bool>("osd_uet_enabled")) {
-    auto uet = std::make_unique<OSDUet>(cct);
-    if (int r = uet->init(); r == 0) {
-      service.uet = uet.release();
-    } else {
-      derr << "WARNING: UET delivery init failed: " << cpp_strerror(r)
-	   << " (UET delivery disabled on this osd)" << dendl;
-    }
-  }
-#endif
-
 #ifdef WITH_OOB_OFI
   if (cct->_conf.get_val<bool>("osd_ofi_enabled")) {
     auto ofi = std::make_unique<OSDOfi>(cct);
@@ -4261,13 +4217,6 @@ void OSD::final_init()
     r = admin_socket->register_command(
       "cuobj status", asok_hook,
       "cuObject out-of-band RDMA delivery statistics");
-    ceph_assert(r == 0);
-  }
-#endif
-#ifdef WITH_OSD_UET
-  if (service.uet) {
-    r = admin_socket->register_command(
-      "uet status", asok_hook, "UET out-of-band delivery statistics");
     ceph_assert(r == 0);
   }
 #endif

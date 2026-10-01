@@ -173,10 +173,9 @@ void OSDCuObj::do_shutdown()
 
 bool OSDCuObj::handles(const std::string& token) const
 {
-  // UET and libfabric descriptors carry a transport tag in their third
-  // field; a cuObject descriptor has its memory key there
-  return token.find(":uet1:") == std::string::npos &&
-    token.find(":ofi1:") == std::string::npos;
+  // libfabric descriptors carry a transport tag in their third field; a
+  // cuObject descriptor has its memory key there
+  return token.find(":ofi1:") == std::string::npos;
 }
 
 bool OSDCuObj::is_available() const

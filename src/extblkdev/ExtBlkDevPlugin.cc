@@ -177,10 +177,12 @@ namespace ceph {
       if (rc != 0) {
 	return rc;
       }
-#ifdef WITH_OSD_UET
-      // UET delivery opens a raw socket in OSD::init, after this trim;
-      // keep the one capability it needs
-      if (cct->_conf.get_val<bool>("osd_uet_enabled")) {
+#ifdef WITH_OOB_OFI
+      // the UEC reference provider ("uet") sends and receives on raw
+      // sockets it opens in OSD::init, after this trim; keep the one
+      // capability it needs
+      if (cct->_conf.get_val<bool>("osd_ofi_enabled") &&
+	  cct->_conf.get_val<std::string>("osd_ofi_provider") == "uet") {
 	cap_value_t raw[1] = {CAP_NET_RAW};
 	if (cap_set_flag(merge_caps, CAP_PERMITTED, 1, raw, CAP_SET) < 0) {
 	  return -errno;

@@ -75,7 +75,6 @@ class MonClient;
 class ObjectStore;
 class FuseStore;
 class OSDCuObj;
-class OSDUet;
 class OSDOfi;
 class OSDOobExecutor;
 class OSDMap;
@@ -126,10 +125,6 @@ public:
   /// cuObject RDMA endpoint backing CEPH_OSD_OP_READ_RDMA; null unless
   /// osd_cuobj_enabled and the RDMA session came up
   OSDCuObj* cuobj = nullptr;
-#endif
-#ifdef WITH_OSD_UET
-  /// UET delivery endpoint; null unless osd_uet_enabled and it came up
-  OSDUet* uet = nullptr;
 #endif
 #ifdef WITH_OOB_OFI
   /// libfabric delivery endpoint; null unless osd_ofi_enabled and it came up

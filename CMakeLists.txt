@@ -598,19 +598,10 @@ if(WITH_OSD_CUOBJ)
   # when WITH_RDMA (the async messenger transport) is disabled
   find_package(verbs REQUIRED)
 endif()
-# mock-up: OSD-direct read delivery over Ultra Ethernet Transport through
-# the UEC reference provider (github.com/ultraethernet/uet-ref-prov),
-# built out of tree; UET_REF_PROV_DIR is its checkout with libuet_fabric.so
-option(WITH_OSD_UET "OSD out-of-band read delivery over UET (uet-ref-prov)" OFF)
-if(WITH_OSD_UET)
-  set(UET_REF_PROV_DIR "" CACHE PATH "uet-ref-prov checkout, built")
-  find_library(UET_FABRIC_LIBRARY uet_fabric PATHS ${UET_REF_PROV_DIR}
-    NO_DEFAULT_PATH REQUIRED)
-  find_library(FABRIC_LIBRARY fabric REQUIRED)
-endif()
 # out-of-band delivery over libfabric: one transport for the OSD
 # executor, EC gather windows and the gateway's relay window, on any
-# provider (tcp, shm, verbs, efa, a UET provider)
+# provider (tcp, shm, verbs, efa, a UET provider such as the UEC
+# reference provider's libfabric wrapper)
 option(WITH_OOB_OFI "out-of-band delivery over libfabric" OFF)
 if(WITH_OOB_OFI)
   find_path(FABRIC_INCLUDE_DIR rdma/fabric.h REQUIRED)

@@ -68,13 +68,6 @@ endif()
 if(WITH_OSD_CUOBJ)
   list(APPEND osd_srcs osd_cuobj.cc osd_dc_target.cc)
 endif()
-if(WITH_OSD_UET)
-  list(APPEND osd_srcs osd_uet.cc uet_shim.c)
-  # the provider's headers, and the libfabric headers it vendors, only
-  # for the C shim that includes them
-  set_source_files_properties(uet_shim.c PROPERTIES INCLUDE_DIRECTORIES
-    "${UET_REF_PROV_DIR};${UET_REF_PROV_DIR}/util;${UET_REF_PROV_DIR}/imp_shim;${UET_REF_PROV_DIR}/nic_shim;${UET_REF_PROV_DIR}/crypto;${UET_REF_PROV_DIR}/libfabric_headers;${UET_REF_PROV_DIR}/libfabric_headers/include")
-endif()
 if(WITH_OOB_OFI)
   list(APPEND osd_srcs osd_ofi.cc)
 endif()
@@ -86,9 +79,6 @@ target_link_libraries(osd
     os heap_profiler cpu_profiler ${FMT_LIB} ${CMAKE_DL_LIBS})
 if(WITH_OSD_CUOBJ)
   target_link_libraries(osd PRIVATE ${CUOBJSERVER_LIBRARY} IBVerbs::verbs)
-endif()
-if(WITH_OSD_UET)
-  target_link_libraries(osd PRIVATE ${UET_FABRIC_LIBRARY} ${FABRIC_LIBRARY})
 endif()
 if(WITH_OOB_OFI)
   target_link_libraries(osd PRIVATE ofi_rma)

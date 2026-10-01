@@ -19,10 +19,10 @@ namespace ceph { class Formatter; }
  *
  * The delivery descriptor is opaque to the OSD's op path; each
  * executor recognizes the token shapes it can serve. cuObject tokens
- * name a Dynamically Connected target; UET tokens name a fabric
- * endpoint and a memory key. PrimaryLogPG asks OSDService for the
- * executor that handles a token and falls back to inline delivery
- * when there is none.
+ * name a Dynamically Connected target; libfabric tokens name a
+ * provider, an endpoint and a memory key. PrimaryLogPG asks OSDService
+ * for the executor that handles a token and falls back to inline
+ * delivery when there is none.
  */
 class OSDOobExecutor {
 public:

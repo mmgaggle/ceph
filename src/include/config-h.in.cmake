@@ -160,14 +160,11 @@
 /* define if OSD cuObject RDMA (READ_RDMA pushdown) enabled */
 #cmakedefine WITH_OSD_CUOBJ
 
-/* Define if OSDs can deliver reads over UET (uet-ref-prov mock-up) */
-#cmakedefine WITH_OSD_UET
-
 /* Define if out-of-band delivery over libfabric is built */
 #cmakedefine WITH_OOB_OFI
 
 /* out-of-band read delivery is compiled in when any transport is */
-#if defined(WITH_OSD_CUOBJ) || defined(WITH_OSD_UET) || defined(WITH_OOB_OFI)
+#if defined(WITH_OSD_CUOBJ) || defined(WITH_OOB_OFI)
 #define HAVE_OSD_OOB_DELIVERY 1
 #endif
 

@@ -20,9 +20,11 @@ struct uet_shim {
   uet_ep_handle_t ep;
   struct fid_cq cq;
   uet_cq_handle_t tx_cq, rx_cq;
-  uet_mr_handle_t mr;
+  uet_mr_handle_t mr, win_mr;
   char* buf;
   size_t size;
+  char* win;
+  size_t win_size;
   uint32_t ipv4;
   int npeers;
   uint32_t peer_ip[MAX_PEERS];
@@ -38,15 +40,23 @@ static void eq_err_cb(uet_handle_t h, struct fi_eq_err_entry* e)
   (void)h; (void)e;
 }
 
-struct uet_shim* uet_shim_open(size_t size, int window, char* err,
-                               size_t errlen)
+static char* alloc_region(size_t size)
+{
+  char* p = aligned_alloc(4096, (size + 4095) & ~(size_t)4095);
+  if (p)
+    memset(p, 0, size);
+  return p;
+}
+
+struct uet_shim* uet_shim_open(size_t stage_size, size_t window_size,
+                               char* err, size_t errlen)
 {
   struct uet_shim* s = calloc(1, sizeof(*s));
   struct fi_info* hints = fi_allocinfo();
   struct uet_addr src;
   struct fi_cq_attr cq_attr;
   const char* what = "";
-  int r;
+  int r = -ENOMEM;
 
   if (!s || !hints) {
     snprintf(err, errlen, "out of memory");
@@ -65,26 +75,37 @@ struct uet_shim* uet_shim_open(size_t size, int window, char* err,
     what = "uet_domain"; goto fail;
   }
   s->ipv4 = ((struct uet_addr*)s->info->src_addr)->fa.v4;
-  s->size = size;
-  s->buf = aligned_alloc(4096, (size + 4095) & ~(size_t)4095);
-  if (!s->buf) { r = -ENOMEM; what = "aligned_alloc"; goto fail; }
-  memset(s->buf, 0, size);
   s->info->domain_attr->mr_mode |= FI_MR_PROV_KEY;
-  /* a window is remotely writable; a staging source stays local */
-  if ((r = uet_mr_reg(s->dom, s->buf, size,
-                      window ? (FI_WRITE | FI_REMOTE_WRITE | FI_READ |
-                                FI_REMOTE_READ)
-                             : (FI_WRITE | FI_READ),
-                      window ? UET_MR_KEY_IDEMPOTENT_SAFE : UET_MR_KEY_NONE,
-                      UET_FLAGS_NONE, NULL, &s->mr))) {
-    what = "uet_mr_reg"; goto fail;
+  if (stage_size) {
+    s->size = stage_size;
+    if (!(s->buf = alloc_region(stage_size))) {
+      r = -ENOMEM; what = "staging"; goto fail;
+    }
+    /* a staging source stays local */
+    if ((r = uet_mr_reg(s->dom, s->buf, stage_size, FI_WRITE | FI_READ,
+                        UET_MR_KEY_NONE, UET_FLAGS_NONE, NULL, &s->mr))) {
+      what = "uet_mr_reg (staging)"; goto fail;
+    }
+  }
+  if (window_size) {
+    s->win_size = window_size;
+    if (!(s->win = alloc_region(window_size))) {
+      r = -ENOMEM; what = "window"; goto fail;
+    }
+    if ((r = uet_mr_reg(s->dom, s->win, window_size,
+                        FI_WRITE | FI_REMOTE_WRITE | FI_READ | FI_REMOTE_READ,
+                        UET_MR_KEY_IDEMPOTENT_SAFE, UET_FLAGS_NONE, NULL,
+                        &s->win_mr))) {
+      what = "uet_mr_reg (window)"; goto fail;
+    }
   }
   s->info->tx_attr->size = 64;
   s->info->rx_attr->size = 64;
   if ((r = uet_endpoint(s->dom, s->info, &s->ep_fid, NULL, &s->ep))) {
     what = "uet_endpoint"; goto fail;
   }
-  if ((r = uet_ep_bind_mr(s->ep, s->mr, UET_FLAGS_NONE))) {
+  if ((stage_size && (r = uet_ep_bind_mr(s->ep, s->mr, UET_FLAGS_NONE))) ||
+      (window_size && (r = uet_ep_bind_mr(s->ep, s->win_mr, UET_FLAGS_NONE)))) {
     what = "uet_ep_bind_mr"; goto fail;
   }
   memset(&cq_attr, 0, sizeof(cq_attr));
@@ -96,7 +117,10 @@ struct uet_shim* uet_shim_open(size_t size, int window, char* err,
                           &s->rx_cq))) {
     what = "uet_ep_bind_cq"; goto fail;
   }
-  if ((r = uet_mr_enable(s->mr))) { what = "uet_mr_enable"; goto fail; }
+  if ((stage_size && (r = uet_mr_enable(s->mr))) ||
+      (window_size && (r = uet_mr_enable(s->win_mr)))) {
+    what = "uet_mr_enable"; goto fail;
+  }
   if ((r = uet_ep_enable(s->ep))) { what = "uet_ep_enable"; goto fail; }
   fi_freeinfo(hints);
   return s;
@@ -105,6 +129,7 @@ fail:
   snprintf(err, errlen, "%s: %s", what, fi_strerror(-r));
   fi_freeinfo(hints);
   free(s->buf);
+  free(s->win);
   free(s);
   return NULL;
 }
@@ -115,11 +140,16 @@ void uet_shim_close(struct uet_shim* s)
   uet_ep_close(s->ep);
   uet_finalize(s->h);
   free(s->buf);
+  free(s->win);
   free(s);
 }
 
 char* uet_shim_buffer(struct uet_shim* s) { return s->buf; }
-uint64_t uet_shim_key(struct uet_shim* s) { return uet_mr_key(s->mr); }
+char* uet_shim_window(struct uet_shim* s) { return s->win; }
+uint64_t uet_shim_key(struct uet_shim* s)
+{
+  return s->win ? uet_mr_key(s->win_mr) : 0;
+}
 uint32_t uet_shim_ipv4(struct uet_shim* s) { return s->ipv4; }
 
 int uet_shim_peer(struct uet_shim* s, uint32_t ipv4)

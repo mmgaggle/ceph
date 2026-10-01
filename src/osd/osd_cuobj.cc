@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include "osd_cuobj.h"
+#include "osd/osd_dc_target.h"
 
 #include <cuobjserver.h>
 
@@ -97,7 +98,59 @@ int OSDCuObj::do_init(const std::string& rdma_ip, uint16_t rdma_port)
 
   dout(1) << "initialized with " << m_pool_count << " RDMA buffers of "
 	  << buf_size << " bytes" << dendl;
+
+  if (m_cct->_conf.get_val<bool>("osd_oob_gather")) {
+    // a DC target so peers can push their shard reads into this OSD
+    // when it gathers an erasure-coded read
+    m_win_size = m_cct->_conf.get_val<Option::size_t>("osd_oob_window_size");
+    const auto count = m_cct->_conf.get_val<uint64_t>("osd_oob_window_count");
+    auto dct = std::make_unique<OSDDcTarget>();
+    if (m_win_size && count &&
+	dct->open(m_cct, rdma_ip, m_win_size * count, dc_key) == 0) {
+      m_dct = std::move(dct);
+      m_win_slots.resize(count);
+    } else {
+      derr << "WARNING: no DC target for gather windows; peers will reply "
+	   << "inline" << dendl;
+    }
+  }
   return 0;
+}
+
+std::optional<OSDOobExecutor::window_t> OSDCuObj::acquire_window(size_t size)
+{
+  if (!m_dct || size > m_win_size) {
+    return std::nullopt;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard l(m_win_mtx);
+  for (size_t i = 0; i < m_win_slots.size(); i++) {
+    auto& slot = m_win_slots[i];
+    if (slot.in_use || now < slot.quarantined_until) {
+      continue;
+    }
+    slot.in_use = true;
+    window_t w;
+    w.id = i;
+    w.ptr = m_dct->pool() + i * m_win_size;
+    w.size = m_win_size;
+    w.token = m_dct->token(i * m_win_size, m_win_size);
+    return w;
+  }
+  return std::nullopt;
+}
+
+void OSDCuObj::release_window(uint64_t id, uint64_t quarantine_ms)
+{
+  std::lock_guard l(m_win_mtx);
+  if (id >= m_win_slots.size()) {
+    return;
+  }
+  m_win_slots[id].in_use = false;
+  if (quarantine_ms) {
+    m_win_slots[id].quarantined_until = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(quarantine_ms);
+  }
 }
 
 void OSDCuObj::do_shutdown()

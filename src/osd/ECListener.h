@@ -26,8 +26,22 @@
 // ECListener -- an interface decoupling the pipelines from
 // particular implementation of ECBackendL (crimson vs cassical).
 // https://stackoverflow.com/q/7872958
+class OSDOobExecutor;
+
 struct ECListener {
   virtual ~ECListener() = default;
+
+  /// the out-of-band executor that serves a delivery token; a shard
+  /// uses it to push its part of a gather into the primary's window
+  virtual OSDOobExecutor* oob_executor_for(const std::string& token) {
+    return nullptr;
+  }
+  /// the executor that lends receive windows for gathers, when the
+  /// primary gathers shard reads out of band; null otherwise
+  virtual OSDOobExecutor* oob_gather_executor() {
+    return nullptr;
+  }
+
   virtual const OSDMapRef& pgb_get_osdmap() const = 0;
   virtual epoch_t pgb_get_osdmap_epoch() const = 0;
   virtual const pg_info_t &get_info() const = 0;

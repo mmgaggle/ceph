@@ -569,6 +569,24 @@ OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
   return nullptr;
 }
 
+OSDOobExecutor* OSDService::oob_gather_executor() const
+{
+  if (!cct->_conf.get_val<bool>("osd_oob_gather")) {
+    return nullptr;
+  }
+#ifdef WITH_OSD_UET
+  if (uet) {
+    return uet;
+  }
+#endif
+#ifdef WITH_OSD_CUOBJ
+  if (cuobj) {
+    return cuobj;
+  }
+#endif
+  return nullptr;
+}
+
 bool OSDService::has_oob_executor() const
 {
   bool any = false;

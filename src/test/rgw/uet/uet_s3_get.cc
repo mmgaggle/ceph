@@ -87,12 +87,12 @@ int main(int argc, char** argv)
   // the window: a region the OSDs may write, idempotent-safe so writes
   // can use RUDI; no peer is ever inserted
   char err[256] = "";
-  uet_shim* shim = uet_shim_open(size, 1, err, sizeof(err));
+  uet_shim* shim = uet_shim_open(0, size, err, sizeof(err));
   if (!shim) {
     std::fprintf(stderr, "uet window: %s\n", err);
     return 1;
   }
-  char* window = uet_shim_buffer(shim);
+  char* window = uet_shim_window(shim);
 
   char ip[INET_ADDRSTRLEN];
   struct in_addr a;

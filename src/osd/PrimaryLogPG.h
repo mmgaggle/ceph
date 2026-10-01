@@ -1996,6 +1996,10 @@ public:
   bool check_failsafe_full() override;
   bool maybe_preempt_replica_scrub(const hobject_t& oid) override;
   struct ECListener *get_eclistener() override;
+#ifdef HAVE_OSD_OOB_DELIVERY
+  OSDOobExecutor* oob_executor_for(const std::string& token) override;
+  OSDOobExecutor* oob_gather_executor() override;
+#endif
   const pg_missing_const_i * maybe_get_shard_missing(
     pg_shard_t peer) const {
     if (peer == primary_shard()) {

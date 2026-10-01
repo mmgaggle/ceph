@@ -4,9 +4,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "include/buffer.h"
 #include "include/common_fwd.h"
@@ -17,6 +20,7 @@ namespace ceph { class Formatter; }
 
 struct rdma_buffer;
 class cuObjServer;
+class OSDDcTarget;
 
 /**
  * Per-OSD cuObject RDMA endpoint backing CEPH_OSD_OP_READ_RDMA.
@@ -74,6 +78,11 @@ public:
   /// asok/debug counters
   void dump_stats(ceph::Formatter* f) const override;
 
+  /// gather windows: slots of a pool behind a DC target on this OSD, so
+  /// peers' cuObject servers can push shard reads here (osd_oob_gather)
+  std::optional<window_t> acquire_window(size_t size) override;
+  void release_window(uint64_t id, uint64_t quarantine_ms) override;
+
 private:
   struct BufEntry {
     void* ptr = nullptr;
@@ -97,6 +106,15 @@ private:
 
   CephContext* m_cct;
   std::unique_ptr<cuObjServer> m_server;
+
+  struct WindowSlot {
+    bool in_use = false;
+    std::chrono::steady_clock::time_point quarantined_until{};
+  };
+  std::unique_ptr<OSDDcTarget> m_dct;
+  std::mutex m_win_mtx;
+  std::vector<WindowSlot> m_win_slots;
+  size_t m_win_size = 0;
   std::unique_ptr<BufEntry[]> m_pool;
   size_t m_pool_count = 0;
   size_t m_buf_size = 0;

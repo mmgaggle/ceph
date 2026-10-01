@@ -522,6 +522,10 @@ void ECCommon::ReadPipeline::start_read_op(
   do_read_op(op);
 }
 
+/// transport drain bound added to the delivery lease when a gather
+/// window may still receive a late push
+static constexpr uint64_t GATHER_DRAIN_MS = 3000;
+
 void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
   const int priority = rop.priority;
   const ceph_tid_t tid = rop.tid;
@@ -594,10 +598,38 @@ void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
   std::pair<int, int> subchunk_info =
     std::make_pair(ec_impl->get_sub_chunk_count(),
       sinfo.get_chunk_size() / ec_impl->get_sub_chunk_count());
+  // a client read may have its peer shards push their data into windows
+  // of this OSD's memory instead of returning it in the reply
+  OSDOobExecutor* gather_exec =
+    rop.for_recovery ? nullptr : get_parent()->oob_gather_executor();
+  if (gather_exec) {
+    rop.gather.exec = gather_exec;
+    rop.gather.quarantine_ms = static_cast<uint64_t>(
+      get_parent()->get_pool().get_rdma_delivery_lease() * 1000.0) +
+      GATHER_DRAIN_MS;
+  }
   for (auto &&[pg_shard, read]: messages) {
     rop.in_progress.insert(pg_shard);
     shard_to_read_map[pg_shard].insert(rop.tid);
     read.tid = tid;
+    read.push_token.clear();
+    // our own shard is read through a message to ourselves; there is
+    // nothing to gain pushing it back to this OSD
+    if (gather_exec && pg_shard != get_parent()->whoami_shard() &&
+	!rop.gather.find(pg_shard)) {
+      uint64_t bytes = 0;
+      for (auto& [hoid, extents] : read.to_read) {
+	for (auto& e : extents) {
+	  bytes += e.get<1>();
+	}
+      }
+      if (bytes > 0) {
+	if (auto w = gather_exec->acquire_window(bytes); w) {
+	  read.push_token = w->token;
+	  rop.gather.windows.emplace(pg_shard, std::move(*w));
+	}
+      }
+    }
 #ifdef WITH_CRIMSON // crimson only
     if (pg_shard == get_parent()->whoami_shard()) {
       local_read_op = std::move(read);

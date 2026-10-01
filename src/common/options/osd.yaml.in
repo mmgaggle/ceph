@@ -1665,6 +1665,37 @@ options:
   default: 5000
   services:
   - osd
+- name: osd_oob_gather
+  type: bool
+  level: dev
+  desc: When this OSD is the primary of an erasure-coded read, have each peer
+    shard push its data into a window of this OSD's memory over the
+    out-of-band transport instead of returning it in the sub-read reply.
+    Peers that cannot push reply inline as before.
+  default: false
+  services:
+  - osd
+- name: osd_oob_window_size
+  type: size
+  level: dev
+  desc: Size of each registered window peers push shard reads into when this
+    OSD gathers an erasure-coded read out of band (osd_oob_gather); a shard
+    read larger than a window is returned inline
+  default: 8_M
+  services:
+  - osd
+  flags:
+  - startup
+- name: osd_oob_window_count
+  type: uint
+  level: dev
+  desc: Number of gather windows; a gather that finds none free reads its
+    shards inline
+  default: 16
+  services:
+  - osd
+  flags:
+  - startup
 - name: osd_uet_buffer_size
   type: size
   level: dev

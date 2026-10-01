@@ -14,6 +14,7 @@
  */
 
 #include "ECBackend.h"
+#include "osd/oob_placement.h"
 
 #include <iostream>
 
@@ -734,6 +735,44 @@ void ECBackend::handle_sub_read(
 
   reply->from = get_parent()->whoami_shard();
   reply->tid = op.tid;
+
+  if (!op.push_token.empty()) {
+    push_sub_read(op, reply);
+  }
+}
+
+void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply)
+{
+  // the primary lent us a window: place everything read there, back to
+  // back in reply order, and return only the extents. Any refusal or
+  // failure leaves the reply as it is, with the data inline.
+  OSDOobExecutor* exec =
+    get_parent()->get_eclistener()->oob_executor_for(op.push_token);
+  if (!exec || reply->buffers_read.empty()) {
+    return;
+  }
+  bufferlist all;
+  std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
+  for (auto &&[hoid, extents] : reply->buffers_read) {
+    for (auto &&[offset, bl] : extents) {
+      pushed[hoid].emplace_back(offset, bl.length());
+      all.append(bl);
+    }
+  }
+  if (all.length() == 0) {
+    return;
+  }
+  auto plan = ceph::osd::oob::linear_plan(0, all.length());
+  ssize_t r = exec->execute_plan("ec gather", op.push_token, all, plan);
+  if (r != static_cast<ssize_t>(all.length())) {
+    dout(10) << __func__ << ": push to the primary failed (" << r
+	     << "), replying inline" << dendl;
+    return;
+  }
+  dout(20) << __func__ << ": pushed " << all.length()
+	   << " bytes to the primary" << dendl;
+  reply->pushed = std::move(pushed);
+  reply->buffers_read.clear();
 }
 
 void ECBackend::handle_sub_read_n_reply(
@@ -791,6 +830,44 @@ void ECBackend::handle_sub_read_reply(
     return;
   }
   ReadOp &rop = iter->second;
+  if (const auto* w = rop.gather.find(from); w) {
+    if (op.pushed.empty()) {
+      // the shard replied inline: a push it attempted may still land
+      rop.gather.release(from, false);
+    } else {
+      // the shard placed its data in our window: rebuild the buffers the
+      // reply would have carried, in the order it placed them
+      rop.gather.exec->window_sync();
+      uint64_t cursor = 0;
+      bool ok = true;
+      for (auto &&[hoid, extents] : op.pushed) {
+	for (auto &&[offset, len] : extents) {
+	  if (cursor + len > w->size) {
+	    ok = false;
+	    break;
+	  }
+	  bufferlist bl;
+	  bl.append(w->ptr + cursor, len);
+	  op.buffers_read[hoid].emplace_back(offset, std::move(bl));
+	  cursor += len;
+	}
+      }
+      dout(20) << __func__ << ": " << cursor << " bytes from shard "
+	       << from << " arrived out of band" << dendl;
+      rop.gather.release(from, ok);
+      if (!ok) {
+	for (auto &&[hoid, extents] : op.pushed) {
+	  op.buffers_read.erase(hoid);
+	  op.errors[hoid] = -EIO;
+	}
+      }
+    }
+  } else if (!op.pushed.empty()) {
+    // pushed data with no window of ours to find it in
+    for (auto &&[hoid, extents] : op.pushed) {
+      op.errors[hoid] = -EIO;
+    }
+  }
   if (cct->_conf->bluestore_debug_inject_read_err) {
     for (auto i = op.buffers_read.begin();
          i != op.buffers_read.end();

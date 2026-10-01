@@ -119,6 +119,11 @@ struct ECSubRead {
   std::map<hobject_t, std::vector<std::pair<int, int>>> subchunks;
   std::set<hobject_t> omap_headers_to_read;
   std::map<hobject_t, std::pair<std::string, uint64_t>> omap_read_from;
+  /// out-of-band delivery token for a gather: push the data read into
+  /// the primary's window it names (in to_read order, back to back)
+  /// instead of returning it; empty for an ordinary sub-read. Advisory:
+  /// a shard that cannot push returns the data inline.
+  std::string push_token;
   /**
     * Calculate the cost of the SubOp read operation for mClock scheduler.
     *
@@ -143,6 +148,10 @@ struct ECSubReadReply {
   std::map<hobject_t, ceph::buffer::list> omap_headers_read;
   std::map<hobject_t, std::map<std::string, ceph::buffer::list>> omap_entries_read;
   std::map<hobject_t, bool> omaps_complete;
+  /// extents (offset, length) whose data was pushed into the primary's
+  /// window rather than carried in buffers_read, in the order they sit
+  /// there back to back
+  std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
   void encode(ceph::buffer::list &bl) const;
   void encode(ceph::buffer::list &p_bl,
 	      ceph::buffer::list &d_pl,

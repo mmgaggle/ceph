@@ -43,6 +43,7 @@ typedef crimson::osd::ObjectContextRef ObjectContextRef;
 #include "ECTransaction.h"
 #include "ECExtentCache.h"
 #include "ECListener.h"
+#include "osd/oob_executor.h"
 #include "common/dout.h"
 
 //forward declaration
@@ -288,6 +289,45 @@ struct ECCommon {
     }
   };
 
+  /**
+   * Windows a primary lent to peer shards for one gather. A shard that
+   * received a window's token may still write into it until the pool's
+   * delivery lease runs out, so a window whose data was not consumed -
+   * the shard replied inline, the read was cancelled or restarted - is
+   * returned with that quarantine.
+   */
+  struct gather_windows_t {
+    OSDOobExecutor* exec = nullptr;
+    uint64_t quarantine_ms = 0;
+    std::map<pg_shard_t, OSDOobExecutor::window_t> windows;
+
+    gather_windows_t() = default;
+    gather_windows_t(const gather_windows_t&) = delete;
+    gather_windows_t(gather_windows_t&& o) noexcept
+      : exec(o.exec), quarantine_ms(o.quarantine_ms),
+	windows(std::move(o.windows)) {
+      o.windows.clear();
+    }
+    ~gather_windows_t() {
+      for (auto& [shard, w] : windows) {
+	exec->release_window(w.id, quarantine_ms);
+      }
+    }
+    /// the window lent to shard, or null
+    const OSDOobExecutor::window_t* find(pg_shard_t shard) const {
+      auto it = windows.find(shard);
+      return it == windows.end() ? nullptr : &it->second;
+    }
+    /// return shard's window; clean when its data was consumed
+    void release(pg_shard_t shard, bool clean) {
+      auto it = windows.find(shard);
+      if (it != windows.end()) {
+	exec->release_window(it->second.id, clean ? 0 : quarantine_ms);
+	windows.erase(it);
+      }
+    }
+  };
+
   struct ReadOp {
     int priority;
     ceph_tid_t tid;
@@ -314,6 +354,9 @@ struct ECCommon {
     std::set<pg_shard_t> in_progress;
 
     std::list<ECUtil::log_entry_t> debug_log;
+
+    /// windows peer shards push their reads into (osd_oob_gather)
+    gather_windows_t gather;
 
     ReadOp(
         int priority,

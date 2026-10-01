@@ -69,6 +69,9 @@ public:
 		       const ceph::buffer::list& data,
 		       const ceph::osd::oob::placement_plan& plan) override;
   void dump_stats(ceph::Formatter* f) const override;
+  std::optional<window_t> acquire_window(size_t size) override;
+  void release_window(uint64_t id, uint64_t quarantine_ms) override;
+  void window_sync() override;
 
 private:
   struct Impl;
@@ -80,4 +83,6 @@ private:
   std::atomic<uint64_t> plans_failed{0};
   std::atomic<uint64_t> bytes_pushed{0};
   std::atomic<uint64_t> writes_posted{0};
+  std::atomic<uint64_t> windows_acquired{0};
+  std::atomic<uint64_t> windows_exhausted{0};
 };

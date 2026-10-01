@@ -135,6 +135,8 @@ public:
   OSDOobExecutor* oob_executor_for(const std::string& token) const;
   /// true when any out-of-band transport is up
   bool has_oob_executor() const;
+  /// the executor lending windows for EC gathers (osd_oob_gather), or null
+  OSDOobExecutor* oob_gather_executor() const;
 #endif
 
   void enqueue_back(OpSchedulerItem&& qi);

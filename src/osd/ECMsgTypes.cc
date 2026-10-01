@@ -221,7 +221,9 @@ void ECSubRead::encode(bufferlist &bl, uint64_t features) const
     return;
   }
 
-  ENCODE_START(4, 2, bl);
+  // compat stays below the version: decode reads subchunks only when
+  // struct_v > struct_compat
+  ENCODE_START(5, 2, bl);
   encode(from, bl);
   encode(tid, bl);
   encode(to_read, bl);
@@ -229,12 +231,13 @@ void ECSubRead::encode(bufferlist &bl, uint64_t features) const
   encode(subchunks, bl);
   encode(omap_read_from, bl);
   encode(omap_headers_to_read, bl);
+  encode(push_token, bl);  // v5
   ENCODE_FINISH(bl);
 }
 
 void ECSubRead::decode(bufferlist::const_iterator &bl)
 {
-  DECODE_START(4, bl);
+  DECODE_START(5, bl);
   decode(from, bl);
   decode(tid, bl);
   if (struct_v == 1) {
@@ -264,6 +267,11 @@ void ECSubRead::decode(bufferlist::const_iterator &bl)
   } else {
     omap_read_from.clear();
     omap_headers_to_read.clear();
+  }
+  if (struct_v >= 5) {
+    decode(push_token, bl);
+  } else {
+    push_token.clear();
   }
   DECODE_FINISH(bl);
 }
@@ -412,7 +420,9 @@ void ECSubReadReply::encode(bufferlist &p_bl,
 			    bufferlist &d_bl,
 			    uint64_t features) const
 {
-  uint8_t ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 3 : 1;
+  // only a primary that sent a push token reads pushed, and such a
+  // primary is new enough to decode v4
+  uint8_t ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 4 : 1;
   uint8_t compat_ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 2 : 1;
   ENCODE_START(ver, compat_ver, p_bl);
   encode(from, p_bl);
@@ -443,6 +453,9 @@ void ECSubReadReply::encode(bufferlist &p_bl,
     encode(omap_entries_read, p_bl);
     encode(omaps_complete, p_bl);
   }
+  if (ver >= 4) {
+    encode(pushed, p_bl);
+  }
   ENCODE_FINISH(p_bl);
 }
 
@@ -454,7 +467,7 @@ void ECSubReadReply::decode(bufferlist::const_iterator &bl)
 void ECSubReadReply::decode(bufferlist::const_iterator &p_bl,
 			    bufferlist::const_iterator &d_bl)
 {
-  DECODE_START(3, p_bl);
+  DECODE_START(4, p_bl);
   decode(from, p_bl);
   decode(tid, p_bl);
   if (struct_v < 2) {
@@ -494,6 +507,11 @@ void ECSubReadReply::decode(bufferlist::const_iterator &p_bl,
     omap_headers_read.clear();
     omap_entries_read.clear();
     omaps_complete.clear();
+  }
+  if (struct_v >= 4) {
+    decode(pushed, p_bl);
+  } else {
+    pushed.clear();
   }
 
   DECODE_FINISH(p_bl);

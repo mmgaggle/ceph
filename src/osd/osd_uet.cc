@@ -9,6 +9,8 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 #include "common/ceph_context.h"
 #include "common/config.h"
@@ -81,6 +83,20 @@ struct OSDUet::Impl {
   uet_shim* shim = nullptr;
   std::chrono::milliseconds op_timeout{5000};
 
+  /// receive pool, carved into fixed windows peers push into
+  struct slot_t {
+    bool in_use = false;
+    std::chrono::steady_clock::time_point quarantined_until{};
+  };
+  std::mutex win_mtx;
+  std::vector<slot_t> slots;
+  size_t slot_size = 0;
+  std::string ip;  ///< this OSD's fabric endpoint, dotted
+
+  /// a software provider places incoming data only while polled
+  std::thread progress;
+  std::atomic<bool> stopping{false};
+
   int wait_writes(uint64_t count);
 };
 
@@ -109,6 +125,10 @@ OSDUet::OSDUet(CephContext* cct) : impl(std::make_unique<Impl>()), cct(cct) {}
 
 OSDUet::~OSDUet()
 {
+  impl->stopping = true;
+  if (impl->progress.joinable()) {
+    impl->progress.join();
+  }
   uet_shim_close(impl->shim);
 }
 
@@ -132,14 +152,90 @@ int OSDUet::init()
 
   char err[256] = "";
   const size_t stage = cct->_conf.get_val<Option::size_t>("osd_uet_buffer_size");
-  d.shim = uet_shim_open(stage, 0, err, sizeof(err));
+  d.slot_size = cct->_conf.get_val<Option::size_t>("osd_oob_window_size");
+  const size_t nslots = cct->_conf.get_val<uint64_t>("osd_oob_window_count");
+  d.shim = uet_shim_open(stage, d.slot_size * nslots, err, sizeof(err));
   if (!d.shim) {
     derr << "UET endpoint on " << ifname << ": " << err << dendl;
     return -EIO;
   }
-  dout(1) << "UET delivery up on " << ifname << ", staging " << stage
-	  << " bytes" << dendl;
+  d.slots.resize(d.slot_size ? nslots : 0);
+  in_addr a;
+  a.s_addr = htonl(uet_shim_ipv4(d.shim));
+  char ip[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &a, ip, sizeof(ip));
+  d.ip = ip;
+  if (!d.slots.empty()) {
+    // peers push into our windows while no op of ours is polling
+    d.progress = std::thread([&d] {
+      while (!d.stopping) {
+	{
+	  std::lock_guard l(d.mtx);
+	  for (int i = 0; i < 16; i++) {
+	    uet_shim_poll_rx(d.shim);
+	  }
+	}
+	std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+    });
+  }
+  dout(1) << "UET delivery up on " << ifname << " (" << d.ip << "), staging "
+	  << stage << " bytes, " << d.slots.size() << " windows of "
+	  << d.slot_size << " bytes" << dendl;
   return 0;
+}
+
+std::optional<OSDOobExecutor::window_t> OSDUet::acquire_window(size_t size)
+{
+  auto& d = *impl;
+  if (!d.shim || size > d.slot_size) {
+    return std::nullopt;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard l(d.win_mtx);
+  for (size_t i = 0; i < d.slots.size(); i++) {
+    auto& slot = d.slots[i];
+    if (slot.in_use || now < slot.quarantined_until) {
+      continue;
+    }
+    slot.in_use = true;
+    windows_acquired++;
+    window_t w;
+    w.id = i;
+    w.ptr = uet_shim_window(d.shim) + i * d.slot_size;
+    w.size = d.slot_size;
+    // the window pool is zero-based, so a window's base is its offset
+    char tok[160];
+    snprintf(tok, sizeof(tok), "%zx:%zx:uet1:%s:%llx", i * d.slot_size,
+	     d.slot_size, d.ip.c_str(),
+	     static_cast<unsigned long long>(uet_shim_key(d.shim)));
+    w.token = tok;
+    return w;
+  }
+  windows_exhausted++;
+  return std::nullopt;
+}
+
+void OSDUet::window_sync()
+{
+  // the provider places incoming data with this mutex held (progress
+  // thread or a polling op); taking it orders our reads after those
+  // writes
+  std::lock_guard l(impl->mtx);
+}
+
+void OSDUet::release_window(uint64_t id, uint64_t quarantine_ms)
+{
+  auto& d = *impl;
+  std::lock_guard l(d.win_mtx);
+  if (id >= d.slots.size()) {
+    return;
+  }
+  d.slots[id].in_use = false;
+  if (quarantine_ms) {
+    d.slots[id].quarantined_until = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(quarantine_ms);
+  }
 }
 
 bool OSDUet::is_available() const
@@ -239,4 +335,6 @@ void OSDUet::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("plans_failed", plans_failed);
   f->dump_unsigned("bytes_pushed", bytes_pushed);
   f->dump_unsigned("writes_posted", writes_posted);
+  f->dump_unsigned("windows_acquired", windows_acquired);
+  f->dump_unsigned("windows_exhausted", windows_exhausted);
 }

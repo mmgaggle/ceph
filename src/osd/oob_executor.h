@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <sys/types.h>
 
@@ -47,4 +48,39 @@ public:
 
   /// asok/debug counters
   virtual void dump_stats(ceph::Formatter* f) const = 0;
+
+  /**
+   * A registered region of this OSD's memory that peers can push into,
+   * named by a token of this executor's transport. A primary gathering
+   * shard reads hands the token to each shard in its sub-read, and the
+   * shards place their data here instead of sending it in the reply.
+   */
+  struct window_t {
+    uint64_t id = 0;
+    char* ptr = nullptr;
+    size_t size = 0;
+    std::string token;
+  };
+
+  /// a window of at least size bytes, or nullopt when the transport
+  /// cannot receive or none is free
+  virtual std::optional<window_t> acquire_window(size_t size) {
+    return std::nullopt;
+  }
+
+  /**
+   * Return a window. quarantine_ms keeps it out of use that long: after
+   * a gather that did not finish cleanly, a peer that received the
+   * token may still write into it until the pool's delivery lease runs
+   * out.
+   */
+  virtual void release_window(uint64_t id, uint64_t quarantine_ms) {}
+
+  /**
+   * Order the caller's reads of window memory after the transport's
+   * writes to it. A software transport places data from its own
+   * thread; a gather reads the window from the op thread that handled
+   * the shard's reply, and nothing else orders the two.
+   */
+  virtual void window_sync() {}
 };

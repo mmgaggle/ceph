@@ -16506,6 +16506,18 @@ struct ECListener *PrimaryLogPG::get_eclistener()
   return this;
 }
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+OSDOobExecutor* PrimaryLogPG::oob_executor_for(const std::string& token)
+{
+  return osd->oob_executor_for(token);
+}
+
+OSDOobExecutor* PrimaryLogPG::oob_gather_executor()
+{
+  return osd->oob_gather_executor();
+}
+#endif
+
 void intrusive_ptr_add_ref(PrimaryLogPG *pg) { pg->get("intptr"); }
 void intrusive_ptr_release(PrimaryLogPG *pg) { pg->put("intptr"); }
 

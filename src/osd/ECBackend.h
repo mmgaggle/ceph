@@ -84,6 +84,10 @@ class ECBackend : public ECCommon {
       ECSubReadReply *reply,
       const ZTracer::Trace &trace
     );
+  /// push a sub-read's data into the primary's gather window (the
+  /// op's push_token), returning only extents in the reply
+  void push_sub_read(const ECSubRead &op, ECSubReadReply *reply);
+
   void handle_sub_read_n_reply(
     pg_shard_t from,
     ECSubRead &op,

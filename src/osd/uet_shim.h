@@ -16,18 +16,20 @@ extern "C" {
 struct uet_shim;
 
 /*
- * Open an endpoint on the interface named by UET_IFNAME with one
- * registered region of `size` bytes. `window` makes the region a
- * remotely writable, idempotent-safe target (a client window);
- * otherwise it is a local staging source. Returns NULL and fills err
- * on failure.
+ * Open an endpoint on the interface named by UET_IFNAME with up to two
+ * registered regions: a local staging source of stage_size bytes that
+ * writes are sent from, and a window of window_size bytes that peers
+ * may write into (remotely writable, idempotent-safe, zero-based, so
+ * peers address it by offset). Either size may be 0. Returns NULL and
+ * fills err on failure.
  */
-struct uet_shim* uet_shim_open(size_t size, int window, char* err,
-                               size_t errlen);
+struct uet_shim* uet_shim_open(size_t stage_size, size_t window_size,
+                               char* err, size_t errlen);
 void uet_shim_close(struct uet_shim* s);
 
-char* uet_shim_buffer(struct uet_shim* s);
-uint64_t uet_shim_key(struct uet_shim* s);
+char* uet_shim_buffer(struct uet_shim* s);   /* staging source */
+char* uet_shim_window(struct uet_shim* s);   /* writable by peers */
+uint64_t uet_shim_key(struct uet_shim* s);   /* the window's key */
 uint32_t uet_shim_ipv4(struct uet_shim* s);  /* host byte order */
 
 /* index of the peer at ipv4 (inserted and cached on first use), or a

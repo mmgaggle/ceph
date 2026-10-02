@@ -362,7 +362,10 @@ public:
     }
 
     for (const auto& group_id : info.group_ids) {
-      if (old_info && old_info->group_ids.count(group_id)) {
+      // a group's member entries are keyed by display name, so a renamed
+      // user's entries move to its new name
+      if (old_info && old_info->group_ids.count(group_id) &&
+          old_info->display_name == info.display_name) {
         continue;
       }
       // link the user to its group
@@ -441,7 +444,8 @@ public:
     }
 
     for (const auto& group_id : old_info.group_ids) {
-      if (info.group_ids.count(group_id)) {
+      if (info.group_ids.count(group_id) &&
+          old_info.display_name == info.display_name) {
         continue;
       }
       // remove from the old group

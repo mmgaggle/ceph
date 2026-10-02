@@ -39,12 +39,12 @@ type tCfg = (
   // environment
   watchDrops: int,          // how many times the OSD may drop a live client's watch (a watch
                             // timeout: the client learns of it later and re-watches)
-  requestRetries: int       // how many times a waiting acquirer re-sends its lock request
-                            // after the owner answered 0 (the 10 s retry timer)
+  crashes: int              // how many times each client may die, at any step; its lock
+                            // entry stays until a peer breaks it, and its watches lapse
 );
 
 enum tRc { OK, EBUSY, EAGAIN, ENOENT, EEXIST, EROFS, EBLOCKLISTED, EINVAL, ESTALE, ETIMEDOUT,
-           ERESTART, EOPNOTSUPP }
+           ERESTART, EOPNOTSUPP, ENOTEMPTY }
 
 // a cls_lock entry on a header: the holder's entity (the client) and cookie
 // (its watch handle); addr is the client too
@@ -103,7 +103,7 @@ fun Op(kind: tOpKind, image: int, tag: int): tOp {
 enum tNotifyKind { N_ACQUIRED_LOCK, N_RELEASED_LOCK, N_REQUEST_LOCK, N_HEADER_UPDATE,
                    N_ASYNC_REQUEST, N_ASYNC_COMPLETE }
 enum tReqKind { R_WRITE, R_SNAP_CREATE, R_SNAP_REMOVE, R_SNAP_PROTECT, R_SNAP_UNPROTECT, R_CLONE,
-                R_FLATTEN, R_RELEASE_LOCK, R_ACQUIRE_LOCK, R_READ_CHILD }
+                R_FLATTEN, R_RELEASE_LOCK, R_ACQUIRE_LOCK, R_READ_CHILD, R_REMOVE_IMAGE }
 type tNotify = (kind: tNotifyKind, from: int, req: tReqKind, asyncId: int, snapName: int, result: tRc);
 // an ack: empty means the watcher sent no payload
 type tAck = (empty: bool, result: tRc);
@@ -122,6 +122,8 @@ fun Clone(name: int, child: int): tAction { return (kind = R_CLONE, obj = 0, sna
 fun Flatten(): tAction { return (kind = R_FLATTEN, obj = 0, snapName = 0, child = 0); }
 fun ReleaseLock(): tAction { return (kind = R_RELEASE_LOCK, obj = 0, snapName = 0, child = 0); }
 fun AcquireLock(): tAction { return (kind = R_ACQUIRE_LOCK, obj = 0, snapName = 0, child = 0); }
+// remove the client's image (rbd rm: PreRemoveRequest, RemoveRequest)
+fun RemoveImage(): tAction { return (kind = R_REMOVE_IMAGE, obj = 0, snapName = 0, child = 0); }
 
 // a client's script: the image it opens, and its actions in order
 type tScript = (image: int, actions: seq[tAction]);
@@ -176,6 +178,16 @@ event eWatchError: (image: int, rc: tRc);
 // a client's own request timer (rbd_request_timed_out_seconds): the
 // generation of the request it was armed for
 event eRequestTimer: int;
+// a client's own retry timer for its lock request (schedule_request_lock)
+event eLockRetryTimer: int;
+// a client died: client -> store (its watches lapse), client -> driver
+// (its remaining actions will not be answered)
+event eCrash: int;
+event eCrashed: (client: int, remaining: int);
+// driver -> client: every action is answered; answer once nothing is in
+// flight (an op run for a peer, a write, a lock action)
+event eDrain: machine;
+event eDrained: int;
 // driver
 event eActionDone: (client: int, rc: tRc);
 event eQuiesce: machine;
@@ -192,8 +204,9 @@ event mSnapCreated: (image: int, snap: int, view: map[int, int]);
 event mSnapView: (image: int, snap: int, obj: int, val: int);
 // snapshot snap of image removed from its header, and the parent links
 // (a child's head, snap 0, or one of its snapshots) that still name it
+// from a child that still needs it: one with an object not yet its own
 event mSnapRemoved: (image: int, snap: int, refs: set[tParent]);
-// an image removed, and the parent links that still name a snapshot of it
+// an image removed, and such parent links to a snapshot of it
 event mImageRemoved: (image: int, refs: set[tParent]);
 // a child read an object from its parent (flatten, or a read through)
 event mParentRead: (child: int, obj: int, rc: tRc);
@@ -206,6 +219,11 @@ event mParentSet: (child: int, parent: tParent);
 // an image created or removed
 event mImage: (image: int, present: bool);
 event mActionStarted: (client: int, kind: tReqKind, asyncId: int);
+// a client died, with an action running or not
+event mCrashed: (client: int, running: bool);
+// a remove of snapshot snap of image began (snapshot_trash_add succeeded)
+event mSnapRemoveStarted: (image: int, snap: int);
 event mActionDone: (client: int, kind: tReqKind, asyncId: int, rc: tRc);
-// at the end: the pool's snapshot ids, and every header's
-event mFinal: (poolSnaps: set[int], headerSnaps: set[int]);
+// at the end: the pool's snapshot ids, every header's, and the parent
+// links (child image, child snap) that name a snapshot that is gone
+event mFinal: (poolSnaps: set[int], headerSnaps: set[int], dangling: set[tParent]);

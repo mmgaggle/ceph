@@ -8,8 +8,10 @@ tcThreeWriters                     holds
 tcCreateViaOwnerSafe               holds
 tcCreateViaOwnerAnswer             violated EEXIST
 tcCreateViaOwnerLostWatchSafe      holds
-tcCreateViaOwnerLostWatchSnap      violated shows
-tcCreateViaOwnerLostWatchRefresh   holds
+tcCreateViaOwnerLostWatchAnswer    violated EEXIST
+tcOwnerLostWatchStale              violated shows
+tcOwnerLostWatchSafe               holds
+tcOwnerLostWatchRefresh            holds
 tcSnapCreateNoLock                 violated shows
 tcTwoCreatesNoLock                 violated leaked
 tcCreateOwnerChangeAnswer            violated EEXIST
@@ -25,4 +27,23 @@ tcCloneV1VsProtectRaceJournaling holds
 tcCloneV1VsProtectRaceCas     holds
 tcFlattenVsRemove                  holds
 tcChildReadVsRemove                holds
-tcFlattenVsChildSnapNoLock         violated was removed while child
+tcFlattenVsChildSnapNoLock         violated still names a parent snapshot
+
+# crashes
+tcWritersCrash                     holds
+tcOwnerCrashStale             violated shows
+tcOwnerCrashSafe         holds
+tcOwnerCrashRefresh      holds
+tcCreateViaOwnerCrashSafe              holds
+tcCreateViaOwnerCrashStale          violated shows
+tcFlattenCrashParent               violated still names a parent snapshot
+tcFlattenCrashReads                 holds
+tcCloneV1Crash                     holds
+
+# image removal
+tcRemoveVsClone                    violated was removed while child
+tcRemoveVsCloneNoLock              violated was removed while child
+tcRemoveParentVsFlatten            holds
+
+# two children
+tcTwoChildren                      holds

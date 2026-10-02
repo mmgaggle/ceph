@@ -23,7 +23,10 @@ Any later read at the snapshot answers that data.
 
 **ChildHasParent.** A parent snapshot is never removed while a child's
 head, or a child's snapshot, still reads through it. Nor is a parent
-image. A child is an image whose clone completed.
+image. A child is an image whose clone completed. A child that has every
+object of its own reads nothing through its parent. But at the end, no
+child's head or snapshot names a parent snapshot that is gone, because
+such a child cannot be opened.
 
 **ParentReadable.** A child always finds its parent's data. Every object
 of the parent was written before the clone, so a read through to the
@@ -79,8 +82,12 @@ Each handler is one atomic op on one object, or one monitor command.
   once each watcher acked it or lost its watch. A lost watcher is a
   missing ack, as the OSD's notify timeout treats it.
 - A watch timeout. The OSD can drop a live client's watch, as many
-  times as the scenario allows. The client learns of it later and
-  re-watches.
+  times as the scenario allows, at an op chosen up front out of 60. The
+  client learns of it later and re-watches.
+- A client's death. If the scenario allows it, a client picks a step at
+  which it dies, out of its first 40. Its watches lapse (the OSD's
+  watch timeout), nothing it had in flight completes, and its lock
+  entry stays until a peer breaks it.
 
 ### `Client`: one ImageCtx
 
@@ -151,23 +158,35 @@ A client runs a script of actions one after another.
   Detach the parent.
 - A read through to the parent (`io::util::read_parent`). If a read of
   a child object answers `-ENOENT`, read the parent at the snapshot.
+- Image removal (`image::PreRemoveRequest`, `image::RemoveRequest`), on
+  this client's image. Acquire the lock, and keep it while removing
+  (`StandardPolicy`). If a snapshot is listed, answer `-ENOTEMPTY`,
+  after removing the trashed ones. If another client watches the
+  header, answer `-EBUSY`. Detach the image from its parent. Check the
+  listed snapshots once more. Close the image: release the lock,
+  unregister the watch. Remove the header.
 
 ### `Driver`
 
 It starts the clients, one per script. Once every action is answered,
-it quiesces the store.
+it waits until no live client has anything in flight (an op run for a
+peer, a write, a lock action), then it quiesces the store.
 
 ### What is not modelled
 
 - Object maps, journals and the image cache. Reads other than the read
   through to the parent. More than one pool.
-- A client crash. A lost watch followed by a blocklist has the same
-  effect on the lock.
+- Image trimming on removal. The data objects stay, so a clone made in
+  the removal's window still finds data.
 - The 600 s expiry of a completed request on the owner. The model folds
   it into one rule. If an owner is asked again for a request it
   completed with 0, it runs the request again. See finding 2. The
   request timer (`rbd_request_timed_out_seconds`) fires once per sent
   request, before or after its completion, as the scheduler decides.
+  The retry timer of a lock request (`schedule_request_lock`) fires
+  once per answer from the owner, likewise.
+- A clone that dies half built. Its image stays in the pool, with a
+  parent link nobody counts. It is not a child for ChildHasParent.
 - A proxied op whose owner dies mid-way. When a child removes a trashed
   parent snapshot, it does not take the parent's lock.
 
@@ -186,8 +205,10 @@ clone v2, no journaling, `rbd_blocklist_on_break_lock` on and
 | `tcCreateViaOwnerSafe` | the owner writes while a peer creates a snapshot through it | WritesFenced, SnapImmutable, NoLeakedSnapIds, AllAnswered | holds |
 | `tcCreateViaOwnerAnswer` | the same | CreateAnswered | violated (finding 2) |
 | `tcCreateViaOwnerLostWatchSafe` | the same, one dropped watch | WritesFenced, NoLeakedSnapIds, AllAnswered | holds |
-| `tcCreateViaOwnerLostWatchSnap` | the same | SnapImmutable | violated (finding 1) |
-| `tcCreateViaOwnerLostWatchRefresh` | the same, with a refresh on every acquire | all of the above | holds |
+| `tcCreateViaOwnerLostWatchAnswer` | the same | CreateAnswered | violated (finding 2) |
+| `tcOwnerLostWatchStale` | the owner takes the lock and creates a snapshot, one dropped watch, a peer writes | SnapImmutable | violated (finding 1) |
+| `tcOwnerLostWatchSafe` | the same | WritesFenced, NoLeakedSnapIds, AllAnswered | holds |
+| `tcOwnerLostWatchRefresh` | the same, with a refresh on every acquire | all of the above | holds |
 | `tcSnapCreateNoLock` | without the exclusive-lock feature | SnapImmutable | violated (finding 4) |
 | `tcTwoCreatesNoLock` | two creates without the feature | NoLeakedSnapIds | violated (finding 4) |
 | `tcCreateOwnerChangeAnswer` | a create through the owner while a third client takes the lock | CreateAnswered | violated (finding 2) |
@@ -204,9 +225,32 @@ clone v2, no journaling, `rbd_blocklist_on_break_lock` on and
 | `tcFlattenVsChildSnapNoLock` | a flatten and a snapshot of the child, no lock, no deep-flatten | ChildHasParent | violated (finding 4) |
 
 `expect.txt` lists each case's expected outcome and a fragment of the
-failure message. `tcCreateViaOwnerAnswer` needs more schedules than the
-others under PCT with depth 3. `deep.sh` finds its counterexample under
-random, PCT with depth 5 and POS in a few thousand schedules each.
+failure message. `tcCreateViaOwnerAnswer` needs more schedules than the others under PCT
+with depth 3. `deep.sh` finds its counterexample under random, PCT with
+depth 5 and POS in a few thousand schedules each.
+
+The crash cases, each with `crashes = 1`:
+
+| Case | Scenario | Properties | Expected |
+|---|---|---|---|
+| `tcWritersCrash` | two writers | WritesFenced, AllAnswered | holds |
+| `tcOwnerCrashStale` | the owner creates a snapshot, a peer writes | SnapImmutable | violated (finding 1) |
+| `tcOwnerCrashSafe` | the same | WritesFenced, AllAnswered | holds |
+| `tcOwnerCrashRefresh` | the same, with a refresh on every acquire | WritesFenced, SnapImmutable, AllAnswered | holds |
+| `tcCreateViaOwnerCrashSafe` | a snapshot through the owner, which may die | WritesFenced, AllAnswered | holds |
+| `tcCreateViaOwnerCrashStale` | the same | SnapImmutable | violated (finding 1) |
+| `tcFlattenCrashParent` | a child flattens, the parent snapshot is removed | ChildHasParent | violated (finding 5) |
+| `tcFlattenCrashReads` | the same | ParentReadable, AllAnswered | holds |
+| `tcCloneV1Crash` | a clone v1, then unprotect and remove | ChildHasParent, AllAnswered | holds |
+
+The image removal and two-children cases:
+
+| Case | Scenario | Properties | Expected |
+|---|---|---|---|
+| `tcRemoveVsClone` | `rbd rm` while a peer creates a snapshot and clones it | ChildHasParent, AllAnswered | violated (finding 6) |
+| `tcRemoveVsCloneNoLock` | the same, without the exclusive-lock feature | ChildHasParent, AllAnswered | violated (finding 6) |
+| `tcRemoveParentVsFlatten` | `rbd rm` of a parent after its snapshot, a child flattens, a third client clones | ChildHasParent, ParentReadable, AllAnswered | holds |
+| `tcTwoChildren` | the snapshot is removed, a child flattens and reads, a second clone | ChildHasParent, ParentReadable, AllAnswered | holds |
 
 ## What the model found
 
@@ -219,22 +263,23 @@ HeaderUpdate notify. The previous owner sends that notify after
 `C_NotifyUpdate` in `Operations.cc:112-152`). If it is fenced in
 between, nobody sends it.
 
-The trace: client 2 owns the lock. The OSD drops its watch. Client 2
-runs a snapshot create: `snapshot_add` commits snapshot 1. Client 1
-tries the lock. The holder has no watcher with its cookie, so it looks
+The trace (`tcOwnerLostWatchStale`): client 2 owns the lock. The OSD
+drops its watch. Client 2 runs a snapshot create: `snapshot_add` commits
+snapshot 1. Client 1 tries the lock. The holder has no watcher with its cookie, so it looks
 dead (`BreakRequest.cc:84-93`). Client 1 blocklists it, breaks the lock
 and takes it. Client 1 saw no HeaderUpdate, so it does not refresh. It
 writes object 1 with a snap context of `seq 0`. The OSD applies the
 write to the head with no clone. Snapshot 1 now shows the new data for
 object 1.
 
-If the owner crashes between `snapshot_add` and the notify, the same
-happens. `ORDERSNAP` cannot help: the object was never cloned, so its
-`snapset.seq` is 0.
+If the owner dies between `snapshot_add` and the notify, the same
+happens, with no watch drop needed: `tcOwnerCrashStale` and
+`tcCreateViaOwnerCrashStale` show it. `ORDERSNAP` cannot help: the
+object was never cloned, so its `snapset.seq` is 0.
 
 A fix: refresh in `PostAcquireRequest` whether or not a HeaderUpdate was
-seen (`refreshOnAcquire` in the model). `tcCreateViaOwnerLostWatchRefresh`
-holds with it.
+seen (`refreshOnAcquire` in the model). `tcOwnerLostWatchRefresh` and
+`tcOwnerCrashRefresh` hold with it.
 
 ### 2. A snapshot create retried after a lock owner announced itself is answered EEXIST
 
@@ -255,7 +300,8 @@ A requester sees an unknown owner announce itself in two cases. It
 opened the image after the owner acquired the lock, and the owner
 re-acquires it after a re-watch (`notify_acquired_lock` from
 `post_reacquire_lock_handler`). Or both opened the image at the same
-time. The model shows the second.
+time. `tcCreateViaOwnerLostWatchAnswer` shows the first,
+`tcCreateViaOwnerAnswer` the second.
 
 The model folds the timer and the expiry into one rule. If an owner is
 asked again for a request it completed with 0, it runs the request
@@ -306,6 +352,34 @@ write over PROTECTED. `tcCloneV1VsProtectRaceCas` holds with it.
 
 These are known limits of the feature, but the model shows the exact
 interleavings.
+
+### 5. A flatten that dies leaves a child that cannot be opened
+
+`FlattenRequest` detaches the child from its parent first
+(`DetachChildRequest`, `FlattenRequest.cc:163-192`) and clears the
+child's parent link second (`DetachParentRequest`, `:210-253`). The
+detach removes the parent's trashed snapshot once no child counts on it.
+If the client dies in between, the child's header still names the
+parent snapshot, which is gone, or which a later remove takes away.
+The child's next open fails with `-ENOENT` on its parent
+(`RefreshRequest.cc:865-886`), although every object was copied up.
+
+A fix: clear the parent link first, then detach the child. A crash then
+leaves a child that counts on its parent for nothing, which the next
+flatten or remove cleans up.
+
+### 6. `rbd rm` removes the header after it let go of the lock
+
+`RemoveRequest` closes the image, which releases the lock and
+unregisters the watch, and then removes the header. Nothing guards the
+header's removal. A peer that opens the image in between creates a
+snapshot, clones it, and loses its parent when the header goes. With
+the exclusive-lock feature the remover holds the lock through its
+checks, but not through the removal. `tcRemoveVsClone` shows it.
+
+The window is short, and the data objects were trimmed before it. A
+guard on the header's removal, such as a cls check that the header has
+no snapshot, would close it.
 
 ## Running
 

@@ -17,10 +17,14 @@ test tcCreateViaOwnerAnswer [main=TestSnapCreateViaOwner]:
   assert CreateAnswered in (union System, { TestSnapCreateViaOwner });
 test tcCreateViaOwnerLostWatchSafe [main=TestSnapCreateViaOwnerDrop]:
   assert WritesFenced, NoLeakedSnapIds, AllAnswered in (union System, { TestSnapCreateViaOwnerDrop });
-test tcCreateViaOwnerLostWatchSnap [main=TestSnapCreateViaOwnerDrop]:
-  assert SnapImmutable in (union System, { TestSnapCreateViaOwnerDrop });
-test tcCreateViaOwnerLostWatchRefresh [main=TestSnapCreateViaOwnerDropRefresh]:
-  assert WritesFenced, SnapImmutable, NoLeakedSnapIds, AllAnswered in (union System, { TestSnapCreateViaOwnerDropRefresh });
+test tcCreateViaOwnerLostWatchAnswer [main=TestSnapCreateViaOwnerDrop]:
+  assert CreateAnswered in (union System, { TestSnapCreateViaOwnerDrop });
+test tcOwnerLostWatchStale [main=TestOwnerLostWatch]:
+  assert SnapImmutable in (union System, { TestOwnerLostWatch });
+test tcOwnerLostWatchSafe [main=TestOwnerLostWatch]:
+  assert WritesFenced, NoLeakedSnapIds, AllAnswered in (union System, { TestOwnerLostWatch });
+test tcOwnerLostWatchRefresh [main=TestOwnerLostWatchRefresh]:
+  assert WritesFenced, SnapImmutable, NoLeakedSnapIds, AllAnswered in (union System, { TestOwnerLostWatchRefresh });
 test tcSnapCreateNoLock [main=TestSnapCreateNoLock]:
   assert SnapImmutable in (union System, { TestSnapCreateNoLock });
 test tcTwoCreatesNoLock [main=TestTwoCreatesNoLock]:
@@ -51,3 +55,35 @@ test tcChildReadVsRemove [main=TestChildReadVsRemove]:
   assert ChildHasParent, ParentReadable, AllAnswered in (union System, { TestChildReadVsRemove });
 test tcFlattenVsChildSnapNoLock [main=TestFlattenVsChildSnapNoLock]:
   assert ChildHasParent in (union System, { TestFlattenVsChildSnapNoLock });
+
+// crashes
+test tcWritersCrash [main=TestWritersCrash]:
+  assert WritesFenced, AllAnswered in (union System, { TestWritersCrash });
+test tcOwnerCrashStale [main=TestOwnerCrashSnapCreate]:
+  assert SnapImmutable in (union System, { TestOwnerCrashSnapCreate });
+test tcOwnerCrashSafe [main=TestOwnerCrashSnapCreate]:
+  assert WritesFenced, AllAnswered in (union System, { TestOwnerCrashSnapCreate });
+test tcOwnerCrashRefresh [main=TestOwnerCrashSnapCreateRefresh]:
+  assert WritesFenced, SnapImmutable, AllAnswered in (union System, { TestOwnerCrashSnapCreateRefresh });
+test tcCreateViaOwnerCrashSafe [main=TestCreateViaOwnerCrash]:
+  assert WritesFenced, AllAnswered in (union System, { TestCreateViaOwnerCrash });
+test tcCreateViaOwnerCrashStale [main=TestCreateViaOwnerCrash]:
+  assert SnapImmutable in (union System, { TestCreateViaOwnerCrash });
+test tcFlattenCrashParent [main=TestFlattenCrash]:
+  assert ChildHasParent in (union System, { TestFlattenCrash });
+test tcFlattenCrashReads [main=TestFlattenCrash]:
+  assert ParentReadable, AllAnswered in (union System, { TestFlattenCrash });
+test tcCloneV1Crash [main=TestCloneV1Crash]:
+  assert ChildHasParent, AllAnswered in (union System, { TestCloneV1Crash });
+
+// image removal
+test tcRemoveVsClone [main=TestRemoveVsClone]:
+  assert ChildHasParent, AllAnswered in (union System, { TestRemoveVsClone });
+test tcRemoveVsCloneNoLock [main=TestRemoveVsCloneNoLock]:
+  assert ChildHasParent, AllAnswered in (union System, { TestRemoveVsCloneNoLock });
+test tcRemoveParentVsFlatten [main=TestRemoveParentVsFlatten]:
+  assert ChildHasParent, ParentReadable, AllAnswered in (union System, { TestRemoveParentVsFlatten });
+
+// two children
+test tcTwoChildren [main=TestTwoChildren]:
+  assert ChildHasParent, ParentReadable, AllAnswered in (union System, { TestTwoChildren });

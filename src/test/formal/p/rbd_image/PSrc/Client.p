@@ -104,8 +104,21 @@ fun T_N_REQUEST_LOCK(): int { return 80; }
 fun T_N_FIRE(): int { return 81; }
 fun T_N_ASYNC_REQUEST(): int { return 82; }
 fun T_N_HEADER_UPDATE(): int { return 83; }
+fun T_RM_TRASH_RELEASE(): int { return 90; }
+fun T_RM_TRASH_REMOVE(): int { return 91; }
+fun T_RM_WATCHERS(): int { return 92; }
+fun T_RM_DETACH(): int { return 93; }
+fun T_RM_SNAP_GET(): int { return 94; }
+fun T_RM_PTRASH_RELEASE(): int { return 95; }
+fun T_RM_PTRASH_REMOVE(): int { return 96; }
+fun T_RM_UNWATCH(): int { return 97; }
+fun T_RM_REMOVE(): int { return 98; }
 
 type tQueuedOp = (asyncId: int, kind: tReqKind, name: int, requester: int);
+
+// how many steps (events handled) a client that may die picks its death
+// from; a pick past its run means it lives
+fun CRASH_STEPS(): int { return 40; }
 
 machine Client {
   var cfg: tCfg;
@@ -129,7 +142,16 @@ machine Client {
   var locker: tLock;
   var lockQ: seq[int];
   var peerRet: tRc;
-  var reqRetries: int;
+  var reqGen: int;          // the lock request's retry timer generation
+  var removing: bool;       // rbd rm in progress: StandardPolicy, then close
+  var rmWaitsLock: bool;
+  var rmWaitsRelease: bool;
+  var rmTrash: seq[int];    // the trashed snapshots a remove still has to drop
+  var crashBudget: int;
+  var drainer: machine;
+  var draining: bool;
+  var crashAt: int;
+  var crashStep: int;
   var ownerId: int;         // ImageWatcher::m_owner_client_id
   var requireLock: bool;    // exclusive_lock::ImageDispatch: writes need the lock
   var opWaitsLock: bool;
@@ -181,21 +203,41 @@ machine Client {
       script = p.script.actions;
       requireLock = cfg.exclusiveLock;
       refreshSeq = 1;
+      crashBudget = cfg.crashes;
+      if (crashBudget > 0) {
+        crashAt = 1 + choose(CRASH_STEPS());
+      }
       Send(Op(OP_WATCH, image, T_WATCH()));
     }
 
     on eRes do (r: tRes) {
+      MayCrash();
       HandleRes(r);
     }
 
     on eNotified do (n: (tag: int, acks: seq[tAck], rc: tRc)) {
+      MayCrash();
       HandleNotified(n.tag, NotifyResult(n.acks, n.rc));
     }
 
     on eNotify do (n: (nid: int, image: int, n: tNotify)) {
       var ack: tAck;
+      MayCrash();
       ack = HandleNotify(n.n);
       send store, eAck, (nid = n.nid, client = id, ack = ack);
+    }
+
+    on eDrain do (d: machine) {
+      drainer = d;
+      draining = true;
+      CheckDrained();
+    }
+
+    // schedule_request_lock's timer: ask the owner again
+    on eLockRetryTimer do (g: int) {
+      if (g == reqGen && lstate == L_WAITING_FOR_LOCK && handle != 0) {
+        NotifyRequestLock();
+      }
     }
 
     // the request timer: the request is still unanswered, so retry it
@@ -216,6 +258,7 @@ machine Client {
 
     // Watcher::handle_error: the watch is gone; re-register it
     on eWatchError do (e: (image: int, rc: tRc)) {
+      MayCrash();
       handle = 0;
       ownerId = 0;
       if (e.rc == EBLOCKLISTED) {
@@ -226,6 +269,34 @@ machine Client {
         Send(WithCookie(Op(OP_UNWATCH, image, T_REWATCH_UNWATCH()), cookie));
       }
     }
+  }
+
+  // the client died: nothing it had in flight completes, its watches
+  // lapse, and its lock entry stays until a peer breaks it
+  state Dead {
+    ignore eRes, eNotify, eNotified, eWatchError, eRequestTimer, eLockRetryTimer, eDrain;
+  }
+
+  // goto leaves the handler that called this. The step to die at is
+  // chosen when the client starts, so that every step is as likely.
+  fun MayCrash() {
+    var remaining: int;
+    if (crashBudget == 0) {
+      return;
+    }
+    crashStep = crashStep + 1;
+    if (crashStep != crashAt) {
+      return;
+    }
+    crashBudget = 0;
+    remaining = sizeof(script) - actIdx;
+    if (actRunning) {
+      remaining = remaining + 1;
+    }
+    announce mCrashed, (client = id, running = actRunning);
+    send store, eCrash, id;
+    send driver, eCrashed, (client = id, remaining = remaining);
+    goto Dead;
   }
 
   fun Send(op: tOp) {
@@ -282,8 +353,31 @@ machine Client {
       actWaitsLock = true;
       Enqueue(A_REL());
       Kick();
+    } else if (act.kind == R_REMOVE_IMAGE) {
+      RemoveStart();
     } else {
       IaStart(act.kind, act.snapName);
+    }
+  }
+
+  // the open failed: every action of the script is answered its error
+  fun FailScript(rc: tRc) {
+    while (actIdx < sizeof(script)) {
+      act = script[actIdx];
+      actAsyncId = id * 100 + actIdx;
+      actIdx = actIdx + 1;
+      announce mActionStarted, (client = id, kind = act.kind, asyncId = actAsyncId);
+      announce mActionDone, (client = id, kind = act.kind, asyncId = actAsyncId, rc = rc);
+      send driver, eActionDone, (client = id, rc = rc);
+    }
+  }
+
+  // nothing in flight: an op for a peer, a write, a lock action, a notify
+  fun CheckDrained() {
+    if (draining && !opBusy && inFlight == 0 && sizeof(lockQ) == 0 && !iaInFlight &&
+        !IsTransition() && !rewatching) {
+      draining = false;
+      send drainer, eDrained, id;
     }
   }
 
@@ -400,6 +494,7 @@ machine Client {
   }
   // the last in-flight write completed
   fun Drained() {
+    CheckDrained();
     if (lstate == L_PRE_RELEASING) {
       TryContinueRelease();
     }
@@ -419,9 +514,6 @@ machine Client {
       }
     }
     lockQ += (sizeof(lockQ), a);
-    if (a == A_ACQ() || a == A_TRY()) {
-      reqRetries = 0;
-    }
   }
   fun IsTransition(): bool {
     return lstate != L_UNLOCKED && lstate != L_LOCKED;
@@ -449,6 +541,7 @@ machine Client {
     a = lockQ[0];
     lockQ -= (0);
     lstate = next;
+    CheckDrained();
     if (a == A_ACQ() || a == A_TRY()) {
       if (r != OK) {
         FailPendingWrites(r);
@@ -461,10 +554,18 @@ machine Client {
         actWaitsLock = false;
         ActionDone(r);
       }
+      if (rmWaitsLock) {
+        rmWaitsLock = false;
+        RemoveLocked(r);
+      }
     } else if (a == A_REL()) {
       if (actWaitsLock && act.kind == R_RELEASE_LOCK) {
         actWaitsLock = false;
         ActionDone(r);
+      }
+      if (rmWaitsRelease) {
+        rmWaitsRelease = false;
+        Send(WithCookie(Op(OP_UNWATCH, image, T_RM_UNWATCH()), handle));
       }
     }
     Kick();
@@ -530,10 +631,10 @@ machine Client {
       PeerNotification(OK);   // no owner answered: treat it as dead and retry now
     } else if (r == EROFS) {
       PeerNotification(EROFS);
-    } else if (handle != 0 && reqRetries < cfg.requestRetries) {
+    } else {
       // schedule_request_lock: ask again after the retry delay
-      reqRetries = reqRetries + 1;
-      NotifyRequestLock();
+      reqGen = reqGen + 1;
+      send this, eLockRetryTimer, reqGen;
     }
   }
   // ExclusiveLock::handle_peer_notification
@@ -653,7 +754,7 @@ machine Client {
     if (n.kind == N_REQUEST_LOCK) {
       if (n.from != id && IsOwner() && ownerId == id) {
         if (lstate == L_LOCKED) {
-          if (cfg.autoPolicy) {
+          if (cfg.autoPolicy && !removing) {
             ack = (empty = false, result = OK);
             Enqueue(A_REL());
             Kick();
@@ -678,7 +779,7 @@ machine Client {
         ownerId = 0;
       }
       if (!IsOwner()) {
-        reqRetries = cfg.requestRetries;
+        reqGen = reqGen + 1;   // cancel(TASK_CODE_REQUEST_LOCK)
         PeerNotification(OK);
         CancelAsyncRequests();
       }
@@ -760,6 +861,7 @@ machine Client {
   }
   fun IaRemoteAnswered(r: tRc) {
     iaInFlight = false;
+    CheckDrained();
     if (!iaRemoteWaiting) {
       return;   // its AsyncComplete came first, or the request was cancelled
     }
@@ -856,6 +958,7 @@ machine Client {
   fun OpDone(r: tRc) {
     var q: tQueuedOp;
     opBusy = false;
+    CheckDrained();
     if (opAsyncId != 0) {
       asyncPending -= (opAsyncId);
       asyncComplete[opAsyncId] = r;
@@ -1018,6 +1121,79 @@ machine Client {
     }
   }
 
+  /* rbd rm: image::PreRemoveRequest, then image::RemoveRequest */
+
+  fun RemoveStart() {
+    removing = true;   // StandardPolicy: the lock is not given up while removing
+    if (cfg.exclusiveLock) {
+      rmWaitsLock = true;
+      Enqueue(A_ACQ());
+      Kick();
+    } else {
+      RemoveLocked(OK);
+    }
+  }
+  fun RemoveLocked(r: tRc) {
+    var s: int;
+    if (cfg.exclusiveLock && (r != OK || lstate != L_LOCKED)) {
+      removing = false;
+      ActionDone(EBUSY);   // not forced
+      return;
+    }
+    // check_image_snaps, on the snapshots as last read: a user snapshot
+    // refuses the removal; a trashed one is removed first
+    rmTrash = default(seq[int]);
+    foreach (s in keys(snapInfo)) {
+      if (!snapInfo[s].trash) {
+        removing = false;
+        ActionDone(ENOTEMPTY);
+        return;
+      }
+      rmTrash += (sizeof(rmTrash), s);
+    }
+    RemoveNextTrash();
+  }
+  fun RemoveNextTrash() {
+    var s: int;
+    if (sizeof(rmTrash) == 0) {
+      Send(Op(OP_LIST_WATCHERS, image, T_RM_WATCHERS()));
+      return;
+    }
+    s = rmTrash[0];
+    rmTrash -= (0);
+    opSnapId = s;
+    Send(WithSnap(Op(OP_SNAP_RELEASE, image, T_RM_TRASH_RELEASE()), s));
+  }
+  // RemoveRequest::detach_child: this image as a child of its parent
+  fun RemoveDetachChild() {
+    if (parent.image == 0) {
+      RemoveClose();
+    } else if (cfg.cloneV2) {
+      Send(ChildOp(OP_CHILD_DETACH, parent, image, T_RM_DETACH()));
+    } else {
+      Send(ChildOp(OP_REMOVE_CHILD, parent, image, T_RM_DETACH()));
+    }
+  }
+  // the last-chance snapshot check on the cached snapshots, then close
+  // the image: the lock is released and the watch unregistered
+  fun RemoveClose() {
+    var s: int;
+    foreach (s in keys(snapInfo)) {
+      if (!snapInfo[s].trash) {
+        removing = false;
+        ActionDone(ENOTEMPTY);
+        return;
+      }
+    }
+    if (cfg.exclusiveLock) {
+      rmWaitsRelease = true;
+      Enqueue(A_REL());
+      Kick();
+    } else {
+      Send(WithCookie(Op(OP_UNWATCH, image, T_RM_UNWATCH()), handle));
+    }
+  }
+
   /* answers from the store */
 
   fun HandleRes(r: tRes) {
@@ -1025,12 +1201,17 @@ machine Client {
     var op: tOp;
     t = r.tag;
     if (t == T_WATCH()) {
+      if (r.rc != OK) {
+        FailScript(r.rc);   // the open failed: nothing runs
+        return;
+      }
       handle = r.n;
       Refresh(T_REFRESH_OPEN());
     } else if (t == T_REWATCH_UNWATCH()) {
       Send(Op(OP_WATCH, image, T_REWATCH_WATCH()));
     } else if (t == T_REWATCH_WATCH()) {
       rewatching = false;
+      CheckDrained();
       if (r.rc == OK) {
         handle = r.n;
       } else if (r.rc == EBLOCKLISTED) {
@@ -1050,7 +1231,13 @@ machine Client {
         ApplyRefresh(r.hdr);
       }
       if (t == T_REFRESH_OPEN()) {
-        StartNextAction();
+        if (r.rc != OK) {
+          FailScript(r.rc);   // the open failed: nothing runs
+        } else {
+          StartNextAction();
+        }
+      } else if (r.rc != OK && (t == T_REFRESH_ACT() || t == T_REFRESH_IA())) {
+        ActionDone(r.rc);   // the image is gone: the op fails
       } else if (t == T_REFRESH_ACT()) {
         DoAction();
       } else if (t == T_REFRESH_IA()) {
@@ -1170,6 +1357,7 @@ machine Client {
     var t: int;
     var s: tSnap;
     var i: int;
+    var w: int;
     t = r.tag;
     if (t == T_SC_ALLOC()) {
       if (r.rc != OK) {
@@ -1332,6 +1520,51 @@ machine Client {
       Send(Op(OP_REMOVE_IMAGE, clChild, T_CL_RB_REMOVE()));
     } else if (t == T_CL_RB_REMOVE()) {
       ActionDone(clRc);
+    } else if (t == T_RM_TRASH_RELEASE()) {
+      Send(WithSnap(Op(OP_SNAP_REMOVE, image, T_RM_TRASH_REMOVE()), opSnapId));
+    } else if (t == T_RM_TRASH_REMOVE()) {
+      if (r.rc == EBUSY) {
+        removing = false;
+        ActionDone(EBUSY);   // -ECHILD: a clone still uses the trashed snapshot
+      } else {
+        snapInfo -= (opSnapId);
+        RemoveNextTrash();
+      }
+    } else if (t == T_RM_WATCHERS()) {
+      i = 0;
+      foreach (w in keys(r.watchers)) {
+        if (w != id) {
+          i = 1;
+        }
+      }
+      if (r.rc != OK || i == 1) {
+        removing = false;
+        ActionDone(EBUSY);   // image has watchers
+      } else {
+        RemoveDetachChild();
+      }
+    } else if (t == T_RM_DETACH()) {
+      if (cfg.cloneV2 && r.rc == OK) {
+        Send(WithSnap(Op(OP_SNAP_GET, parent.image, T_RM_SNAP_GET()), parent.snap));
+      } else {
+        RemoveClose();
+      }
+    } else if (t == T_RM_SNAP_GET()) {
+      if (r.rc == OK && r.snap.trash && r.snap.childCount == 0) {
+        Send(WithSnap(Op(OP_SNAP_RELEASE, parent.image, T_RM_PTRASH_RELEASE()), parent.snap));
+      } else {
+        RemoveClose();
+      }
+    } else if (t == T_RM_PTRASH_RELEASE()) {
+      Send(WithSnap(Op(OP_SNAP_REMOVE, parent.image, T_RM_PTRASH_REMOVE()), parent.snap));
+    } else if (t == T_RM_PTRASH_REMOVE()) {
+      RemoveClose();
+    } else if (t == T_RM_UNWATCH()) {
+      handle = 0;
+      Send(Op(OP_REMOVE_IMAGE, image, T_RM_REMOVE()));
+    } else if (t == T_RM_REMOVE()) {
+      removing = false;
+      ActionDone(r.rc);
     }
   }
 

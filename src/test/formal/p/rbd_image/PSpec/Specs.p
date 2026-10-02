@@ -16,7 +16,7 @@ spec WritesFenced observes mWrite {
 // What a snapshot shows never changes after it is created: the val each
 // object showed at the snapshot when snapshot_add committed is what any
 // later read at the snapshot answers.
-spec SnapImmutable observes mSnapCreated, mSnapView, mSnapRemoved {
+spec SnapImmutable observes mSnapCreated, mSnapView, mSnapRemoved, mSnapRemoveStarted {
   var views: map[(image: int, snap: int), map[int, int]];
   start state Watch {
     on mSnapCreated do (c: (image: int, snap: int, view: map[int, int])) {
@@ -34,16 +34,31 @@ spec SnapImmutable observes mSnapCreated, mSnapView, mSnapRemoved {
     on mSnapRemoved do (s: (image: int, snap: int, refs: set[tParent])) {
       views -= ((image = s.image, snap = s.snap));
     }
+    // a remove began: the snapshot's data may go before its header entry
+    on mSnapRemoveStarted do (s: (image: int, snap: int)) {
+      views -= ((image = s.image, snap = s.snap));
+    }
   }
 }
 
 // A parent snapshot is never removed while a child's head, or a child's
 // snapshot, still reads through it; nor is a parent image. A child is an
 // image whose clone completed (one a clone still builds, and will remove
-// if it fails, does not count).
-spec ChildHasParent observes mSnapRemoved, mImageRemoved, mCloneDone {
+// if it fails, does not count). A child that has every object of its
+// own reads nothing through its parent; but at the end, no child's head
+// or snapshot may still name a parent snapshot that is gone: the child
+// could not be opened.
+spec ChildHasParent observes mSnapRemoved, mImageRemoved, mCloneDone, mFinal {
   var children: set[int];
   start state Watch {
+    on mFinal do (f: (poolSnaps: set[int], headerSnaps: set[int], dangling: set[tParent])) {
+      var r: tParent;
+      foreach (r in f.dangling) {
+        assert !(r.image in children),
+          format("child {0} still names a parent snapshot that is gone (at its snapshot {1}; 0 is its head): it cannot be opened",
+                 r.image, r.snap);
+      }
+    }
     on mCloneDone do (child: int) {
       children += (child);
     }
@@ -95,14 +110,15 @@ spec CreateAnswered observes mSnapAddedFor, mActionDone {
   }
 }
 
-// Every action is answered (liveness).
-spec AllAnswered observes mActionStarted, mActionDone {
+// Every action is answered (liveness), unless its client died.
+spec AllAnswered observes mActionStarted, mActionDone, mCrashed {
   var outstanding: int;
   start state Idle {
     on mActionStarted do (s: (client: int, kind: tReqKind, asyncId: int)) {
       outstanding = 1;
       goto Waiting;
     }
+    ignore mCrashed;
   }
   hot state Waiting {
     on mActionStarted do (s: (client: int, kind: tReqKind, asyncId: int)) {
@@ -114,6 +130,14 @@ spec AllAnswered observes mActionStarted, mActionDone {
         goto Idle;
       }
     }
+    on mCrashed do (c: (client: int, running: bool)) {
+      if (c.running) {
+        outstanding = outstanding - 1;
+        if (outstanding == 0) {
+          goto Idle;
+        }
+      }
+    }
   }
 }
 
@@ -121,7 +145,7 @@ spec AllAnswered observes mActionStarted, mActionDone {
 // some header: a snapshot create does not leak the ids it allocated.
 spec NoLeakedSnapIds observes mFinal {
   start state Watch {
-    on mFinal do (f: (poolSnaps: set[int], headerSnaps: set[int])) {
+    on mFinal do (f: (poolSnaps: set[int], headerSnaps: set[int], dangling: set[tParent])) {
       var s: int;
       foreach (s in f.poolSnaps) {
         assert s in f.headerSnaps,
@@ -130,3 +154,4 @@ spec NoLeakedSnapIds observes mFinal {
     }
   }
 }
+

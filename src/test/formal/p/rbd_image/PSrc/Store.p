@@ -32,6 +32,9 @@
  *   the client learns of it when its next watch check fails
  *   (ENOTCONN), and re-watches.
  */
+// how many store ops a watch drop picks its op from
+fun DROP_STEPS(): int { return 60; }
+
 machine Store {
   var cfg: tCfg;
   var hdrs: map[int, tHeader];
@@ -50,6 +53,8 @@ machine Store {
   var nAcks: map[int, seq[tAck]];
   var nextNid: int;
   var drops: int;
+  var dropAt: int;
+  var dropStep: int;
 
   start state Serve {
     entry (p: (cfg: tCfg, init: tInit)) {
@@ -59,6 +64,9 @@ machine Store {
       var os: map[int, tObj];
       cfg = p.cfg;
       drops = cfg.watchDrops;
+      if (drops > 0) {
+        dropAt = 1 + choose(DROP_STEPS());
+      }
       // image 1, with each object written once (val 1)
       h = default(tHeader);
       h.present = true;
@@ -205,8 +213,20 @@ machine Store {
       FinishNotifyIfDone(a.nid);
     }
 
+    // a client died: its watches lapse (the OSD's watch timeout)
+    on eCrash do (c: int) {
+      var image: int;
+      foreach (image in keys(watchers)) {
+        if (c in watchers[image]) {
+          DropWatch(image, c);
+        }
+      }
+      clients -= (c);
+    }
+
     on eQuiesce do (from: machine) {
       var hs: set[int];
+      var dangling: set[tParent];
       var i: int;
       var s: int;
       foreach (i in keys(hdrs)) {
@@ -214,9 +234,17 @@ machine Store {
           foreach (s in keys(hdrs[i].snaps)) {
             hs += (s);
           }
+          if (hdrs[i].parent.image != 0 && !SnapExists(hdrs[i].parent)) {
+            dangling += ((image = i, snap = 0));
+          }
+          foreach (s in keys(hdrs[i].snaps)) {
+            if (hdrs[i].snaps[s].parent.image != 0 && !SnapExists(hdrs[i].snaps[s].parent)) {
+              dangling += ((image = i, snap = s));
+            }
+          }
         }
       }
-      announce mFinal, (poolSnaps = poolSnaps, headerSnaps = hs);
+      announce mFinal, (poolSnaps = poolSnaps, headerSnaps = hs, dangling = dangling);
       send from, eQuiesced;
     }
   }
@@ -231,7 +259,8 @@ machine Store {
     announce mImage, (image = image, present = true);
   }
 
-  // the OSD drops a live client's watch: a watch timeout
+  // the OSD drops a live client's watch: a watch timeout. The op to
+  // drop it at is chosen up front, so that every op is as likely.
   fun MaybeDropWatch() {
     var image: int;
     var c: int;
@@ -240,15 +269,21 @@ machine Store {
     if (drops == 0) {
       return;
     }
+    dropStep = dropStep + 1;
+    if (dropStep != dropAt) {
+      return;
+    }
     foreach (image in keys(watchers)) {
       foreach (c in keys(watchers[image])) {
         victims += (sizeof(victims), (image = image, client = c));
       }
     }
-    if (sizeof(victims) == 0 || !$) {
+    if (sizeof(victims) == 0) {
+      dropAt = dropAt + 1;   // nobody to drop yet: the next op
       return;
     }
     drops = drops - 1;
+    dropAt = dropStep + 1 + choose(DROP_STEPS());
     v = choose(victims);
     DropWatch(v.image, v.client);
     send clients[v.client], eWatchError, (image = v.image, rc = ENOENT);
@@ -374,6 +409,7 @@ machine Store {
         r.rc = EEXIST;
       } else {
         h.snaps[op.snap].trash = true;
+        announce mSnapRemoveStarted, (image = op.image, snap = op.snap);
       }
     } else if (op.kind == OP_SNAP_GET) {
       if (!(op.snap in h.snaps)) {
@@ -447,6 +483,27 @@ machine Store {
     return r;
   }
 
+  fun SnapExists(p: tParent): bool {
+    return p.image in hdrs && hdrs[p.image].present && p.snap in hdrs[p.image].snaps;
+  }
+
+  // whether image has every object of its own: a flattened child needs
+  // its parent no more
+  fun Complete(image: int): bool {
+    var o: int;
+    if (!(image in objs)) {
+      return false;
+    }
+    o = 1;
+    while (o <= NOBJ()) {
+      if (!(o in objs[image]) || !objs[image][o].present) {
+        return false;
+      }
+      o = o + 1;
+    }
+    return true;
+  }
+
   fun NameInUse(h: tHeader, name: int): bool {
     var s: int;
     foreach (s in keys(h.snaps)) {
@@ -457,13 +514,14 @@ machine Store {
     return false;
   }
 
-  // every parent link, from a head or a snapshot of an existing image, to p
+  // every parent link, from a head or a snapshot of an existing image
+  // that still needs its parent, to p
   fun ParentRefs(p: tParent): set[tParent] {
     var i: int;
     var s: int;
     var refs: set[tParent];
     foreach (i in keys(hdrs)) {
-      if (hdrs[i].present) {
+      if (hdrs[i].present && !Complete(i)) {
         if (hdrs[i].parent == p) {
           refs += ((image = i, snap = 0));
         }
@@ -477,13 +535,13 @@ machine Store {
     return refs;
   }
 
-  // every parent link to any snapshot of image
+  // every such parent link to any snapshot of image
   fun ChildRefs(image: int): set[tParent] {
     var i: int;
     var s: int;
     var refs: set[tParent];
     foreach (i in keys(hdrs)) {
-      if (hdrs[i].present) {
+      if (hdrs[i].present && !Complete(i)) {
         if (hdrs[i].parent.image == image) {
           refs += ((image = i, snap = 0));
         }

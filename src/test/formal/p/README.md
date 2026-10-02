@@ -28,7 +28,7 @@ dotnet tool install --global P
 
 The scripts find P in `~/.dotnet/tools`, and a Homebrew `dotnet@8` by
 themselves. Otherwise, set `DOTNET_ROOT` to the directory that holds
-`dotnet`. `run.sh` runs `jobs` cases at a time. `rbd_image` has 23
+`dotnet`. `run.sh` runs `jobs` cases at a time. `rbd_image` has 38
 cases, at 20,000 schedules each.
 
 If any of P's summaries reports a bug, `run.sh` counts the case as
@@ -37,13 +37,13 @@ match, so no test name can be a prefix of another.
 
 ## What the models found
 
-`rbd_image` finds four gaps on main, detailed in its README:
+`rbd_image` finds six gaps on main, detailed in its README:
 
 - **A new lock owner writes with a stale snap context.** If the owner
   saw no HeaderUpdate, it does not refresh the header on acquire. The
-  previous owner can add a snapshot just before it is fenced. That
-  snapshot is not in the new owner's snap context. The new owner's
-  writes then change what the snapshot shows.
+  previous owner can add a snapshot just before it is fenced, or just
+  before it dies. That snapshot is not in the new owner's snap context.
+  The new owner's writes then change what the snapshot shows.
 - **A snapshot create that is retried after a lock owner announced
   itself is answered EEXIST**, for the snapshot it created. The owner
   answers the retry from its record of completed requests. The requester
@@ -58,3 +58,9 @@ match, so no test name can be a prefix of another.
   time.** Another client's writes with the old snap context land in it.
   A flatten without the lock can also leave a child's snapshot that
   reads a parent snapshot that no longer counts it.
+- **A flatten that dies leaves a child that cannot be opened.** It
+  detaches the child from the parent, which can remove the parent's
+  trashed snapshot, before it clears the child's parent link.
+- **`rbd rm` removes the header after it let go of the lock.** A peer
+  that opens the image in between can snapshot and clone it, and the
+  clone loses its parent.

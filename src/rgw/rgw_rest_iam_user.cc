@@ -573,6 +573,10 @@ int RGWDeleteUser_IAM::check_empty()
     s->err.message = "The user cannot be deleted until its AccessKeys are removed";
     return -ERR_DELETE_CONFLICT;
   }
+  if (!info.group_ids.empty()) {
+    s->err.message = "The user cannot be deleted until it is removed from all groups";
+    return -ERR_DELETE_CONFLICT;
+  }
 
   const auto& attrs = user->get_attrs();
   if (auto p = attrs.find(RGW_ATTR_USER_POLICY); p != attrs.end()) {

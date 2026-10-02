@@ -6218,9 +6218,11 @@ int RadosRole::store_info(const DoutPrefixProvider *dpp, bool exclusive, optiona
   librados::Rados& rados = *store->getRados()->get_rados_handle();
   RGWServices* svc = store->svc();
   const RGWZoneParams& zone = svc->zone->get_zone_params();
+  // a non-exclusive store is an update of a role that was loaded
+  const bool must_exist = !exclusive;
   return rgwrados::role::write(dpp, y, rados, *svc->sysobj, svc->mdlog,
                                zone, info, info.objv_tracker,
-                               ceph::real_time{}, exclusive);
+                               ceph::real_time{}, exclusive, must_exist);
 }
 
 int RadosRole::load_by_name(const DoutPrefixProvider *dpp, optional_yield y)

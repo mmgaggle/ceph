@@ -331,7 +331,7 @@ int write(const DoutPrefixProvider* dpp, optional_yield y,
           librados::Rados& rados, RGWSI_SysObj& sysobj, RGWSI_MDLog* mdlog,
           const RGWZoneParams& zone, const RGWRoleInfo& info,
           RGWObjVersionTracker& objv, ceph::real_time mtime,
-          bool exclusive)
+          bool exclusive, bool must_exist)
 {
   int r = 0;
 
@@ -340,7 +340,12 @@ int write(const DoutPrefixProvider* dpp, optional_yield y,
   RGWRoleInfo* old_info = nullptr;
   if (!exclusive) {
     r = read_by_id(dpp, y, sysobj, zone, info.id, old);
-    if (r == -ENOENT) {
+    if (r == -ENOENT && must_exist) {
+      // an update of a role that is gone, as when DeleteRole raced it.
+      // writing its name and path as if it were new could only fail with
+      // EEXIST, which role updates don't list
+      return r;
+    } else if (r == -ENOENT) {
     } else if (r < 0) {
       return r;
     } else {

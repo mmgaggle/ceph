@@ -56,7 +56,7 @@ int write(const DoutPrefixProvider* dpp, optional_yield y,
           librados::Rados& rados, RGWSI_SysObj& sysobj, RGWSI_MDLog* mdlog,
           const RGWZoneParams& zone, const RGWRoleInfo& info,
           RGWObjVersionTracker& objv, ceph::real_time mtime,
-          bool exclusive);
+          bool exclusive, bool must_exist = false);
 
 /// Remove a role by name, including its name/path objects.
 int remove(const DoutPrefixProvider* dpp, optional_yield y,

@@ -294,8 +294,10 @@ std::tuple<int, rgw::sal::RGWRole*> STSService::getRoleInfo(const DoutPrefixProv
     std::unique_ptr<rgw::sal::RGWRole> role = driver->get_role(roleName, tenant, account);
     if (int ret = role->load_by_name(dpp, y); ret < 0) {
       if (ret == -ENOENT) {
+        // AWS answers AccessDenied for a role that does not exist, and the
+        // STS API lists no NoSuchEntity error
         ldpp_dout(dpp, 0) << "Role doesn't exist: " << roleName << dendl;
-        ret = -ERR_NO_ROLE_FOUND;
+        ret = -EPERM;
       }
       return make_tuple(ret, nullptr);
     } else {

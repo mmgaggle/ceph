@@ -51,8 +51,9 @@ int retry_raced_user_write(const DoutPrefixProvider* dpp, optional_yield y,
     }
   }
   if (r == -ECANCELED) {
-    // map ECANCELED to 409 ConcurrentModification
-    return -ERR_CONCURRENT_MODIFICATION;
+    // map ECANCELED to 500 ServiceFailure, which every IAM operation lists.
+    // most of them do not list 409 ConcurrentModification
+    return -ERR_INTERNAL_ERROR;
   }
   return r;
 }
@@ -75,8 +76,9 @@ int retry_raced_group_write(const DoutPrefixProvider* dpp, optional_yield y,
     }
   }
   if (r == -ECANCELED) {
-    // map ECANCELED to 409 ConcurrentModification
-    return -ERR_CONCURRENT_MODIFICATION;
+    // map ECANCELED to 500 ServiceFailure, which every IAM operation lists.
+    // most of them do not list 409 ConcurrentModification
+    return -ERR_INTERNAL_ERROR;
   }
   return r;
 }
@@ -97,8 +99,9 @@ int retry_raced_role_write(const DoutPrefixProvider* dpp, optional_yield y,
     }
   }
   if (r == -ECANCELED) {
-    // map ECANCELED to 409 ConcurrentModification
-    return -ERR_CONCURRENT_MODIFICATION;
+    // map ECANCELED to 500 ServiceFailure, which every IAM operation lists.
+    // most of them do not list 409 ConcurrentModification
+    return -ERR_INTERNAL_ERROR;
   }
   return r;
 }

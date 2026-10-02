@@ -572,6 +572,11 @@ The gateway's relay windows need ``ofi`` in ``rgw_rdma_transports``,
 ``rgw_ofi_provider`` set to ``uet``, an interface in
 ``rgw_ofi_domain``, and ``CAP_NET_RAW``.
 
+Give every UET interface the same MTU, and use jumbo frames where the
+network allows them. The provider sizes each packet's payload from the
+interface MTU: about 8 KiB at an MTU of 9000, against 1 KiB at 1500. UET
+travels over UDP, to port 4793 by default.
+
 The wrapper must discard an endpoint's writes when the endpoint closes,
 as ``fi_endpoint(3)`` requires. The OSD relies on that to cut off a late
 write. A wrapper that drains its writes on close instead lets a cut-off

@@ -32,6 +32,15 @@ enum tCapOp { OP_GRANT = 0, OP_REVOKE = 1 }
 type tOpenReq = (client: int, from: machine, mode: tMode);
 
 /*
+ * A ceph_mds_request_release embedded in an MClientRequest
+ * (Client::encode_inode_release).
+ */
+type tReqRelease = (cap_id: int, cap_seq: int, issue_seq: int, caps: tCaps, wanted: tCaps);
+
+/* MClientRequest(CEPH_MDS_OP_GETATTR | CEPH_MDS_OP_SETATTR) on the one file */
+type tMdsReq = (client: int, from: machine, has_release: bool, release: tReqRelease);
+
+/*
  * MClientCaps(CEPH_CAP_OP_UPDATE | FLUSH).
  *   cap_id     the Capability's id; the MDS ignores messages for an old cap
  *   cap_seq    cap->seq, the seq of the last GRANT/REVOKE the client saw
@@ -48,14 +57,27 @@ type tCapUpdate = (client: int, cap_id: int, cap_seq: int, issue_seq: int, caps:
 /* MClientCapRelease entry */
 type tCapRelease = (client: int, cap_id: int, issue_seq: int);
 
+/* MClientSession(CEPH_SESSION_REQUEST_RENEWCAPS) */
+type tRenewCaps = (client: int, renew_seq: int);
+
 event eOpenReq    : tOpenReq;
+event eGetattrReq : tMdsReq;
+event eSetattrReq : tMdsReq;
 event eCapUpdate  : tCapUpdate;
 event eCapRelease : tCapRelease;
+event eRenewCaps  : tRenewCaps;
+/*
+ * Modelling artifact: the MDS session timeout fires for this client. It is
+ * sent by the client after its own cap_ttl expired, which encodes the
+ * protocol's timing assumption that a client stops trusting its caps
+ * before the MDS declares the session stale.
+ */
+event eSessionTimeout : int;
 
 /* ---- MDS -> client ---- */
 
-/* the ceph_mds_reply_cap part of an MClientReply */
-type tOpenReply = (cap_id: int, caps: tCaps, wanted: tCaps, cap_seq: int, max_size: int);
+/* the ceph_mds_reply_cap part of an MClientReply; has_cap is false when the reply carries no cap */
+type tCapReply = (has_cap: bool, cap_id: int, caps: tCaps, wanted: tCaps, cap_seq: int, max_size: int);
 
 /* MClientCaps(GRANT | REVOKE) */
 type tCapGrant = (op: tCapOp, cap_id: int, cap_seq: int, caps: tCaps, wanted: tCaps, issue_seq: int, max_size: int);
@@ -63,23 +85,42 @@ type tCapGrant = (op: tCapOp, cap_id: int, cap_seq: int, caps: tCaps, wanted: tC
 /* MClientCaps(FLUSH_ACK) */
 type tFlushAck = (tid: int, dirty: tCaps);
 
-event eOpenReply : tOpenReply;
-event eCapGrant  : tCapGrant;
-event eFlushAck  : tFlushAck;
+event eOpenReply    : tCapReply;
+event eGetattrReply : tCapReply;
+event eSetattrReply : tCapReply;
+event eCapGrant     : tCapGrant;
+event eFlushAck     : tFlushAck;
+/* MClientSession(CEPH_SESSION_STALE) */
+event eSessionStale;
+/* the session was killed and the client blocklisted: the client sees its connection reset */
+event eSessionKilled;
+/* MClientSession(CEPH_SESSION_RENEWCAPS), carries the renew seq */
+event eRenewCapsAck : int;
 
 /* ---- announcements observed by the specs ---- */
 
 type tCapsAnnounce = (client: int, caps: tCaps);
 /* the MDS Capability::issued() for a client changed */
 event eMdsIssued : tCapsAnnounce;
-/* the client's Cap::implemented changed, or the cap was dropped (empty) */
+/*
+ * the client's Cap::implemented changed, or the cap was dropped (empty).
+ * Caps the client does not consider valid (session cap_gen moved on, or
+ * cap_ttl expired) are reported as empty: Inode::caps_issued() ignores them.
+ */
 event eClientImplemented : tCapsAnnounce;
 
 type tIoDone = (client: int, ver: int);
 event eReadStart : int;
 event eReadDone  : tIoDone;
 event eWriteDone : tIoDone;
-
+event eStatDone  : int;
+event eSetattrDone : int;
+/* a buffered write that had completed to its application was lost to a blocklist */
+event eWriteLost : int;
+/* a buffered write was overwritten in the cache before it was flushed: `old` can only reach the
+   store through `new`, so if `new` is lost, `old` is lost too */
+type tSuperseded = (older: int, newer: int);
+event eWriteSuperseded : tSuperseded;
 
 /* ---- set helpers ---- */
 

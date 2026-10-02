@@ -9,32 +9,69 @@
  * coexist with Fw/Fb on another, and the cache is dropped before another
  * client may write.
  */
-spec DataCoherence observes eReadStart, eReadDone, eWriteDone {
-  var latest: int;              // newest version any application has seen complete
-  var snapshot: map[int, int];  // latest at the time each client's read started
+spec DataCoherence observes eReadStart, eReadDone, eWriteDone, eWriteLost, eWriteSuperseded {
+  var completed: set[int];           // versions some application has seen complete
+  var lost: set[int];                // versions lost when their writer was blocklisted
+  var superseded: map[int, int];     // old buffered version -> the version that overwrote it
+  var snapshot: map[int, set[int]];  // completed at the time each client's read started
+
+  /* a lost version takes every version that could only reach the store through it */
+  fun MarkLost(v: int) {
+    var k: int;
+    var again: bool;
+    lost += (v);
+    again = true;
+    while (again) {
+      again = false;
+      foreach (k in keys(superseded)) {
+        if ((superseded[k] in lost) && !(k in lost)) {
+          lost += (k);
+          again = true;
+        }
+      }
+    }
+  }
+
+  /* the newest completed version that was not lost since */
+  fun Latest(vs: set[int]) : int {
+    var v: int;
+    var m: int;
+    m = 0;
+    foreach (v in vs) {
+      if (v > m && !(v in lost)) { m = v; }
+    }
+    return m;
+  }
 
   start state Watching {
     on eWriteDone do (w: tIoDone) {
-      if (w.ver > latest) {
-        latest = w.ver;
-      }
+      completed += (w.ver);
+    }
+    on eWriteLost do (v: int) {
+      MarkLost(v);
+    }
+    on eWriteSuperseded do (s: tSuperseded) {
+      superseded[s.older] = s.newer;
     }
     on eReadStart do (c: int) {
-      snapshot[c] = latest;
+      snapshot[c] = completed;
     }
     on eReadDone do (r: tIoDone) {
-      assert r.ver >= snapshot[r.client],
+      assert r.ver >= Latest(snapshot[r.client]),
         format("stale read: client {0} read version {1} but version {2} had completed before the read started",
-               r.client, r.ver, snapshot[r.client]);
+               r.client, r.ver, Latest(snapshot[r.client]));
     }
   }
 }
 
 /*
  * CapTracking: the MDS never believes a client released a cap the client
- * still holds (Cap::implemented on the client is always a subset of
+ * still holds and trusts (Cap::implemented, as long as the client's
+ * session cap_gen and cap_ttl make the cap valid, is always a subset of
  * Capability::issued on the MDS). Every lock transition relies on this:
- * the MDS waits for issued caps to drain before it changes state.
+ * the MDS waits for issued caps to drain before it changes state. A stale
+ * session may have its non-write caps revoked by force, which is why the
+ * client reports caps it no longer trusts as empty.
  */
 spec CapTracking observes eMdsIssued, eClientImplemented {
   var mdsIssued: map[int, tCaps];
@@ -62,12 +99,13 @@ spec CapTracking observes eMdsIssued, eClientImplemented {
 }
 
 /*
- * IoProgress: every read or write an application issues eventually
- * completes or is rejected. A schedule that ends with this monitor in the
- * hot state is a liveness bug: a client is stuck waiting for caps, for
- * max_size, or for a flush.
+ * IoProgress: every read, write, stat or setattr that an application
+ * issues completes or is rejected with EBADF. A schedule that ends in the
+ * hot state means a client waits forever for caps, for `max_size`, for a
+ * flush, or for an MDS request that never gets its lock.
  */
-spec IoProgress observes eAppRead, eAppWrite, eReadDone, eWriteDone, eIoDropped {
+spec IoProgress observes eAppRead, eAppWrite, eAppStat, eAppSetattr,
+                         eReadDone, eWriteDone, eStatDone, eSetattrDone, eIoDropped {
   var outstanding: int;
 
   fun Started() {
@@ -80,40 +118,39 @@ spec IoProgress observes eAppRead, eAppWrite, eReadDone, eWriteDone, eIoDropped 
   }
 
   start cold state Idle {
-    on eAppRead  do { Started(); goto Pending; }
-    on eAppWrite do { Started(); goto Pending; }
-    on eReadDone  do (r: tIoDone) { Finished(); }
-    on eWriteDone do (w: tIoDone) { Finished(); }
-    on eIoDropped do (c: int) { Finished(); }
+    on eAppRead    do { Started(); goto Pending; }
+    on eAppWrite   do { Started(); goto Pending; }
+    on eAppStat    do { Started(); goto Pending; }
+    on eAppSetattr do { Started(); goto Pending; }
+    on eReadDone    do (r: tIoDone) { Finished(); }
+    on eWriteDone   do (w: tIoDone) { Finished(); }
+    on eStatDone    do (c: int) { Finished(); }
+    on eSetattrDone do (c: int) { Finished(); }
+    on eIoDropped   do (c: int) { Finished(); }
   }
 
   hot state Pending {
-    on eAppRead  do { Started(); }
-    on eAppWrite do { Started(); }
-    on eReadDone  do (r: tIoDone) { Finished(); if (outstanding == 0) { goto Idle; } }
-    on eWriteDone do (w: tIoDone) { Finished(); if (outstanding == 0) { goto Idle; } }
-    on eIoDropped do (c: int)     { Finished(); if (outstanding == 0) { goto Idle; } }
+    on eAppRead    do { Started(); }
+    on eAppWrite   do { Started(); }
+    on eAppStat    do { Started(); }
+    on eAppSetattr do { Started(); }
+    on eReadDone    do (r: tIoDone) { Finished(); if (outstanding == 0) { goto Idle; } }
+    on eWriteDone   do (w: tIoDone) { Finished(); if (outstanding == 0) { goto Idle; } }
+    on eStatDone    do (c: int)     { Finished(); if (outstanding == 0) { goto Idle; } }
+    on eSetattrDone do (c: int)     { Finished(); if (outstanding == 0) { goto Idle; } }
+    on eIoDropped   do (c: int)     { Finished(); if (outstanding == 0) { goto Idle; } }
   }
 }
 
 /*
- * LockTransitions: the filelock only moves along the edges of the locks.c
- * table. A stable state may enter an intermediate state whose target is
- * another stable state, and an intermediate state may only complete to its
- * own target (eval_gather) or, for simple_lock's MIX->LOCK staging, move
- * between stages that share a target.
+ * LockTransitions: the filelock only moves along the edges Locker takes
+ * (see LockEdgeIsLegal in FileLock.p).
  */
 spec LockTransitions observes eLockTransition {
   start state Watching {
     on eLockTransition do (t: tLockTransition) {
-      if (LockIsStable(t.prev)) {
-        assert t.prev != t.next, format("lock transition {0} -> {1}: no-op from a stable state", t.prev, t.next);
-        assert LockIsStable(LockNext(t.next)),
-          format("lock transition {0} -> {1}: target state is not reachable from a stable state", t.prev, t.next);
-      } else {
-        assert t.next == LockNext(t.prev),
-          format("lock transition {0} -> {1}: an unstable state may only complete to {2}", t.prev, t.next, LockNext(t.prev));
-      }
+      assert LockEdgeIsLegal(t.prev, t.next),
+        format("illegal lock transition {0} -> {1}", t.prev, t.next);
     }
   }
 }

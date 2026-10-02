@@ -459,6 +459,15 @@ class Driver {
     virtual int remove_group(const DoutPrefixProvider* dpp, optional_yield y,
                              const RGWGroupInfo& info,
                              RGWObjVersionTracker& objv) = 0;
+    /** Write the group's member entry for a user. */
+    virtual int link_group_user(const DoutPrefixProvider* dpp, optional_yield y,
+                                const RGWGroupInfo& group,
+                                const RGWUserInfo& user) { return -ENOTSUP; }
+    /** Remove the group's member entry for a user, only while it names that
+     * user. */
+    virtual int unlink_group_user(const DoutPrefixProvider* dpp, optional_yield y,
+                                  const RGWGroupInfo& group,
+                                  const RGWUserInfo& user) { return -ENOTSUP; }
     /** Return a paginated listing of the group's users. */
     virtual int list_group_users(const DoutPrefixProvider* dpp,
                                  optional_yield y,

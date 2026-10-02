@@ -2263,6 +2263,36 @@ int RadosStore::remove_group(const DoutPrefixProvider* dpp, optional_yield y,
   return write_mdlog_entry(dpp, y, *svc()->mdlog, "group", info.id, objv);
 }
 
+int RadosStore::link_group_user(const DoutPrefixProvider* dpp, optional_yield y,
+                                const RGWGroupInfo& group,
+                                const RGWUserInfo& user)
+{
+  librados::Rados& rados = *getRados()->get_rados_handle();
+  const RGWZoneParams& zone = svc()->zone->get_zone_params();
+  const rgw_raw_obj& obj = rgwrados::group::get_users_obj(zone, group.id);
+  return rgwrados::users::add(dpp, y, rados, obj, user, false,
+                              std::numeric_limits<uint32_t>::max());
+}
+
+int RadosStore::unlink_group_user(const DoutPrefixProvider* dpp, optional_yield y,
+                                  const RGWGroupInfo& group,
+                                  const RGWUserInfo& user)
+{
+  librados::Rados& rados = *getRados()->get_rados_handle();
+  const RGWZoneParams& zone = svc()->zone->get_zone_params();
+  const rgw_raw_obj& obj = rgwrados::group::get_users_obj(zone, group.id);
+  // cls_account_resource_rm takes only a name: check the entry first
+  std::string id;
+  int r = rgwrados::users::get(dpp, y, rados, obj, user.display_name, id);
+  if (r < 0) {
+    return r;
+  }
+  if (id != user.user_id.id) {
+    return -ECANCELED;
+  }
+  return rgwrados::users::remove(dpp, y, rados, obj, user.display_name);
+}
+
 int RadosStore::list_group_users(const DoutPrefixProvider* dpp,
                                  optional_yield y,
                                  std::string_view tenant,

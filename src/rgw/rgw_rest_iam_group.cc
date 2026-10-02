@@ -602,18 +602,22 @@ int RGWDeleteGroup_IAM::check_empty(optional_yield y)
     }
   }
 
-  // check that group has no users
+  // check that group has no users. list_group_users drops an entry whose
+  // user is gone, so check every entry, not only the first
   const std::string& tenant = s->auth.identity->get_tenant();
-  rgw::sal::UserList listing;
-  int r = driver->list_group_users(this, y, tenant, info.id, "", 1, listing);
-  if (r < 0) {
-    return r;
-  }
-
-  if (listing.users.size()) {
-    s->err.message = "The group cannot be deleted until all users are removed";
-    return -ERR_DELETE_CONFLICT;
-  }
+  std::string marker;
+  do {
+    rgw::sal::UserList listing;
+    int r = driver->list_group_users(this, y, tenant, info.id, marker, 1000, listing);
+    if (r < 0) {
+      return r;
+    }
+    if (listing.users.size()) {
+      s->err.message = "The group cannot be deleted until all users are removed";
+      return -ERR_DELETE_CONFLICT;
+    }
+    marker = std::move(listing.next_marker);
+  } while (!marker.empty());
 
   return 0;
 }
@@ -802,9 +806,12 @@ void RGWListGroups_IAM::send_response()
 class RGWAddUserToGroup_IAM : public RGWOp {
   bufferlist post_body;
   RGWGroupInfo group;
+  rgw::sal::Attrs group_attrs;
+  RGWObjVersionTracker group_objv;
   std::unique_ptr<rgw::sal::User> user;
 
   int forward_to_master(optional_yield y, const rgw::SiteConfig& site);
+  int guard_group(optional_yield y);
  public:
   explicit RGWAddUserToGroup_IAM(const ceph::bufferlist& post_body)
     : post_body(post_body) {}
@@ -837,10 +844,8 @@ int RGWAddUserToGroup_IAM::init_processing(optional_yield y)
   }
 
   // look up group by GroupName
-  rgw::sal::Attrs attrs_ignored;
-  RGWObjVersionTracker objv_ignored;
   int r = driver->load_group_by_name(this, y, group.account_id, name,
-                                     group, attrs_ignored, objv_ignored);
+                                     group, group_attrs, group_objv);
   if (r == -ENOENT) {
     s->err.message = "No such GroupName in the account";
     return -ERR_NO_SUCH_ENTITY;
@@ -903,6 +908,27 @@ void RGWAddUserToGroup_IAM::execute(optional_yield y)
     }
   }
 
+  // on the metadata master, write the member entry first, then rewrite the
+  // group under the version read. a DeleteGroup that listed the members
+  // before the entry was written then fails its version check and lists
+  // them again
+  bool linked = false;
+  if (site.is_meta_master() &&
+      !user->get_info().group_ids.count(group.id)) {
+    op_ret = driver->link_group_user(this, y, group, user->get_info());
+    if (op_ret < 0 && op_ret != -ENOTSUP) {
+      return;
+    }
+    linked = (op_ret == 0);
+    if (linked) {
+      op_ret = guard_group(y);
+      if (op_ret < 0) {
+        driver->unlink_group_user(this, y, group, user->get_info());
+        return;
+      }
+    }
+  }
+
   op_ret = retry_raced_user_write(this, y, user.get(),
       [this, y] {
         RGWUserInfo& info = user->get_info();
@@ -915,6 +941,27 @@ void RGWAddUserToGroup_IAM::execute(optional_yield y)
         constexpr bool exclusive = false;
         return user->store_user(this, y, exclusive, &old_info);
       });
+  if (op_ret < 0 && linked) {
+    // the user is gone or its write failed: take the member entry back
+    driver->unlink_group_user(this, y, group, user->get_info());
+  }
+}
+
+// rewrite the group unchanged under the version read, so that a racing
+// DeleteGroup sees a new version
+int RGWAddUserToGroup_IAM::guard_group(optional_yield y)
+{
+  int r = retry_raced_group_write(this, y, driver, group, group_attrs, group_objv,
+      [this, y] {
+        constexpr bool exclusive = false;
+        return driver->store_group(this, y, group, group_attrs, group_objv,
+                                   exclusive, &group);
+      });
+  if (r == -ENOENT) {
+    s->err.message = "No such GroupName in the account";
+    return -ERR_NO_SUCH_ENTITY;
+  }
+  return r;
 }
 
 void RGWAddUserToGroup_IAM::send_response()

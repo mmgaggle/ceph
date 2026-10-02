@@ -246,6 +246,12 @@ class RadosStore : public StoreDriver {
     int remove_group(const DoutPrefixProvider* dpp, optional_yield y,
                      const RGWGroupInfo& info,
                      RGWObjVersionTracker& objv) override;
+    int link_group_user(const DoutPrefixProvider* dpp, optional_yield y,
+                        const RGWGroupInfo& group,
+                        const RGWUserInfo& user) override;
+    int unlink_group_user(const DoutPrefixProvider* dpp, optional_yield y,
+                          const RGWGroupInfo& group,
+                          const RGWUserInfo& user) override;
     int list_group_users(const DoutPrefixProvider* dpp,
                          optional_yield y,
                          std::string_view tenant,

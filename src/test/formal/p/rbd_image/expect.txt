@@ -1,0 +1,28 @@
+# the exclusive lock
+tcTwoWriters                       holds
+tcLostWatchFenced                 holds
+tcLostWatchNoBlocklist      violated held the exclusive lock
+tcThreeWriters                     holds
+
+# snapshots
+tcCreateViaOwnerSafe               holds
+tcCreateViaOwnerAnswer             violated EEXIST
+tcCreateViaOwnerLostWatchSafe      holds
+tcCreateViaOwnerLostWatchSnap      violated shows
+tcCreateViaOwnerLostWatchRefresh   holds
+tcSnapCreateNoLock                 violated shows
+tcTwoCreatesNoLock                 violated leaked
+tcCreateOwnerChangeAnswer            violated EEXIST
+tcCreateOwnerChangeSafe        holds
+tcSnapRemoveVsCreate               holds
+
+# layering
+tcCloneV2VsRemove                  holds
+tcCloneV1VsUnprotectOnly               holds
+tcCloneV1NoRecheck                 violated was removed while child
+tcCloneV1VsProtectRace        violated was removed while child
+tcCloneV1VsProtectRaceJournaling holds
+tcCloneV1VsProtectRaceCas     holds
+tcFlattenVsRemove                  holds
+tcChildReadVsRemove                holds
+tcFlattenVsChildSnapNoLock         violated was removed while child

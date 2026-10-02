@@ -64,6 +64,14 @@ int remove(const DoutPrefixProvider* dpp, optional_yield y,
            const RGWZoneParams& zone, std::string_view tenant,
            const rgw_account_id& account, std::string_view name);
 
+/// Remove the role that was read, by id, under the version it was read
+/// with. Its name and path entries are removed only while they still name
+/// that id.
+int remove_loaded(const DoutPrefixProvider* dpp, optional_yield y,
+                  librados::Rados& rados, RGWSI_SysObj& sysobj, RGWSI_MDLog* mdlog,
+                  const RGWZoneParams& zone, const RGWRoleInfo& info,
+                  RGWObjVersionTracker& objv);
+
 /// Return a paginated listing of roles for the given tenant.
 int list_tenant(const DoutPrefixProvider* dpp, optional_yield y,
                 RGWSI_SysObj& sysobj, const RGWZoneParams& zone,

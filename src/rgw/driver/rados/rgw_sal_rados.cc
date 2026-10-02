@@ -6246,8 +6246,10 @@ int RadosRole::delete_obj(const DoutPrefixProvider *dpp, optional_yield y)
   librados::Rados& rados = *store->getRados()->get_rados_handle();
   RGWServices* svc = store->svc();
   const RGWZoneParams& zone = svc->zone->get_zone_params();
-  return rgwrados::role::remove(dpp, y, rados, *svc->sysobj, svc->mdlog, zone,
-                                info.tenant, info.account_id, info.name);
+  // remove the role this object loaded, not whatever role has its name
+  // now: the caller checked this one, under the version it read
+  return rgwrados::role::remove_loaded(dpp, y, rados, *svc->sysobj, svc->mdlog,
+                                       zone, info, info.objv_tracker);
 }
 
 } // namespace rgw::sal

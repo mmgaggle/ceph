@@ -495,6 +495,56 @@ static int remove_by_id(const DoutPrefixProvider* dpp, optional_yield y,
   return 0;
 }
 
+int remove_loaded(const DoutPrefixProvider* dpp, optional_yield y,
+                  librados::Rados& rados, RGWSI_SysObj& sysobj, RGWSI_MDLog* mdlog,
+                  const RGWZoneParams& zone, const RGWRoleInfo& info,
+                  RGWObjVersionTracker& objv)
+{
+  // delete the role info under the version read. a racing write fails
+  // this with ECANCELED, and the caller reloads the role and checks again
+  const rgw_raw_obj& obj = get_id_obj(zone, info.id);
+  int r = rgw_delete_system_obj(dpp, &sysobj, obj.pool, obj.oid, &objv, y);
+  if (r < 0) {
+    ldpp_dout(dpp, 1) << "ERROR: failed to remove role "
+        << info.id << " with: " << cpp_strerror(r) << dendl;
+    return r;
+  }
+
+  // delete the name object, only while it names this role: a role created
+  // again under the name keeps it
+  if (!info.name.empty()) {
+    IndexObj name;
+    name.obj = get_name_obj(zone, info);
+    RGWNameToId name_to_id;
+    r = read_name(dpp, y, sysobj, name, name_to_id);
+    if (r == 0 && name_to_id.obj_id == info.id) {
+      std::ignore = remove_index(dpp, y, sysobj, name); // under name.objv
+    }
+  }
+
+  // delete the path object, likewise
+  if (!info.account_id.empty()) {
+    AccountIndex path;
+    path.obj = account::get_roles_obj(zone, info.account_id);
+    path.name = info.name;
+    std::string id;
+    r = roles::get(dpp, y, rados, path.obj, info.name, id);
+    if (r == 0 && id == info.id) {
+      std::ignore = remove_index(dpp, y, rados, path);
+    }
+  } else {
+    IndexObj path;
+    path.obj = get_tenant_path_obj(zone, info);
+    std::ignore = remove_index(dpp, y, sysobj, path);
+  }
+
+  // record in the mdlog on success
+  if (mdlog) {
+    return mdlog->complete_entry(dpp, y, "roles", info.id, &objv);
+  }
+  return 0;
+}
+
 int remove(const DoutPrefixProvider* dpp, optional_yield y,
            librados::Rados& rados, RGWSI_SysObj& sysobj, RGWSI_MDLog* mdlog,
            const RGWZoneParams& zone, std::string_view tenant,

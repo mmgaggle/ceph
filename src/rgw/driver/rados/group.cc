@@ -188,6 +188,7 @@ int write(const DoutPrefixProvider* dpp,
       && old_info->name == info.name;
 
   std::optional<NameObj> remove_name;
+  bool linked = false;
   if (old_info) {
     if (old_info->id != info.id) {
       ldpp_dout(dpp, 1) << "ERROR: can't modify group id" << dendl;
@@ -222,6 +223,34 @@ int write(const DoutPrefixProvider* dpp,
     } else if (r < 0) {
       return r;
     }
+
+    // link the new name to its account, exclusively and under the account's
+    // group limit for a new group. cls_account_resource_add enforces both
+    // atomically, so concurrent creates can't share a name or exceed the limit
+    uint32_t limit = std::numeric_limits<uint32_t>::max();
+    if (exclusive) {
+      RGWAccountInfo account;
+      std::map<std::string, ceph::buffer::list> account_attrs; // unused
+      ceph::real_time account_mtime; // unused
+      RGWObjVersionTracker account_objv; // unused
+      r = account::read(dpp, y, sysobj, zone, info.account_id, account,
+                        account_attrs, account_mtime, account_objv);
+      if (r < 0) {
+        return r;
+      }
+      if (account.max_groups >= 0) { // max_groups < 0 means unlimited
+        limit = account.max_groups;
+      }
+    }
+    const auto& groups_obj = account::get_groups_obj(zone, info.account_id);
+    r = groups::add(dpp, y, rados, groups_obj, info, true, limit);
+    if (r == -EUSERS) {
+      return -ERR_LIMIT_EXCEEDED;
+    }
+    if (r < 0) {
+      return r;
+    }
+    linked = true;
   }
 
   // encode/write the group info
@@ -235,6 +264,11 @@ int write(const DoutPrefixProvider* dpp,
     if (r < 0) {
       ldpp_dout(dpp, 1) << "ERROR: failed to write group obj " << obj
           << " with: " << cpp_strerror(r) << dendl;
+      if (linked) {
+        // roll back the new account entry
+        const auto& groups_obj = account::get_groups_obj(zone, info.account_id);
+        std::ignore = groups::remove(dpp, y, rados, groups_obj, info.name);
+      }
       return r;
     }
   }
@@ -268,14 +302,7 @@ int write(const DoutPrefixProvider* dpp,
       ldpp_dout(dpp, 20) << "WARNING: failed to write name obj "
           << nameobj.obj << " with: " << cpp_strerror(r) << dendl;
     } // not fatal
-    // link the new name to its account
-    const auto& users = account::get_groups_obj(zone, info.account_id);
-    r = groups::add(dpp, y, rados, users, info, false,
-                    std::numeric_limits<uint32_t>::max());
-    if (r < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: could not link to account "
-          << info.account_id << ": " << cpp_strerror(r) << dendl;
-    } // not fatal
+    // the account entry was linked above
   }
 
   return 0;

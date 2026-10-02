@@ -256,20 +256,54 @@ static int remove_index(const DoutPrefixProvider* dpp,
 
 using PathIndex = std::variant<std::monostate, IndexObj, AccountIndex>;
 
+// the account's role limit, which a new role is added under
+static int account_role_limit(const DoutPrefixProvider* dpp, optional_yield y,
+                              RGWSI_SysObj& sysobj, const RGWZoneParams& zone,
+                              std::string_view account_id, uint32_t& limit)
+{
+  RGWAccountInfo account;
+  std::map<std::string, ceph::buffer::list> attrs; // unused
+  ceph::real_time mtime; // unused
+  RGWObjVersionTracker objv; // unused
+  int r = account::read(dpp, y, sysobj, zone, account_id,
+                        account, attrs, mtime, objv);
+  if (r < 0) {
+    return r;
+  }
+  if (account.max_roles < 0) { // max_roles < 0 means unlimited
+    limit = std::numeric_limits<uint32_t>::max();
+  } else {
+    limit = account.max_roles;
+  }
+  return 0;
+}
+
 static int write_path(const DoutPrefixProvider* dpp, optional_yield y,
                       librados::Rados& rados, RGWSI_SysObj& sysobj,
                       const RGWZoneParams& zone, const RGWRoleInfo& info,
-                      PathIndex& index)
+                      bool create, PathIndex& index)
 {
   if (!info.account_id.empty()) {
-    // add the new role to its account
+    // add the new role to its account. cls_account_resource_add enforces
+    // the account's limit atomically, so concurrent creates can't exceed it
     AccountIndex path;
     path.obj = account::get_roles_obj(zone, info.account_id);
     path.name = info.name;
 
     constexpr bool exclusive = true;
-    constexpr uint32_t no_limit = std::numeric_limits<uint32_t>::max();
-    int r = roles::add(dpp, y, rados, path.obj, info, exclusive, no_limit);
+    uint32_t limit = std::numeric_limits<uint32_t>::max();
+    if (create) {
+      int r = account_role_limit(dpp, y, sysobj, zone, info.account_id, limit);
+      if (r < 0) {
+        return r;
+      }
+    }
+    int r = roles::add(dpp, y, rados, path.obj, info, exclusive, limit);
+    if (r == -EUSERS) {
+      ldpp_dout(dpp, 4) << "role limit " << limit << " exceeded for account "
+          << info.account_id << dendl;
+      return -ERR_LIMIT_EXCEEDED;
+    }
     if (r < 0) {
       ldpp_dout(dpp, 1) << "failed to add role to account "
           << path.obj << " with: " << cpp_strerror(r) << dendl;
@@ -418,7 +452,7 @@ int write(const DoutPrefixProvider* dpp, optional_yield y,
   // check for path conflict
   PathIndex new_path;
   if (!same_path) {
-    r = write_path(dpp, y, rados, sysobj, zone, info, new_path);
+    r = write_path(dpp, y, rados, sysobj, zone, info, exclusive, new_path);
     if (r < 0) {
       // roll back new name object
       std::ignore = remove_index(dpp, y, sysobj, new_name);

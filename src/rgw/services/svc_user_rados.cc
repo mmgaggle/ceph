@@ -189,6 +189,7 @@ class PutOperation
   RGWObjVersionTracker ot;
   string err_msg;
   optional_yield y;
+  bool linked = false; // prepare linked the account entry
 
   void set_err_msg(string msg) {
     if (!err_msg.empty()) {
@@ -265,6 +266,45 @@ public:
 
       const RGWZoneParams& zone = svc.zone->get_zone_params();
       const auto& users = rgwrados::account::get_users_obj(zone, info.account_id);
+
+      // a new user, or a user with a new name in its account: link the name
+      // exclusively before the user object is written, under the account's
+      // user limit for a new user. cls_account_resource_add enforces both
+      // atomically, so concurrent creates and renames can't share a name or
+      // exceed the limit. the entry is rolled back if the write fails
+      if (exclusive || (old_info && (old_info->account_id != info.account_id ||
+                                     old_info->display_name != info.display_name))) {
+        uint32_t limit = std::numeric_limits<uint32_t>::max();
+        if (exclusive) {
+          RGWAccountInfo account;
+          std::map<std::string, bufferlist> attrs; // unused
+          ceph::real_time account_mtime; // unused
+          RGWObjVersionTracker objv; // unused
+          int r = rgwrados::account::read(dpp, y, *svc.sysobj, zone, info.account_id,
+                                          account, attrs, account_mtime, objv);
+          if (r < 0) {
+            return r;
+          }
+          if (account.max_users >= 0) { // max_users < 0 means unlimited
+            limit = account.max_users;
+          }
+        }
+        int r = rgwrados::users::add(dpp, y, rados, users, info, true, limit);
+        if (r == -EUSERS) {
+          return -ERR_LIMIT_EXCEEDED;
+        }
+        if (r == -EEXIST) {
+          ldpp_dout(dpp, 0) << "WARNING: can't store user info, display name "
+              "already exists in account" << dendl;
+          return -EEXIST;
+        }
+        if (r < 0) {
+          return r;
+        }
+        linked = true;
+        return 0;
+      }
+
       std::string existing_uid;
       int r = rgwrados::users::get(dpp, y, rados, users,
                                    info.display_name, existing_uid);
@@ -276,6 +316,16 @@ public:
     }
 
     return 0;
+  }
+
+  // take back the account entry that prepare linked
+  void unlink(const DoutPrefixProvider *dpp) {
+    if (!linked) {
+      return;
+    }
+    const RGWZoneParams& zone = svc.zone->get_zone_params();
+    const auto& users = rgwrados::account::get_users_obj(zone, info.account_id);
+    std::ignore = rgwrados::users::remove(dpp, y, rados, users, info.display_name);
   }
 
   int put(const DoutPrefixProvider *dpp) {
@@ -344,7 +394,7 @@ public:
       }
     }
 
-    if (account_users_link(&info) &&
+    if (!linked && account_users_link(&info) &&
         account_users_link(&info) != account_users_link(old_info)) {
       // link the user to its account
       const RGWZoneParams& zone = svc.zone->get_zone_params();
@@ -481,6 +531,7 @@ int RGWSI_User_RADOS::store_user_info(const RGWUserInfo& info,
 
   r = op.put(dpp);
   if (r < 0) {
+    op.unlink(dpp);
     return r;
   }
 

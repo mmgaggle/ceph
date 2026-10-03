@@ -338,8 +338,11 @@ of these:
   under a new key. A write that carries the old key then fails instead
   of landing. This is the usual RDMA practice, and it is cheap on a
   software provider. Make sure that the provider does not hand the old
-  key out again soon: the UET reference provider's keys are indexes
-  into a table of regions. The data of the request itself can still be
+  key out again soon. The UET provider can also change a region's key
+  in place, with ``fi_control(&mr->fid, FI_UET_MR_REKEY, &key)``: the
+  old key is dead when the call returns, the region keeps its
+  registration, and over a device it is one command instead of
+  unpinning and pinning the memory again. The data of the request itself can still be
   read before the key is retired: a copy carries the same bytes to the
   same place.
 * Leave the memory untouched, and issue no new token for it, until the
@@ -373,12 +376,13 @@ late writes could be cut off one at a time, about 90% of GETs from
 every client fell back to HTTP.
 
 Ceph does the first for the windows it lends itself, as soon as the
-operation that used a window ends. An OSD's gather windows get a new key
+operation that used a window ends, in place where the provider can. An OSD's gather windows get a new key
 when the gather releases them (``osd_oob_rekey_windows``), and so do the
 gateway's relay windows when a session ends (``rgw_rdma_rekey_windows``),
-also when a gather or a relay failed. A key that leaves service is not used for
-another window for 10 s, and an endpoint asks a provider with a fixed
-table of regions, such as UET's, for a table of 16384 regions.
+also when a gather or a relay failed. When a window is registered again
+instead, the key that leaves service is not used for another window for
+10 s, and an endpoint asks a provider with a fixed table of regions,
+such as UET's, for a table of 16384 regions.
 
 Erasure-coded pools
 ===================
@@ -982,8 +986,10 @@ shows:
 * ``peer_timeouts``: reads that gave up, with nothing sent, while a new
   peer was added to the address vector. ``peers``, ``pending_inserts``
   and ``inserts_refused``. See `libfabric`_.
-* ``windows_rekeyed``, ``windows_rekey_failed`` and ``key_collisions``.
-  See `Reusing a window`_.
+* ``windows_rekeyed``, ``windows_rekey_failed`` and ``key_collisions``;
+  ``rekeys_in_place`` and ``rekeys_reregistered``, and
+  ``rekey_in_place``, whether the provider re-keys in place. See
+  `Reusing a window`_.
 
 An OSD whose libfabric executor stopped raises ``OOB_DELIVERY_UNSAFE`` or
 ``OOB_DELIVERY_DOWN`` in ``ceph health detail``, and one that cut off

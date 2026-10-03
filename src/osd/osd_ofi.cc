@@ -265,6 +265,9 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("windows_exhausted", ws.exhausted);
   f->dump_unsigned("windows_rekeyed", ws.rekeyed);
   f->dump_unsigned("windows_rekey_failed", ws.rekey_failed);
+  f->dump_unsigned("rekeys_in_place", s.rekeys_in_place);
+  f->dump_unsigned("rekeys_reregistered", s.rekeys_reregistered);
+  f->dump_int("rekey_in_place", s.rekey_in_place);
   f->dump_unsigned("key_collisions", s.key_collisions);
   f->dump_string("last_error", ep->last_error());
 }

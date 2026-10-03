@@ -219,6 +219,8 @@ int Service::do_init(CephContext* c)
       if (int r = ofi_ep->register_window(static_cast<char*>(ptr), buf_size, &w);
           r == 0) {
         b.osd_token = ofi_ep->window_token(w, 0, buf_size);
+        b.ofi_window = w.id;
+        b.ofi_registered = true;
       }
       if (b.osd_token.empty()) {
         ldout(cct, 1) << "rgw_rdma_rc: registering relay window " << i
@@ -314,8 +316,31 @@ void Service::release_buffer(Buffer* b, std::chrono::milliseconds quarantine)
     return;
   }
   b->in_use = false;
+#ifdef WITH_OOB_OFI
+  if (ofi_ep && b->ofi_registered &&
+      cct->_conf.get_val<bool>("rgw_rdma_rekey_windows")) {
+    // A new key, so that no OSD write meant for the last session lands
+    // once the buffer serves another: not one a failed relay left in
+    // flight, and not a provider's late duplicate of one that completed,
+    // which the delivery lease does not bound. With the old key gone,
+    // neither can land, and the buffer needs no quarantine.
+    const ceph::ofi::Endpoint::window_t w{b->ofi_window,
+					  static_cast<char*>(b->ptr), b->size};
+    if (int r = ofi_ep->rekey_window(w); r == 0) {
+      b->osd_token = ofi_ep->window_token(w, 0, b->size);
+      b->quarantined_until = clock::time_point::min();
+      return;
+    } else {
+      ldout(cct, 1) << "rgw_rdma_rc: re-keying a relay window: "
+                    << cpp_strerror(r) << " (" << ofi_ep->last_error()
+                    << "); keeping it out of use" << dendl;
+      quarantine = std::max(quarantine, ofi_ep->key_quarantine());
+    }
+  }
+#endif
   if (quarantine.count() > 0) {
-    b->quarantined_until = clock::now() + quarantine;
+    b->quarantined_until = std::max(b->quarantined_until,
+                                    clock::now() + quarantine);
   }
 }
 

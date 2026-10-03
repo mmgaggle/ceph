@@ -59,6 +59,9 @@ struct Buffer {
   /// delivery descriptor OSDs write this window through: a cuObject DC
   /// descriptor or a libfabric one; empty when OSD-direct is off
   std::string osd_token;
+  /// the buffer's libfabric window, when osd_token is a libfabric one
+  uint64_t ofi_window = 0;
+  bool ofi_registered = false;
   bool in_use = false;
   /// an OSD may still push into a window a failed relay abandoned;
   /// the window stays out of the pool until this passes

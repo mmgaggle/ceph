@@ -15,7 +15,7 @@
 #include "include/common_fwd.h"
 #include "osd/oob_executor.h"
 
-namespace ceph::ofi { class Endpoint; }
+namespace ceph::ofi { class Endpoint; class WindowPool; }
 
 /**
  * Out-of-band delivery over libfabric.
@@ -32,6 +32,9 @@ namespace ceph::ofi { class Endpoint; }
  * With osd_oob_gather, the executor also lends windows: a pool of
  * osd_oob_window_count windows of osd_oob_window_size bytes registered
  * for remote writes, which shards of an erasure-coded read push into.
+ * With osd_oob_rekey_windows, a window gets a new memory key when it is
+ * released, so that no write meant for an earlier gather, a provider's
+ * late duplicate included, lands in it once it is lent again.
  *
  * When a cut-off fails or ends late, writes may land in a client's
  * window after the client was told they would not (see
@@ -74,20 +77,13 @@ private:
   /// stop for good once the endpoint is unsafe; true when stopped
   bool check_unsafe();
 
-  struct slot_t {
-    bool in_use = false;
-    std::chrono::steady_clock::time_point quarantined_until{};
-  };
-  std::mutex win_mtx;
-  std::vector<slot_t> slots;
-  size_t slot_size = 0;
-  char* pool = nullptr;
-  uint64_t pool_window = 0;  ///< the pool's id in ep
+  /// the gather windows, over pool_mem; null when gathers stay inline
+  std::unique_ptr<ceph::ofi::WindowPool> windows;
+  char* pool_mem = nullptr;
 
   std::atomic<uint64_t> plans_started{0};
   std::atomic<uint64_t> plans_completed{0};
   std::atomic<uint64_t> plans_failed{0};
   std::atomic<uint64_t> bytes_pushed{0};
-  std::atomic<uint64_t> windows_acquired{0};
-  std::atomic<uint64_t> windows_exhausted{0};
+
 };

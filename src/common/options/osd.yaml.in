@@ -1701,6 +1701,21 @@ options:
   - osd
   flags:
   - runtime
+- name: osd_oob_rekey_windows
+  type: bool
+  level: advanced
+  desc: Give a gather window a new memory key when it is released
+  long_desc: A transport that retransmits without connection state, such as
+    UET's RUDI, can deliver a duplicate of a write that completed long ago,
+    until the network's longest packet lifetime has passed. A new key makes
+    any write meant for an earlier gather fail instead of landing in the
+    window once it is lent again. Without it, a window that a gather
+    released cleanly is lent again at once.
+  default: true
+  services:
+  - osd
+  flags:
+  - runtime
 - name: osd_ofi_inject_cutoff_failure
   type: bool
   level: dev

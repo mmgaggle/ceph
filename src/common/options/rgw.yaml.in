@@ -4674,6 +4674,21 @@ options:
   see_also:
   - rgw_rdma_osd_passthrough
   - rgw_rdma_rc_enabled
+- name: rgw_rdma_rekey_windows
+  type: bool
+  level: advanced
+  desc: Give a relay window a new memory key when its session ends
+  long_desc: A transport that retransmits without connection state, such as
+    UET's RUDI, can deliver a duplicate of an OSD's write that completed
+    long ago, until the network's longest packet lifetime has passed. A new
+    key on the libfabric relay window makes any OSD write meant for an
+    earlier session fail instead of landing in the buffer once it serves
+    another.
+  default: true
+  services:
+  - rgw
+  flags:
+  - runtime
 - name: rgw_rdma_osd_passthrough
   type: bool
   level: advanced

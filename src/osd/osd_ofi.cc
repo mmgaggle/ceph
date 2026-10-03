@@ -23,10 +23,11 @@ OSDOfi::OSDOfi(CephContext* cct, LogChannelRef clog)
 
 OSDOfi::~OSDOfi()
 {
-  // the endpoint goes first: it stops the progress thread and closes
-  // the regions over the pool
+  // the windows, then the endpoint, which stops the progress thread,
+  // before the memory goes
+  windows.reset();
   ep.reset();
-  std::free(pool);
+  std::free(pool_mem);
 }
 
 int OSDOfi::init()
@@ -57,6 +58,7 @@ int OSDOfi::init()
     return -EIO;
   }
 
+  size_t slot_size = 0;
   if (gather) {
     slot_size = conf.get_val<Option::size_t>("osd_oob_window_size");
     const size_t nslots = conf.get_val<uint64_t>("osd_oob_window_count");
@@ -64,20 +66,21 @@ int OSDOfi::init()
     void* p = nullptr;
     if (len && posix_memalign(&p, 4096, len) == 0 && p) {
       std::memset(p, 0, len);
-      pool = static_cast<char*>(p);
-      ceph::ofi::Endpoint::window_t w;
-      if (int r = ep->register_window(pool, len, &w); r < 0) {
-	derr << "registering the gather windows: " << ep->last_error()
+      pool_mem = static_cast<char*>(p);
+      // a window per slot, so that each gets a key of its own, and a new
+      // one when it is released
+      windows = ceph::ofi::WindowPool::create(*ep, pool_mem, slot_size, nslots,
+					      &err);
+      if (!windows) {
+	derr << "registering the gather windows: " << err
 	     << "; gathers stay inline" << dendl;
-      } else {
-	pool_window = w.id;
-	slots.resize(nslots);
       }
     }
   }
   dout(1) << "libfabric delivery up: " << ep->describe() << ", staging "
 	  << cfg.stage_count << " x " << cfg.stage_size << " bytes, "
-	  << slots.size() << " gather windows of " << slot_size << " bytes"
+	  << (windows ? windows->count() : 0) << " gather windows of "
+	  << slot_size << " bytes"
 	  << dendl;
   if (ep->provider() == "tcp" || ep->provider() == "sockets") {
     // closing a socket does not discard what the kernel already queued
@@ -175,46 +178,33 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
 
 std::optional<OSDOobExecutor::window_t> OSDOfi::acquire_window(size_t size)
 {
-  if (!is_available() || size > slot_size) {
+  if (!windows || !is_available()) {
     return std::nullopt;
   }
-  const auto now = std::chrono::steady_clock::now();
-  std::lock_guard l(win_mtx);
-  for (size_t i = 0; i < slots.size(); i++) {
-    auto& slot = slots[i];
-    if (slot.in_use || now < slot.quarantined_until) {
-      continue;
-    }
-    const ceph::ofi::Endpoint::window_t pw{pool_window, pool,
-					   slot_size * slots.size()};
-    std::string token = ep->window_token(pw, i * slot_size, slot_size);
-    if (token.empty()) {
-      return std::nullopt;
-    }
-    slot.in_use = true;
-    windows_acquired++;
-    window_t w;
-    w.id = i;
-    w.ptr = pool + i * slot_size;
-    w.size = slot_size;
-    w.token = std::move(token);
-    return w;
+  auto lent = windows->acquire(size);
+  if (!lent) {
+    return std::nullopt;
   }
-  windows_exhausted++;
-  return std::nullopt;
+  window_t w;
+  w.id = lent->id;
+  w.ptr = lent->ptr;
+  w.size = lent->size;
+  w.token = std::move(lent->token);
+  return w;
 }
 
 void OSDOfi::release_window(uint64_t id, uint64_t quarantine_ms)
 {
-  std::lock_guard l(win_mtx);
-  if (id >= slots.size()) {
+  if (!windows) {
     return;
   }
-  slots[id].in_use = false;
-  if (quarantine_ms) {
-    slots[id].quarantined_until = std::chrono::steady_clock::now() +
-      std::chrono::milliseconds(quarantine_ms);
-  }
+  // A new key, so that no write meant for this gather lands once the
+  // window is lent again: not a peer's that missed it, and not a
+  // provider's late duplicate of one that completed, which the delivery
+  // lease does not bound. With the old key gone neither can land, and the
+  // window is free at once.
+  windows->release(id, std::chrono::milliseconds(quarantine_ms),
+		   cct->_conf.get_val<bool>("osd_oob_rekey_windows"));
 }
 
 void OSDOfi::window_sync()
@@ -250,8 +240,12 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("budget_refused", s.budget_refused);
   f->dump_unsigned("late_starts", s.late_starts);
   f->dump_unsigned("peer_timeouts", s.peer_timeouts);
-  f->dump_unsigned("windows_acquired", windows_acquired);
-  f->dump_unsigned("windows_exhausted", windows_exhausted);
+  const auto ws = windows ? windows->stats() : ceph::ofi::WindowPool::stats_t{};
+  f->dump_unsigned("windows_acquired", ws.acquired);
+  f->dump_unsigned("windows_exhausted", ws.exhausted);
+  f->dump_unsigned("windows_rekeyed", ws.rekeyed);
+  f->dump_unsigned("windows_rekey_failed", ws.rekey_failed);
+  f->dump_unsigned("key_collisions", s.key_collisions);
   f->dump_string("last_error", ep->last_error());
 }
 

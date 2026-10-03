@@ -76,6 +76,10 @@ private:
   std::atomic<bool> stopped{false};
   /// stop for good once the endpoint is unsafe; true when stopped
   bool check_unsafe();
+  /// report, once each, the cut-offs that ended beyond the tolerance
+  /// though the endpoint stayed clean
+  void check_past_tolerance();
+  std::atomic<uint64_t> past_reported{0};
 
   /// the gather windows, over pool_mem; null when gathers stay inline
   std::unique_ptr<ceph::ofi::WindowPool> windows;

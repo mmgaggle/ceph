@@ -44,6 +44,7 @@ int OSDOfi::init()
   cfg.progress_thread = gather;
   cfg.late_tolerance =
     conf.get_val<std::chrono::milliseconds>("osd_oob_cutoff_late_tolerance");
+  cfg.late_fail_closed = conf.get_val<bool>("osd_oob_cutoff_late_fail_closed");
   cfg.cutoff_close_hook = [cct = cct] {
     return cct->_conf.get_val<bool>("osd_ofi_inject_cutoff_failure") ?
       -EIO : 0;
@@ -133,6 +134,25 @@ bool OSDOfi::check_unsafe()
   return true;
 }
 
+void OSDOfi::check_past_tolerance()
+{
+  const auto s = ep->stats();
+  uint64_t seen = past_reported;
+  if (s.cutoffs_past_tolerance <= seen ||
+      !past_reported.compare_exchange_strong(seen, s.cutoffs_past_tolerance)) {
+    return;
+  }
+  // The close or cancel returned, so nothing of the writes it cut off is
+  // sent any more, and delivery goes on. Bytes may have landed in a
+  // client's window after the fence a client that gave its request up
+  // counts on: say so where an operator looks.
+  const std::string why = ep->last_error();
+  derr << "libfabric delivery cut writes off late: " << why << dendl;
+  if (clog) {
+    clog->error() << "libfabric delivery cut writes off late: " << why;
+  }
+}
+
 bool OSDOfi::handles(const std::string& token) const
 {
   if (!is_available()) {
@@ -168,6 +188,8 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
   const int r = ep->write(*t, iov.data(), iov.size(), writes, budget);
   if (r == -ENOTRECOVERABLE || ep->unsafe()) {
     check_unsafe();
+  } else if (r == -ETIMEDOUT) {
+    check_past_tolerance();
   }
   if (r < 0) {
     plans_failed++;
@@ -249,6 +271,8 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("cutoffs_late", s.cutoffs_late);
   f->dump_unsigned("max_cutoff_lateness_ms", s.max_cutoff_lateness_ms);
   f->dump_unsigned("late_tolerance_ms", s.late_tolerance_ms);
+  f->dump_unsigned("cutoffs_past_tolerance", s.cutoffs_past_tolerance);
+  f->dump_unsigned("max_poll_gap_ms", s.max_poll_gap_ms);
   f->dump_unsigned("cutoffs_on_behalf", s.cutoffs_on_behalf);
   f->dump_unsigned("cutoff_slack_ms", s.cutoff_slack_ms);
   f->dump_bool("unsafe", s.unsafe);
@@ -282,17 +306,39 @@ void OSDOfi::get_alerts(std::map<std::string, std::string>& alerts) const
     alerts.emplace("OOB_DELIVERY_UNSAFE",
 		   "libfabric delivery could not cut off writes in time (" +
 		   ep->last_error() + "); out-of-band delivery stopped");
-  } else if (s.broken) {
+    return;
+  }
+  if (s.broken) {
     alerts.emplace("OOB_DELIVERY_DOWN",
 		   "libfabric delivery could not reopen its endpoint (" +
 		   ep->last_error() + "); out-of-band delivery stopped");
-  } else if (s.cutoffs_late &&
-	     std::chrono::steady_clock::now() - s.last_late_cutoff <
-	       std::chrono::minutes(10)) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  const auto period =
+    cct->_conf.get_val<std::chrono::seconds>("osd_oob_cutoff_late_alert_period");
+  const auto minutes = std::to_string(
+    std::chrono::duration_cast<std::chrono::minutes>(period).count());
+  if (s.cutoffs_past_tolerance && now - s.last_past_cutoff < period) {
+    std::string pause;
+    if (s.max_poll_gap_ms) {
+      pause = "; its threads once went " + std::to_string(s.max_poll_gap_ms) +
+	" ms without running, as when the process is stopped or paused";
+    }
+    alerts.emplace("OOB_CUTOFF_PAST_TOLERANCE",
+		   std::to_string(s.cutoffs_past_tolerance) + " write cut-off(s) "
+		   "ended later than the tolerance of " +
+		   std::to_string(s.late_tolerance_ms) + " ms, the latest "
+		   "within the last " + minutes + " minutes, by up to " +
+		   std::to_string(s.max_cutoff_lateness_ms) + " ms" + pause +
+		   "; delivery goes on. A client that gave a request up and "
+		   "reused its window after the pool's lease and drain may "
+		   "have had it written");
+  } else if (s.cutoffs_late && now - s.last_late_cutoff < period) {
     alerts.emplace("OOB_CUTOFF_LATE",
 		   std::to_string(s.cutoffs_late) + " write cut-off(s) ended "
-		   "after their budget, the latest within the last 10 "
-		   "minutes, by up to " +
+		   "after their budget, the latest within the last " + minutes +
+		   " minutes, by up to " +
 		   std::to_string(s.max_cutoff_lateness_ms) + " ms, within "
 		   "the tolerance of " + std::to_string(s.late_tolerance_ms) +
 		   " ms; a client that gives a request up must allow that "

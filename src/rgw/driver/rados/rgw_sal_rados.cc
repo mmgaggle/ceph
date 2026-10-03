@@ -3837,6 +3837,7 @@ int RadosObject::RadosReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs
   int r = parent_op.iterate(dpp, ofs, end, cb, y);
   params.rdma_submitted = parent_op.params.rdma_submitted;
   params.rdma_fence = parent_op.params.rdma_fence;
+  params.rdma_fence_needed = parent_op.params.rdma_fence_needed;
   return r;
 }
 

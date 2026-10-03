@@ -804,6 +804,9 @@ public:
         double rdma_fence = 0; // out: longest delivery lease plus drain
                                // (seconds) among the pools those ops
                                // were sent to
+        bool rdma_fence_needed = true; // out: a fallback must wait out
+                                       // rdma_fence first; see
+                                       // rgw::rdma::fence_needed()
 
         Params() : lastmod(nullptr), obj_size(nullptr), attrs(nullptr),
 		   target_obj(nullptr), epoch(nullptr)

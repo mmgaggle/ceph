@@ -26,6 +26,7 @@
 
 #include "rgw_asio_thread.h"
 #include "rgw_cksum.h"
+#include "rgw_rdma_fence.h"
 #include "rgw_sal.h"
 #include "rgw_zone.h"
 #include "rgw_cache.h"
@@ -8865,12 +8866,15 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
     data.cancel(); // drain completions without writing back to client
     params.rdma_submitted = data.rdma_ops_sent;
     params.rdma_fence = data.rdma_fence;
+    params.rdma_fence_needed = rgw::rdma::fence_needed(data.rdma_slots);
     return r;
   }
 
   r = data.drain();
   params.rdma_submitted = data.rdma_ops_sent;
   params.rdma_fence = data.rdma_fence;
+  // every read has its result now
+  params.rdma_fence_needed = rgw::rdma::fence_needed(data.rdma_slots);
   if (r < 0) {
     return r;
   }

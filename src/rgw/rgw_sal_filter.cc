@@ -1277,6 +1277,7 @@ int FilterObject::FilterReadOp::iterate(const DoutPrefixProvider* dpp, int64_t o
      * how long to fence the window */
     params.rdma_submitted = next->params.rdma_submitted;
     params.rdma_fence = next->params.rdma_fence;
+    params.rdma_fence_needed = next->params.rdma_fence_needed;
     return ret;
   }
 

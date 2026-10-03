@@ -3024,7 +3024,15 @@ void RGWGetObj::execute(optional_yield y)
     // plain HTTP) mode.
     ldpp_dout(this, 4) << "rdma passthrough unsupported, restarting GET "
                        << "in fallback mode" << dendl;
-    if (read_op->params.rdma_submitted) {
+    if (read_op->params.rdma_submitted &&
+        !read_op->params.rdma_fence_needed) {
+      // every OSD either started no transfer for its stripe or had all
+      // of it land before replying, and no op was resent: nothing of
+      // this attempt can write the window any more
+      ldpp_dout(this, 4) << "rdma fence: not needed, every stripe was "
+                         << "declined or landed and none was resent"
+                         << dendl;
+    } else if (read_op->params.rdma_submitted) {
       // descriptor-bearing ops reached OSDs: an RDMA write we lost
       // track of (an OSD marked down mid-request, or the original
       // attempt of an op the Objecter resent) may still start until
@@ -3062,7 +3070,7 @@ void RGWGetObj::execute(optional_yield y)
     op_ret = 0;
     op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
   }
-  if (read_op->params.rdma_submitted) {
+  if (read_op->params.rdma_submitted && read_op->params.rdma_fence_needed) {
     rdma_fence_ms = static_cast<uint64_t>(
         std::ceil(read_op->params.rdma_fence * 1000.0));
   }

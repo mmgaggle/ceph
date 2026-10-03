@@ -1195,6 +1195,10 @@ class Object {
         /// receiving one, so a fallback that rewrites the window, or a
         /// reuse of it, waits this long first
         double rdma_fence{0};
+        /// out: false when no write of the operations can land any more,
+        /// so a fallback need not wait out rdma_fence: every one came back
+        /// declined or landed, and none was resent
+        bool rdma_fence_needed{true};
       } params;
 
       virtual ~ReadOp() = default;

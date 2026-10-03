@@ -132,6 +132,12 @@ add_executable(unittest_rgw_rdma_rc_wire test_rgw_rdma_rc_wire.cc)
 add_ceph_unittest(unittest_rgw_rdma_rc_wire)
 target_link_libraries(unittest_rgw_rdma_rc_wire ${rgw_libs})
 
+# unittest_rgw_rdma_fence
+add_executable(unittest_rgw_rdma_fence test_rgw_rdma_fence.cc)
+add_ceph_unittest(unittest_rgw_rdma_fence)
+target_include_directories(unittest_rgw_rdma_fence
+  PRIVATE ${CMAKE_SOURCE_DIR}/src/rgw)
+
 # unittest_rgw_cors
 add_executable(unittest_rgw_cors
   test_rgw_cors.cc

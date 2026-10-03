@@ -515,6 +515,20 @@ completion of a write then means that the bytes are in the owner's
 memory. A provider that cannot promise this still works, but the OSD
 logs a warning at startup.
 
+The first write to a peer adds the peer to the provider's address
+vector. Some providers take long to do that. A thread of the executor
+adds the peer, and the writes to that peer wait for it, each only until
+its deadline. A write that gives up has sent nothing, and its read is
+delivered inline. The insert goes on, so a later read finds the peer
+ready. The executor asks the provider for a thread-safe domain. With
+one, writes to other peers go on during the insert. A provider that
+offers only ``FI_THREAD_DOMAIN`` allows no other call meanwhile. Then
+the insert first waits until the writes in flight are done, so that
+none of them misses its cut-off, and writes that start meanwhile wait
+for it, again only until their deadlines. The OSD logs at startup which
+case applies: ``concurrent peer inserts`` or ``peer inserts pause
+writes``.
+
 Providers that progress manually place incoming data only while the
 application polls them. Each window owner in Ceph polls its endpoint
 from a thread. A libfabric client must poll its endpoint while it waits
@@ -590,9 +604,10 @@ The reference provider has these limits:
   one endpoint. Processes on one host need separate interfaces and
   addresses.
 * The first write to a new peer runs ``ip route``, ``arp`` and ``ping``
-  to find the next hop, and the endpoint waits until ``ping`` returns.
-  If the peer does not answer the ping, the wait is 10 seconds. The
-  OSD's write then times out, and the read is delivered inline.
+  to find the next hop. If the peer does not answer the ping, that
+  takes 10 seconds. The provider offers only ``FI_THREAD_DOMAIN``, so
+  the OSD's endpoint sends nothing else meanwhile. Reads whose deadline
+  passes during the wait are delivered inline.
 * It sends writes unencrypted, because the security sublayer is not
   configured.
 * It supports IPv4 only.
@@ -784,7 +799,9 @@ Each executor reports its counters through the OSD's admin socket::
 
 The counters cover plans started, completed and failed, bytes written,
 writes in flight, and windows lent and exhausted. The ``ofi status``
-output also names the provider and the last provider error.
+output also names the provider and the last provider error. Its
+``peer_timeouts`` counts writes that gave up, with nothing sent, while
+a new peer was added to the address vector.
 
 Accounting
 ----------
@@ -796,8 +813,8 @@ received for a PUT, although they do not cross the HTTP socket.
 Testing
 -------
 
-* ``unittest_ofi_rma`` tests the libfabric token format, and writes
-  over the ``tcp`` and ``shm`` providers.
+* ``unittest_ofi_rma`` tests the libfabric token format, writes over
+  the ``tcp`` and ``shm`` providers, and a slow first write to a peer.
 * ``unittest_rgw_rdma_rc_wire`` tests the ``hipobj-rc-v2`` wire
   encoding.
 * ``ceph_test_rgw_ofi_get`` is an S3 client for OSD-direct delivery

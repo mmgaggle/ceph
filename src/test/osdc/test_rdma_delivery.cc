@@ -3,6 +3,9 @@
 
 #include "common/rdma_token.h"
 #include "common/crc64nvme.h"
+#include "osdc/Objecter.h"
+
+#include <optional>
 
 #include "gtest/gtest.h"
 
@@ -236,4 +239,78 @@ TEST(RdmaDelivery, FoldCrc64Ranges)
   overlapped[0].ofs -= 1;
   EXPECT_FALSE(ceph::rdma::fold_crc64_ranges(overlapped).has_value());
   EXPECT_FALSE(ceph::rdma::fold_crc64_ranges({}).has_value());
+}
+
+// An op's out-of-band result reaches its caller in the form the caller
+// asked for. librados takes the callback form; the split-read completion
+// used to copy the aggregate through the pointer form only, so every
+// shard-direct passthrough read told librados (and RGW) that nothing had
+// been delivered. Both the reply path and the split completion go
+// through rdma_oob_wanted() and deliver_rdma_oob_result(); this pins
+// what those promise, on an Op built the way prepare_read_op() builds it.
+TEST(RdmaDelivery, ResultReachesEitherForm)
+{
+  ::ObjectOperation op;
+  ceph::buffer::list bl0, bl1, bl2;
+  int rv0 = 0, rv1 = 0, rv2 = 0;
+
+  ceph::rdma::oob_result_t by_pointer;
+  op.read(0, 4096, &bl0, &rv0, nullptr);
+  op.set_rdma_delivery("t0", 0, 0, &by_pointer);
+
+  std::optional<ceph::rdma::oob_result_t> by_callback;
+  int calls = 0;
+  op.read(4096, 4096, &bl1, &rv1, nullptr);
+  op.set_rdma_delivery("t1", 4096,
+                       ceph::rdma::delivery_t::FLAG_CRC64NVME,
+                       [&](const ceph::rdma::oob_result_t& r) {
+                         by_callback = r;
+                         ++calls;
+                       });
+
+  op.read(8192, 4096, &bl2, &rv2, nullptr);  // no descriptor
+
+  auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                             std::move(op.ops), 0, (Context*)nullptr,
+                             nullptr);
+  o->rdma_delivery.swap(op.rdma_delivery);
+  o->rdma_oob_result.swap(op.rdma_oob_result);
+  o->rdma_oob_handler.swap(op.rdma_oob_handler);
+
+  EXPECT_TRUE(Objecter::rdma_oob_wanted(o, 0));
+  // the callback form alone: the case the split completion skipped
+  EXPECT_TRUE(Objecter::rdma_oob_wanted(o, 1));
+  EXPECT_FALSE(Objecter::rdma_oob_wanted(o, 2));
+  EXPECT_FALSE(Objecter::rdma_oob_wanted(o, 7));
+
+  ceph::rdma::oob_result_t r0;
+  r0.bytes = 4096;
+  Objecter::deliver_rdma_oob_result(o, 0, r0);
+  EXPECT_EQ(4096u, by_pointer.bytes);
+
+  ceph::rdma::oob_result_t r1;
+  r1.bytes = 4096;
+  r1.crc64 = 0x1234;
+  r1.flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME |
+             ceph::rdma::oob_result_t::FLAG_CRC64_RANGES;
+  r1.ranges = {{4096, 2048, 0x11}, {6144, 2048, 0x22}};
+  Objecter::deliver_rdma_oob_result(o, 1, r1);
+  ASSERT_TRUE(by_callback.has_value());
+  EXPECT_EQ(1, calls);
+  EXPECT_EQ(4096u, by_callback->bytes);
+  EXPECT_EQ(0x1234u, by_callback->crc64);
+  EXPECT_EQ(r1.flags, by_callback->flags);
+  ASSERT_EQ(2u, by_callback->ranges.size());
+  EXPECT_EQ(6144u, by_callback->ranges[1].ofs);
+
+  // the callback is one-shot: a later delivery for the same op (a
+  // resend's reply) does not call it again
+  Objecter::deliver_rdma_oob_result(o, 1, r1);
+  EXPECT_EQ(1, calls);
+  EXPECT_FALSE(Objecter::rdma_oob_wanted(o, 1));
+
+  // an op with no descriptor and no result asked for is left alone
+  Objecter::deliver_rdma_oob_result(o, 2, r1);
+
+  o->put();
 }

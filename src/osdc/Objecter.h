@@ -2662,6 +2662,19 @@ public:
   void _cancel_linger_op(Op *op);
   void _finish_op(Op *op, int r);
   boost::system::error_code process_op_reply_handlers(Op *op, std::vector<OSDOp> &out_ops);
+public:
+  /// true when op i asked for its out-of-band delivery result, through
+  /// the pointer form or the callback form (ObjectOperation::rdma_oob_handler)
+  static bool rdma_oob_wanted(const Op *op, unsigned i);
+  /// hand op i's out-of-band delivery result to its caller: copy it
+  /// through the pointer form, then invoke (and drop) the callback
+  /// form. Every path that completes an op's reads goes through here,
+  /// the split-read completion included: librados takes the callback
+  /// form, so a path that serves only the pointer leaves it believing
+  /// that nothing was delivered.
+  static void deliver_rdma_oob_result(Op *op, unsigned i,
+                                      const ceph::rdma::oob_result_t& r);
+private:
   void complete_op_reply(Op *op, boost::system::error_code handler_error, OSDSession *s, std::unique_lock<std::shared_mutex> &sl, int rc);
   static bool is_pg_changed(
     int oldprimary,

@@ -572,8 +572,13 @@ void SplitOp::complete() {
     // extents, EC-direct ones by interleaved chunks - so when every
     // pushing sub-read reported ranges, they fold into the crc64 of
     // the op as one contiguous extent.
+    //
+    // The result goes to the caller in whichever form it asked for:
+    // librados takes the callback form, which a pointer-only copy here
+    // used to skip, so every split passthrough read reported nothing
+    // delivered.
     for (unsigned i = 0; i < orig_op->rdma_oob_result.size(); ++i) {
-      if (!orig_op->rdma_oob_result[i]) {
+      if (!Objecter::rdma_oob_wanted(orig_op, i)) {
         continue;
       }
       ceph::rdma::oob_result_t agg;
@@ -610,7 +615,7 @@ void SplitOp::complete() {
       } else {
         agg.ranges.clear();
       }
-      *orig_op->rdma_oob_result[i] = std::move(agg);
+      Objecter::deliver_rdma_oob_result(orig_op, i, agg);
     }
 
     // In a "normal" completion, out_ops is generated in the MOSDOpReply reply

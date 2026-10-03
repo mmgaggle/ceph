@@ -3986,20 +3986,8 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     const auto& oob = m->get_oob_results();
     const ceph::rdma::oob_result_t none;
     for (unsigned i = 0; i < op->rdma_oob_result.size(); ++i) {
-      auto* result = op->rdma_oob_result[i];
-      auto* handler =
-	(op->rdma_oob_handler && i < op->rdma_oob_handler->size() &&
-	 (*op->rdma_oob_handler)[i]) ? &(*op->rdma_oob_handler)[i] : nullptr;
-      if (!result && !handler) {
-	continue;
-      }
-      const auto& r = i < oob.size() ? oob[i] : none;
-      if (result) {
-	*result = r;
-      }
-      if (handler) {
-	std::move(*handler)(r);
-	*handler = nullptr;
+      if (rdma_oob_wanted(op, i)) {
+	deliver_rdma_oob_result(op, i, i < oob.size() ? oob[i] : none);
       }
     }
   }
@@ -4013,6 +4001,29 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
   // This function unlocks sl.
   complete_op_reply(op, handler_error, s, sl, rc);
   m->put();
+}
+
+bool Objecter::rdma_oob_wanted(const Op *op, unsigned i)
+{
+  if (i < op->rdma_oob_result.size() && op->rdma_oob_result[i]) {
+    return true;
+  }
+  return op->rdma_oob_handler && i < op->rdma_oob_handler->size() &&
+    (*op->rdma_oob_handler)[i];
+}
+
+void Objecter::deliver_rdma_oob_result(Op *op, unsigned i,
+				       const ceph::rdma::oob_result_t& r)
+{
+  if (i < op->rdma_oob_result.size() && op->rdma_oob_result[i]) {
+    *op->rdma_oob_result[i] = r;
+  }
+  if (op->rdma_oob_handler && i < op->rdma_oob_handler->size() &&
+      (*op->rdma_oob_handler)[i]) {
+    auto& handler = (*op->rdma_oob_handler)[i];
+    std::move(handler)(r);
+    handler = nullptr;
+  }
 }
 
 void Objecter::complete_op_reply(Op *op, bs::error_code handler_error, OSDSession *s, unique_lock<std::shared_mutex> &sl, int rc) {

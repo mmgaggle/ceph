@@ -672,9 +672,12 @@ inline namespace v14_2_0 {
     /// late duplicate of a completed write, which retiring the window's
     /// key stops)
     static constexpr uint32_t RDMA_DELIVERY_LANDED = 16;
-    /// result flag: the operation was sent more than once; an earlier
+    /// result flag: the operation was sent more than once, and an earlier
     /// attempt may have started a transfer that this result knows nothing
-    /// of, and may land until the pool's lease and drain after it
+    /// of, which may land until the pool's lease and drain after it. Not
+    /// set when every earlier attempt was answered with each of its
+    /// descriptor-bearing reads declined or landed (a replica that bounced
+    /// a balanced read, say).
     static constexpr uint32_t RDMA_DELIVERY_RESENT = 32;
     void set_rdma_delivery(const std::string& token, uint64_t base_offset,
 			   uint32_t flags, rdma_delivery_result *result);

@@ -344,7 +344,55 @@ TEST(RdmaDelivery, ResentResultsAreMarked)
   Objecter::deliver_rdma_oob_result(o, 0, declined);
   EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_DECLINED |
             ceph::rdma::oob_result_t::FLAG_RESENT, got.flags);
+
+  // a resend whose earlier attempts were all answered declined or
+  // landed went out vouched for, and its result is not resent
+  o->rdma_retry_settled = true;
+  Objecter::deliver_rdma_oob_result(o, 0, declined);
+  EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_DECLINED, got.flags);
   o->put();
+}
+
+// An attempt is settled - nothing of it can land after its reply - when
+// every descriptor-bearing op of it was declined or landed and none was
+// resent. A replica's -EAGAIN bounce reports declined for each op.
+TEST(RdmaDelivery, AttemptSettled)
+{
+  using R = ceph::rdma::oob_result_t;
+  using ceph::rdma::attempt_settled;
+  // no results at all (an old OSD, no reply): not settled
+  EXPECT_FALSE(attempt_settled({}));
+  EXPECT_TRUE(attempt_settled({R::FLAG_DECLINED}));
+  EXPECT_TRUE(attempt_settled({R::FLAG_LANDED | R::FLAG_CRC64NVME}));
+  // a split whose one shard bounced while the other landed its share
+  EXPECT_TRUE(attempt_settled({R::FLAG_DECLINED, R::FLAG_LANDED}));
+  // a push cut off after its writes went out, or a result that says
+  // nothing: not settled
+  EXPECT_FALSE(attempt_settled({R::FLAG_DECLINED, 0}));
+  EXPECT_FALSE(attempt_settled({R::FLAG_CRC64NVME}));
+  // a part that was itself resent may hide an unanswered attempt
+  EXPECT_FALSE(attempt_settled({R::FLAG_DECLINED,
+                                R::FLAG_LANDED | R::FLAG_RESENT}));
+}
+
+// An OSD delivers a resend out of band only when every descriptor it
+// carries is vouched for; the bit is one the OSD knows, so a first
+// attempt carrying it is not refused for an unknown flag.
+TEST(RdmaDelivery, PriorAttemptsSettled)
+{
+  using D = ceph::rdma::delivery_t;
+  using ceph::rdma::prior_attempts_settled;
+  EXPECT_NE(0u, D::KNOWN_FLAGS & D::FLAG_PRIOR_SETTLED);
+  D vouched{"t0", 0, D::FLAG_PRIOR_SETTLED | D::FLAG_CRC64NVME};
+  D plain{"t1", 4096, D::FLAG_CRC64NVME};
+  D none;  // an op of the request without a descriptor
+  EXPECT_TRUE(prior_attempts_settled({vouched}));
+  EXPECT_TRUE(prior_attempts_settled({none, vouched, none}));
+  EXPECT_FALSE(prior_attempts_settled({vouched, plain}));
+  EXPECT_FALSE(prior_attempts_settled({plain}));
+  // nothing to deliver: nothing vouched for
+  EXPECT_FALSE(prior_attempts_settled({none}));
+  EXPECT_FALSE(prior_attempts_settled({}));
 }
 
 // A split read's result: declined only when every sub-read declined,

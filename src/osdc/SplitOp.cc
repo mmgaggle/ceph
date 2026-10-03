@@ -538,8 +538,9 @@ void SplitOp::complete() {
 
   // Aggregate out-of-band delivery per parent op. Mixed replies for
   // one op (some sub-reads pushed, some returned inline) cannot be
-  // assembled into a coherent response: retry to the primary, where
-  // the resend (attempts > 0) is guaranteed to deliver inline.
+  // assembled into a coherent response: retry to the primary - as a
+  // resend, which it delivers inline, unless every sub-read settled
+  // (see below).
   std::vector<uint64_t> oob_total(orig_op->ops.size(), 0);
   if (rc >= 0) {
     for (unsigned i : oob_ops) {
@@ -707,6 +708,27 @@ void SplitOp::complete() {
     ldout(cct, DBG_LVL) << __func__ << " object_id=" << orig_op->target.base_oid << " success this=" << this << " rc=" << rc << dendl;
   } else {
     ldout(cct, DBG_LVL) << __func__ << " object_id=" << orig_op->target.base_oid << " retry this=" << this << " rc=" << rc << dendl;
+    if (rc == -EAGAIN && !oob_ops.empty()) {
+      // Every sub-read has replied by now. When each descriptor-bearing
+      // one was declined (a replica bounced it, a shard refused to push)
+      // or landed, no write of this split can land after this point, and
+      // the retry to the primary may deliver out of band as a first
+      // attempt instead of falling back behind the window's fence.
+      std::vector<uint32_t> parts;
+      for (unsigned i : oob_ops) {
+        for (auto& [index, sub_read] : sub_reads) {
+          for (unsigned j = 0; j < sub_read.parent_ops.size(); ++j) {
+            if (sub_read.parent_ops[j] == (int)i && j < sub_read.oob.size()) {
+              parts.push_back(sub_read.oob[j].flags);
+            }
+          }
+        }
+      }
+      orig_op->rdma_split_settled = ceph::rdma::attempt_settled(parts);
+      ldout(cct, DBG_LVL) << __func__ << " object_id=" << orig_op->target.base_oid
+        << " rdma sub-reads " << (orig_op->rdma_split_settled ? "settled" : "unsettled")
+        << dendl;
+    }
   }
   objecter.op_post_split_op_complete(orig_op, handler_error, rc);
 }

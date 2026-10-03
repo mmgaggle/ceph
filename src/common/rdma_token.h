@@ -90,8 +90,14 @@ struct delivery_t {
   /// FLAG_CRC64_COMBINABLE, else fold the per-range values under
   /// FLAG_CRC64_RANGES)
   static constexpr uint32_t FLAG_CRC64NVME = 1u << 0;
+  /// set by the client library on a resent op: every earlier attempt
+  /// got a reply whose result for this op was declined or landed, so
+  /// none of them can still write the window, and the OSD may deliver
+  /// this attempt out of band as it would a first one. An OSD that
+  /// does not know the bit delivers inline, as it does any resend.
+  static constexpr uint32_t FLAG_PRIOR_SETTLED = 1u << 1;
   /// flag bits the OSD understands; unknown bits deliver inline
-  static constexpr uint32_t KNOWN_FLAGS = FLAG_CRC64NVME;
+  static constexpr uint32_t KNOWN_FLAGS = FLAG_CRC64NVME | FLAG_PRIOR_SETTLED;
 
   std::string token;      ///< opaque cuObject RDMA descriptor
   uint64_t base_offset = 0; ///< client-window offset for the op's first byte
@@ -260,6 +266,49 @@ inline uint32_t fold_transfer_flags(const std::vector<uint32_t>& parts,
   return (declined ? oob_result_t::FLAG_DECLINED : 0) |
     (landed ? oob_result_t::FLAG_LANDED : 0) |
     (resent ? oob_result_t::FLAG_RESENT : 0);
+}
+
+/**
+ * Whether an attempt whose descriptor-bearing ops got these result
+ * flags is settled: every one declined (started no transfer) or landed
+ * (every write completed before the reply), and none was resent. No
+ * write of a settled attempt can land after its reply, so a retry of
+ * it may deliver out of band like a first attempt. Mixed results
+ * settle too - some parts declined, the others landed. An attempt with
+ * no results (an old OSD, no reply) is not settled.
+ */
+inline bool attempt_settled(const std::vector<uint32_t>& parts)
+{
+  if (parts.empty()) {
+    return false;
+  }
+  for (uint32_t f : parts) {
+    if (!(f & (oob_result_t::FLAG_DECLINED | oob_result_t::FLAG_LANDED)) ||
+        (f & oob_result_t::FLAG_RESENT)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether a resent op's client vouched that every earlier attempt is
+ * settled (delivery_t::FLAG_PRIOR_SETTLED on every descriptor it
+ * carries), so its OSD may deliver it out of band.
+ */
+inline bool prior_attempts_settled(const std::vector<delivery_t>& deliveries)
+{
+  bool any = false;
+  for (const auto& d : deliveries) {
+    if (d.empty()) {
+      continue;
+    }
+    if (!(d.flags & delivery_t::FLAG_PRIOR_SETTLED)) {
+      return false;
+    }
+    any = true;
+  }
+  return any;
 }
 
 /**

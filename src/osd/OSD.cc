@@ -1714,6 +1714,19 @@ void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
 				       !m->has_flag(CEPH_OSD_FLAG_RETURNVEC));
   reply->set_reply_versions(v, uv);
   reply->set_op_returns(op_returns);
+  if (m->has_rdma_delivery()) {
+    // an op answered here never reached complete_read_ctx, the only
+    // place a transfer starts: say so, so that a client bounced off a
+    // laggy replica can retry without fencing its window
+    const auto& deliveries = m->get_rdma_deliveries();
+    std::vector<ceph::rdma::oob_result_t> oob(deliveries.size());
+    for (size_t i = 0; i < deliveries.size(); i++) {
+      if (!deliveries[i].empty()) {
+	oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
+      }
+    }
+    reply->set_oob_results(std::move(oob));
+  }
   m->get_connection()->send_message(reply);
 }
 

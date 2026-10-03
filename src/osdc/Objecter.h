@@ -2118,9 +2118,21 @@ public:
     /// per-op advisory out-of-band delivery (aligned with ops; empty
     /// token = inline); re-stamped onto every MOSDOp this Op sends
     /// (resends included, where the OSD-side retry refusal keeps the
-    /// descriptors inert)
+    /// descriptors inert unless every earlier attempt is settled)
     boost::container::small_vector<ceph::rdma::delivery_t, osdc_opvec_len>
       rdma_delivery;
+    /// the attempt last sent with descriptors has had no settled reply
+    /// (every descriptor-bearing op declined or landed) yet
+    bool rdma_attempt_unsettled = false;
+    /// some superseded attempt never had a settled reply, so a write of
+    /// it may still land: every later attempt stays a plain resend
+    bool rdma_history_unsettled = false;
+    /// the attempt in flight is a resend whose earlier attempts were all
+    /// settled; its results are not marked resent
+    bool rdma_retry_settled = false;
+    /// set by a split read that ends in EAGAIN: every sub-read was
+    /// answered declined or landed, so the retry is a first attempt
+    bool rdma_split_settled = false;
     boost::container::small_vector<ceph::rdma::oob_result_t*, osdc_opvec_len>
       rdma_oob_result;
     /// callback-form results, taken over from the ObjectOperation at

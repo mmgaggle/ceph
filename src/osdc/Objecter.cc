@@ -2403,12 +2403,17 @@ void Objecter::op_post_split_op_complete(Op* op, bs::error_code ec, int rc) {
       _session_op_remove(op->session, op);
       sl.unlock();
       op->split_op_tids.reset();
-      if (op->has_rdma_delivery()) {
+      if (op->has_rdma_delivery() && !op->rdma_split_settled) {
 	// The split was an attempt: its sub-reads may have started
 	// transfers into the window. Send the retry as a resend, which
 	// the primary delivers inline and the result marks resent.
+	// When every sub-read was answered declined or landed (a replica
+	// bounced its share, say), nothing of the split can land any
+	// more, and the retry goes out as the first attempt it is.
 	op->attempts = std::max(op->attempts, 1);
+	op->rdma_history_unsettled = true;
       }
+      op->rdma_split_settled = false;
       ceph_tid_t tid = 0;
       _op_submit(op, rl, &tid);
     }
@@ -3597,8 +3602,25 @@ Objecter::MOSDOp *Objecter::_prepare_osd_op(Op *op)
     // garbage-decoded by old OSDs). When the gate fails the data
     // simply returns inline, which is always correct.
     ceph_assert(op->rdma_delivery.size() == op->ops.size());
-    m->set_rdma_deliveries(std::vector<ceph::rdma::delivery_t>(
-      op->rdma_delivery.begin(), op->rdma_delivery.end()));
+    std::vector<ceph::rdma::delivery_t> deliveries(
+      op->rdma_delivery.begin(), op->rdma_delivery.end());
+    if (op->rdma_attempt_unsettled) {
+      // the attempt this one supersedes had no settled reply: a write
+      // of it may still land, now and for every later attempt
+      op->rdma_history_unsettled = true;
+    }
+    // a resend whose earlier attempts were all answered declined or
+    // landed may be delivered like a first attempt; say so
+    op->rdma_retry_settled = op->attempts > 1 && !op->rdma_history_unsettled;
+    if (op->rdma_retry_settled) {
+      for (auto& d : deliveries) {
+	if (!d.empty()) {
+	  d.flags |= ceph::rdma::delivery_t::FLAG_PRIOR_SETTLED;
+	}
+      }
+    }
+    m->set_rdma_deliveries(std::move(deliveries));
+    op->rdma_attempt_unsettled = true;
   }
 
   logger->inc(l_osdc_op_send);
@@ -3887,6 +3909,23 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     // have, but that is better than doing callbacks out of order.
   }
 
+  if (op->rdma_attempt_unsettled) {
+    // the reply to the attempt in flight: when every descriptor-bearing
+    // op was declined or landed, nothing of that attempt lands after
+    // this point, and a resend of it (a replica's -EAGAIN) may deliver
+    // out of band
+    const auto& oob = m->get_oob_results();
+    std::vector<uint32_t> parts;
+    for (unsigned i = 0; i < op->rdma_delivery.size(); ++i) {
+      if (!op->rdma_delivery[i].empty()) {
+	parts.push_back(i < oob.size() ? oob[i].flags : 0);
+      }
+    }
+    if (ceph::rdma::attempt_settled(parts)) {
+      op->rdma_attempt_unsettled = false;
+    }
+  }
+
   int rc = m->get_result();
 
   if (m->is_redirect_reply()) {
@@ -4023,9 +4062,10 @@ void Objecter::deliver_rdma_oob_result(Op *op, unsigned i,
 {
   // An op sent more than once may have started a transfer in an earlier
   // attempt that this result knows nothing of: say so, so that a caller
-  // fences its window before reusing it.
+  // fences its window before reusing it - unless every earlier attempt
+  // was answered declined or landed.
   ceph::rdma::oob_result_t r = in;
-  if (op->attempts > 1) {
+  if (op->attempts > 1 && !op->rdma_retry_settled) {
     r.flags |= ceph::rdma::oob_result_t::FLAG_RESENT;
   }
   if (i < op->rdma_oob_result.size() && op->rdma_oob_result[i]) {

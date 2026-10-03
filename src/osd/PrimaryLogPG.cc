@@ -9376,8 +9376,11 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
   }
   // a resent op could double-execute against client memory while the
   // superseded attempt's write is still in flight on another OSD;
-  // deliver inline so at most one attempt ever writes the window
-  if (m->get_retry_attempt() > 0) {
+  // deliver inline so at most one attempt ever writes the window -
+  // unless the client vouches that every earlier attempt was answered
+  // declined or landed (a replica bounced it, say), when none can
+  if (m->get_retry_attempt() > 0 &&
+      !ceph::rdma::prior_attempts_settled(deliveries)) {
     decline_all();
     return false;
   }

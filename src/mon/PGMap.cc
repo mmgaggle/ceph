@@ -3351,6 +3351,8 @@ void PGMap::get_health_checks(
         summary += " stopped out-of-band delivery after a write cut-off failed";
       } else if (asum.first == "OOB_DELIVERY_DOWN") {
         summary += " stopped out-of-band delivery after losing the transport";
+      } else if (asum.first == "OOB_CUTOFF_LATE") {
+        summary += " cut off out-of-band writes late, within the tolerance";
       }
 
       auto& d = checks->add(asum.first, HEALTH_WARN, summary, asum.second.first);

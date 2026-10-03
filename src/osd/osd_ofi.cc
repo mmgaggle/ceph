@@ -42,6 +42,8 @@ int OSDOfi::init()
   const bool gather = conf.get_val<bool>("osd_oob_gather");
   // windows only fill while someone polls a manual-progress provider
   cfg.progress_thread = gather;
+  cfg.late_tolerance =
+    conf.get_val<std::chrono::milliseconds>("osd_oob_cutoff_late_tolerance");
   cfg.cutoff_close_hook = [cct = cct] {
     return cct->_conf.get_val<bool>("osd_ofi_inject_cutoff_failure") ?
       -EIO : 0;
@@ -245,6 +247,10 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_int("close_discards", s.close_discards);
   f->dump_unsigned("cutoffs_failed", s.cutoffs_failed);
   f->dump_unsigned("cutoffs_late", s.cutoffs_late);
+  f->dump_unsigned("max_cutoff_lateness_ms", s.max_cutoff_lateness_ms);
+  f->dump_unsigned("late_tolerance_ms", s.late_tolerance_ms);
+  f->dump_unsigned("cutoffs_on_behalf", s.cutoffs_on_behalf);
+  f->dump_unsigned("cutoff_slack_ms", s.cutoff_slack_ms);
   f->dump_bool("unsafe", s.unsafe);
   f->dump_bool("broken", s.broken);
   f->dump_unsigned("cutoff_cost_ms", s.cutoff_cost_ms);
@@ -277,5 +283,16 @@ void OSDOfi::get_alerts(std::map<std::string, std::string>& alerts) const
     alerts.emplace("OOB_DELIVERY_DOWN",
 		   "libfabric delivery could not reopen its endpoint (" +
 		   ep->last_error() + "); out-of-band delivery stopped");
+  } else if (s.cutoffs_late &&
+	     std::chrono::steady_clock::now() - s.last_late_cutoff <
+	       std::chrono::minutes(10)) {
+    alerts.emplace("OOB_CUTOFF_LATE",
+		   std::to_string(s.cutoffs_late) + " write cut-off(s) ended "
+		   "after their budget, the latest within the last 10 "
+		   "minutes, by up to " +
+		   std::to_string(s.max_cutoff_lateness_ms) + " ms, within "
+		   "the tolerance of " + std::to_string(s.late_tolerance_ms) +
+		   " ms; a client that gives a request up must allow that "
+		   "beyond the pool's delivery lease and drain");
   }
 }

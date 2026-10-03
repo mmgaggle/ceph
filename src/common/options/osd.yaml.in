@@ -1716,6 +1716,26 @@ options:
   - osd
   flags:
   - runtime
+- name: osd_oob_cutoff_late_tolerance
+  type: millisecs
+  level: advanced
+  desc: How late an out-of-band write's cut-off may end, past the budget it
+    protects, before the OSD stops out-of-band delivery
+  long_desc: A write still in flight when its budget, the pool's
+    rdma_delivery_lease plus rdma_delivery_drain from receipt, runs out is
+    cut off. A cut-off that ends after the budget by no more than this, and
+    that itself took no longer, is counted and raises the OOB_CUTOFF_LATE
+    health warning; it is usually a scheduling delay on a loaded host.
+    Clients that receive a response, and the gateway's fallback, wait for
+    the OSD's reply, which follows the cut-off, so they are not affected; a
+    client that gives a request up must allow this much beyond the lease
+    and the drain. A cut-off later than this, or one that takes longer,
+    stops out-of-band delivery (see osd_oob_cutoff_failure).
+  default: 1000
+  services:
+  - osd
+  flags:
+  - startup
 - name: osd_ofi_inject_cutoff_failure
   type: bool
   level: dev

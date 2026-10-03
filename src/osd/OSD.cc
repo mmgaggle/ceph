@@ -1099,6 +1099,11 @@ void OSDService::set_statfs(const struct store_statfs_t &stbuf,
   logger->set(l_osd_stat_bytes_used, used);
   logger->set(l_osd_stat_bytes_avail, avail);
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+  for (auto* e : oob_executors) {
+    e->get_alerts(alerts);
+  }
+#endif
   std::lock_guard l(stat_lock);
   osd_stat.statfs = stbuf;
   osd_stat.os_alerts.clear();
@@ -4153,7 +4158,7 @@ int OSD::init()
 #endif
     } else if (t == ceph::rdma::TRANSPORT_OFI) {
 #ifdef WITH_OOB_OFI
-      auto ofi = std::make_unique<OSDOfi>(cct);
+      auto ofi = std::make_unique<OSDOfi>(cct, clog);
       if (int r = ofi->init(); r == 0) {
 	service.ofi = ofi.release();
 	service.oob_executors.push_back(service.ofi);

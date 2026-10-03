@@ -18,7 +18,8 @@
 #undef dout_prefix
 #define dout_prefix *_dout << "osd_ofi: "
 
-OSDOfi::OSDOfi(CephContext* cct) : cct(cct) {}
+OSDOfi::OSDOfi(CephContext* cct, LogChannelRef clog)
+  : cct(cct), clog(std::move(clog)) {}
 
 OSDOfi::~OSDOfi()
 {
@@ -40,6 +41,10 @@ int OSDOfi::init()
   const bool gather = conf.get_val<bool>("osd_oob_gather");
   // windows only fill while someone polls a manual-progress provider
   cfg.progress_thread = gather;
+  cfg.cutoff_close_hook = [cct = cct] {
+    return cct->_conf.get_val<bool>("osd_ofi_inject_cutoff_failure") ?
+      -EIO : 0;
+  };
   if (cfg.stage_size == 0 || cfg.stage_count == 0) {
     derr << "osd_oob_buffer_size and osd_oob_buffer_count must be nonzero"
 	 << dendl;
@@ -91,12 +96,34 @@ int OSDOfi::init()
 
 bool OSDOfi::is_available() const
 {
-  return static_cast<bool>(ep);
+  return ep && !stopped && !ep->unsafe();
+}
+
+bool OSDOfi::check_unsafe()
+{
+  if (!ep || !ep->unsafe()) {
+    return false;
+  }
+  if (stopped.exchange(true)) {
+    return true;
+  }
+  const std::string why = ep->last_error();
+  derr << "libfabric delivery is unsafe: " << why
+       << "; out-of-band delivery stopped on this osd" << dendl;
+  if (clog) {
+    clog->error() << "libfabric delivery is unsafe: " << why
+		  << "; out-of-band delivery stopped";
+  }
+  if (cct->_conf.get_val<std::string>("osd_oob_cutoff_failure") == "abort") {
+    ceph_abort_msg("libfabric delivery could not cut off its writes (" + why +
+		   "); osd_oob_cutoff_failure=abort");
+  }
+  return true;
 }
 
 bool OSDOfi::handles(const std::string& token) const
 {
-  if (!ep) {
+  if (!is_available()) {
     return false;
   }
   auto t = ceph::ofi::parse_token(token);
@@ -127,10 +154,14 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
   }
   plans_started++;
   const int r = ep->write(*t, iov.data(), iov.size(), writes, budget);
+  if (r == -ENOTRECOVERABLE || ep->unsafe()) {
+    check_unsafe();
+  }
   if (r < 0) {
     plans_failed++;
     dout(5) << "plan for " << key << " failed: " << cpp_strerror(r)
-	    << (r == -EIO || r == -ETIMEDOUT || r == -ECANCELED ?
+	    << (r == -EIO || r == -ETIMEDOUT || r == -ECANCELED ||
+		r == -ENOTRECOVERABLE ?
 		" (" + ep->last_error() + ")" :
 		std::string{}) << dendl;
     return r;
@@ -144,7 +175,7 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
 
 std::optional<OSDOobExecutor::window_t> OSDOfi::acquire_window(size_t size)
 {
-  if (!ep || size > slot_size) {
+  if (!is_available() || size > slot_size) {
     return std::nullopt;
   }
   const auto now = std::chrono::steady_clock::now();
@@ -195,7 +226,7 @@ void OSDOfi::window_sync()
 
 void OSDOfi::dump_stats(ceph::Formatter* f) const
 {
-  f->dump_bool("available", static_cast<bool>(ep));
+  f->dump_bool("available", is_available());
   if (!ep) {
     return;
   }
@@ -211,8 +242,32 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("staging_busy", s.staging_busy);
   f->dump_unsigned("timeouts", s.timeouts);
   f->dump_unsigned("cutoffs", s.resets);
+  f->dump_unsigned("cutoffs_failed", s.cutoffs_failed);
+  f->dump_unsigned("cutoffs_late", s.cutoffs_late);
+  f->dump_bool("unsafe", s.unsafe);
+  f->dump_bool("broken", s.broken);
+  f->dump_unsigned("cutoff_cost_ms", s.cutoff_cost_ms);
+  f->dump_unsigned("budget_refused", s.budget_refused);
+  f->dump_unsigned("late_starts", s.late_starts);
   f->dump_unsigned("peer_timeouts", s.peer_timeouts);
   f->dump_unsigned("windows_acquired", windows_acquired);
   f->dump_unsigned("windows_exhausted", windows_exhausted);
   f->dump_string("last_error", ep->last_error());
+}
+
+void OSDOfi::get_alerts(std::map<std::string, std::string>& alerts) const
+{
+  if (!ep) {
+    return;
+  }
+  const auto s = ep->stats();
+  if (s.unsafe) {
+    alerts.emplace("OOB_DELIVERY_UNSAFE",
+		   "libfabric delivery could not cut off writes in time (" +
+		   ep->last_error() + "); out-of-band delivery stopped");
+  } else if (s.broken) {
+    alerts.emplace("OOB_DELIVERY_DOWN",
+		   "libfabric delivery could not reopen its endpoint (" +
+		   ep->last_error() + "); out-of-band delivery stopped");
+  }
 }

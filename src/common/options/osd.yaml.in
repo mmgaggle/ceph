@@ -1682,6 +1682,35 @@ options:
   default: false
   services:
   - osd
+- name: osd_oob_cutoff_failure
+  type: str
+  level: advanced
+  desc: What an OSD does when an out-of-band transport fails to cut off
+    writes that missed their deadline, or cuts them off late
+  long_desc: Such writes may land in a client's window after the client was
+    told they would not. "disable" stops out-of-band delivery on the OSD,
+    logs to the cluster log and raises the OOB_DELIVERY_UNSAFE health
+    warning; reads are then delivered inline. "abort" also makes the OSD
+    exit, which ends the writes of a software provider and makes a device
+    drop the queue pair's; restart it once the transport is fixed.
+  default: disable
+  enum_values:
+  - disable
+  - abort
+  services:
+  - osd
+  flags:
+  - runtime
+- name: osd_ofi_inject_cutoff_failure
+  type: bool
+  level: dev
+  desc: Make the libfabric executor's cut-offs fail as if the provider could
+    not close its endpoint, to test osd_oob_cutoff_failure
+  default: false
+  services:
+  - osd
+  flags:
+  - runtime
 - name: osd_oob_window_size
   type: size
   level: dev

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <map>
 #include <optional>
 #include <string>
 #include <sys/types.h>
@@ -56,6 +57,13 @@ public:
 
   /// asok/debug counters
   virtual void dump_stats(ceph::Formatter* f) const = 0;
+
+  /**
+   * Add this executor's health alerts, by alert name, to an OSD's alerts
+   * (osd_alert_list_t). The OSD reports them with its stats, and the
+   * manager raises each name as a health warning.
+   */
+  virtual void get_alerts(std::map<std::string, std::string>& alerts) const {}
 
   /**
    * A registered region of this OSD's memory that peers can push into,

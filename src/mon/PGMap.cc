@@ -3347,6 +3347,10 @@ void PGMap::get_health_checks(
         summary += " experiencing high free space fragmentation of BlueStore";
       } else if (asum.first == "EXTBLKDEV") {
         summary += " reporting problems with ExtBlkDev plugin";
+      } else if (asum.first == "OOB_DELIVERY_UNSAFE") {
+        summary += " stopped out-of-band delivery after a write cut-off failed";
+      } else if (asum.first == "OOB_DELIVERY_DOWN") {
+        summary += " stopped out-of-band delivery after losing the transport";
       }
 
       auto& d = checks->add(asum.first, HEALTH_WARN, summary, asum.second.first);

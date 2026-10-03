@@ -137,6 +137,19 @@ no descriptor. An OSD replies inline in these cases:
   written twice.
 * The descriptor has flag bits that the OSD does not know.
 
+With an inline reply, the OSD also says whether it started a transfer
+for the operation at all. When it did not, as in the cases above, or
+when its executor sent nothing (no staging buffer, a budget already
+spent, no address for the client yet), the result is marked declined:
+nothing of the operation reached the window. When the OSD delivered the
+data over a transport whose writes are delivery-complete, the result is
+marked landed: every byte was in the window before the reply. The RADOS
+client marks a result resent when it sent the operation more than once,
+since an earlier attempt may have started a transfer that this result
+knows nothing of. librados reports these as
+``RDMA_DELIVERY_DECLINED``, ``RDMA_DELIVERY_LANDED`` and
+``RDMA_DELIVERY_RESENT``. An OSD of an older release sets none of them.
+
 Executors and tokens
 --------------------
 
@@ -206,7 +219,10 @@ The gateway tries these modes in order, for each request:
    not see the restart, because the gateway has not sent HTTP bytes
    yet. When stripe operations already reached the OSDs, the gateway
    first waits for the fence described in
-   `Fencing a window before reuse`_.
+   `Fencing a window before reuse`_, unless no write of the request can
+   land any more: every stripe came back declined or landed, and none
+   was resent. One OSD that does not deliver out of band then costs a
+   re-read over HTTP, not the fence.
 #. Gateway-staged mode, when the token is a cuObject descriptor and the
    gateway runs its cuObject server (``cuobj`` in
    ``rgw_rdma_transports``).
@@ -238,7 +254,12 @@ use again:
   OSD that disappears during the request, and an operation that the
   gateway's RADOS client sent again. Before a fallback rewrites the
   window, the gateway waits for the lease plus the drain, which it
-  reads from the OSDMap. The window is then quiet before it is written
+  reads from the OSDMap. It skips the wait when every stripe came back
+  declined, so no transfer started, or landed, so every write completed
+  before the reply, and no stripe was resent. A stripe that was resent,
+  one an OSD started a transfer for and then returned inline, one from
+  an older OSD, and one without a result, as when its read timed out,
+  keep the wait. The window is then quiet before it is written
   again.
 
 How an OSD cuts off a write depends on the transport:

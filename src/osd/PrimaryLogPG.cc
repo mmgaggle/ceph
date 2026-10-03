@@ -9415,8 +9415,9 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
     bool started = false;
     if (deliver_op_oob(ctx, i, rops[i], deliveries[i], oob[i], &started)) {
       any = true;
-    } else if (!started) {
-      oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
+    } else {
+      // inline: declined if nothing of it went out
+      oob[i].flags |= ceph::rdma::attempt_flags(false, started, false);
     }
   }
   return any;
@@ -9531,11 +9532,9 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
     encode(bufferlist(), data_op->outdata);
   }
   res.bytes = static_cast<uint64_t>(pushed);
-  if (exec->delivery_complete()) {
-    // every byte is in the window: nothing of this op lands after the
-    // reply, which follows
-    res.flags |= ceph::rdma::oob_result_t::FLAG_LANDED;
-  }
+  // with delivery-complete writes every byte is in the window: nothing of
+  // this op lands after the reply, which follows
+  res.flags |= ceph::rdma::attempt_flags(true, true, exec->delivery_complete());
   if (d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME) {
     // checksum each placed range at the storage node, after it
     // crossed the fabric. Every triple is one contiguous logical

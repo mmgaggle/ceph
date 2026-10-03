@@ -4,8 +4,10 @@
 #include "common/rdma_token.h"
 #include "common/crc64nvme.h"
 #include "osdc/Objecter.h"
+#include "rgw/rgw_rdma_fence.h"
 
 #include <optional>
+#include <vector>
 
 #include "gtest/gtest.h"
 
@@ -367,4 +369,76 @@ TEST(RdmaDelivery, FoldTransferFlags)
                                  R::FLAG_DECLINED | R::FLAG_RESENT}, 0));
   // the crc flags are not folded here
   EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_CRC64NVME}, 4096));
+}
+
+// A stripe read whose push its OSD cut off - per plan, after the writes
+// went out - from the OSD's result, through the Objecter, into the slot a
+// gateway reads: the data comes back inline with a result that is neither
+// declined nor landed, which sends the GET to its HTTP fallback behind
+// the fence. It does not fail the GET.
+TEST(RdmaDelivery, CutOffPushFallsBackToHttp)
+{
+  using R = ceph::rdma::oob_result_t;
+  using L = librados::ObjectReadOperation;
+  using ceph::rdma::attempt_flags;
+  using rgw::rdma::classify_stripe;
+  using rgw::rdma::stripe_reply;
+
+  // what reaches the gateway's slot for an OSD result, the way librados
+  // copies it in (librados_cxx.cc)
+  auto through_objecter = [](const R& osd, int attempts) {
+    ::ObjectOperation op;
+    ceph::buffer::list bl;
+    int rv = 0;
+    L::rdma_delivery_result slot;
+    op.read(0, 4096, &bl, &rv, nullptr);
+    op.set_rdma_delivery("t", 0, 0, [&slot](const R& r) {
+      slot.bytes = r.bytes;
+      slot.crc64 = r.crc64;
+      slot.flags = r.flags;
+    });
+    auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                               std::move(op.ops), 0, (Context*)nullptr,
+                               nullptr);
+    o->rdma_delivery.swap(op.rdma_delivery);
+    o->rdma_oob_result.swap(op.rdma_oob_result);
+    o->rdma_oob_handler.swap(op.rdma_oob_handler);
+    o->attempts = attempts;
+    Objecter::deliver_rdma_oob_result(o, 0, osd);
+    o->put();
+    return slot;
+  };
+
+  // cut off after its writes went out: inline, and the fence holds
+  R cut;
+  cut.flags = attempt_flags(false, true, false);
+  auto slot = through_objecter(cut, 1);
+  EXPECT_EQ(stripe_reply::inline_data, classify_stripe(0, 4096));
+  EXPECT_EQ(0u, slot.bytes);
+  EXPECT_TRUE(rgw::rdma::fence_needed(std::vector{slot}));
+
+  // cut off before anything went out: inline, declined, no fence
+  R refused;
+  refused.flags = attempt_flags(false, false, false);
+  slot = through_objecter(refused, 1);
+  EXPECT_EQ(L::RDMA_DELIVERY_DECLINED, slot.flags);
+  EXPECT_FALSE(rgw::rdma::fence_needed(std::vector{slot}));
+
+  // a resend of a read that was declined: an earlier attempt may have
+  // pushed, so the fence holds
+  slot = through_objecter(refused, 2);
+  EXPECT_TRUE(rgw::rdma::fence_needed(std::vector{slot}));
+
+  // placed with the promise: nothing inline, landed, no fence
+  R placed;
+  placed.bytes = 4096;
+  placed.flags = attempt_flags(true, true, true);
+  slot = through_objecter(placed, 1);
+  EXPECT_EQ(stripe_reply::placed, classify_stripe(0, 0));
+  EXPECT_EQ(L::RDMA_DELIVERY_LANDED, slot.flags);
+  EXPECT_FALSE(rgw::rdma::fence_needed(std::vector{slot}));
+
+  // a read that failed outright fails the GET, inline data or not
+  EXPECT_EQ(stripe_reply::failed, classify_stripe(-EIO, 0));
+  EXPECT_EQ(stripe_reply::failed, classify_stripe(-EIO, 4096));
 }

@@ -223,6 +223,23 @@ struct oob_result_t {
 WRITE_CLASS_ENCODER(oob_result_t)
 
 /**
+ * The transfer flags an OSD reports for a read op whose delivery it
+ * attempted. Placed: every byte is in the window, and landed when the
+ * transport promised delivery-complete. Not placed: the data goes back
+ * inline, declined when no write of it reached the transport, and
+ * neither when one did - a push cut off after its writes went out may
+ * have landed in part, and its reader fences the window before it falls
+ * back.
+ */
+inline uint32_t attempt_flags(bool placed, bool started, bool landed_promise)
+{
+  if (placed) {
+    return landed_promise ? oob_result_t::FLAG_LANDED : 0;
+  }
+  return started ? 0 : oob_result_t::FLAG_DECLINED;
+}
+
+/**
  * The declined, landed and resent flags of a result assembled from the
  * results of its parts, as a split read assembles its sub-reads': declined
  * when every part declined, landed when every part landed and some bytes

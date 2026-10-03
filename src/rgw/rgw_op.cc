@@ -2676,6 +2676,70 @@ static bool rgw_calc_aead_obj_size(const DoutPrefixProvider* dpp,
   return rgw_get_aead_decrypted_size(dpp, attrs, encrypted_size, out_size);
 }
 
+void RGWGetObj::note_rdma_reads(bool submitted, bool needed, bool resent,
+                                double fence_s)
+{
+  if (!submitted) {
+    return;
+  }
+  auto& f = rdma_fence_state;
+  f.sent = true;
+  f.needed = needed;
+  f.resent = resent;
+  f.client_window = rdma_mode == RdmaMode::PASSTHROUGH;
+  f.settled = false;
+  f.wait_ms = static_cast<uint64_t>(std::ceil(fence_s * 1000.0));
+}
+
+void RGWGetObj::rdma_fence_before(const char* what, bool response,
+                                  bool success)
+{
+  auto& f = rdma_fence_state;
+  if (!f.sent || f.settled) {
+    return;
+  }
+  if (response && !f.client_window) {
+    // the reads wrote a gateway relay window, which goes back to its pool
+    // quarantined for rdma_fence_ms instead of holding up the answer
+    return;
+  }
+  f.settled = true;
+  // Every read has completed by now, failed or not: iterate() drains them
+  // all before it returns. A write that a reply does not account for (an
+  // OSD marked down mid-request, the original attempt of a read the
+  // Objecter resent, a push cut off and answered inline) may still start
+  // until the pool's delivery lease runs out from the OSD's receipt of
+  // the read, and land until the drain runs out after that, so waiting
+  // lease plus drain from here covers it - unless every read came back
+  // declined or landed, and none was resent. After a GET that delivered
+  // everything, each stripe's OSD placed its bytes before replying, and
+  // only an earlier attempt of a resent read can still write the window.
+  const bool needed = success ? f.resent : f.needed;
+  if (!needed) {
+    ldpp_dout(this, 4) << "rdma fence: not needed before " << what << ", "
+                       << (success ? "every stripe was placed and none "
+                                     "was resent"
+                                   : "every stripe was declined or landed "
+                                     "and none was resent")
+                       << dendl;
+    return;
+  }
+  if (!f.wait_ms) {
+    return;
+  }
+  ldpp_dout(this, 4) << "rdma fence: waiting " << f.wait_ms
+                     << "ms (lease + drain) before " << what << dendl;
+  if (s->yield) {
+    auto& yctx = s->yield.get_yield_context();
+    boost::asio::steady_timer timer(yctx.get_executor());
+    timer.expires_after(std::chrono::milliseconds(f.wait_ms));
+    boost::system::error_code ec;
+    timer.async_wait(yctx[ec]);
+  } else {
+    std::this_thread::sleep_for(std::chrono::milliseconds(f.wait_ms));
+  }
+}
+
 void RGWGetObj::select_rdma_mode(bool plain_chain)
 {
   rdma_mode = RdmaMode::NONE;
@@ -3016,47 +3080,22 @@ void RGWGetObj::execute(optional_yield y)
   }
 
   op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
+  note_rdma_reads(read_op->params.rdma_submitted,
+                  read_op->params.rdma_fence_needed,
+                  read_op->params.rdma_resent, read_op->params.rdma_fence);
+  if (op_ret < 0) {
+    rdma_failed_at = "the read";
+  }
 
   if (op_ret == -EOPNOTSUPP && rdma_oob_mode()) {
     // an OSD (or the store) cannot push directly - old OSDs, cuObject
-    // absent or disabled, an expired lease or a resent op. No HTTP
-    // bytes are committed yet, so restart the whole GET in staged (or
-    // plain HTTP) mode.
+    // absent or disabled, an expired lease, a resent op or a push cut
+    // off. No HTTP bytes are committed yet, so restart the whole GET in
+    // staged (or plain HTTP) mode, once nothing of this attempt can
+    // write the window any more.
     ldpp_dout(this, 4) << "rdma passthrough unsupported, restarting GET "
                        << "in fallback mode" << dendl;
-    if (read_op->params.rdma_submitted &&
-        !read_op->params.rdma_fence_needed) {
-      // every OSD either started no transfer for its stripe or had all
-      // of it land before replying, and no op was resent: nothing of
-      // this attempt can write the window any more
-      ldpp_dout(this, 4) << "rdma fence: not needed, every stripe was "
-                         << "declined or landed and none was resent"
-                         << dendl;
-    } else if (read_op->params.rdma_submitted) {
-      // descriptor-bearing ops reached OSDs: an RDMA write we lost
-      // track of (an OSD marked down mid-request, or the original
-      // attempt of an op the Objecter resent) may still start until
-      // the pool's delivery lease runs out from the OSD's receipt of
-      // the op, and land until the pool's drain runs out after that,
-      // when the OSD cuts it off. Every op has completed by now, so
-      // waiting lease plus drain from here covers both before the
-      // fallback rewrites the same client ranges.
-      const auto wait_ms = static_cast<uint64_t>(
-        std::ceil(read_op->params.rdma_fence * 1000.0));
-      if (wait_ms) {
-        ldpp_dout(this, 4) << "rdma fence: waiting " << wait_ms
-                           << "ms (lease + drain) before fallback" << dendl;
-        if (s->yield) {
-          auto& yctx = s->yield.get_yield_context();
-          boost::asio::steady_timer timer(yctx.get_executor());
-          timer.expires_after(std::chrono::milliseconds(wait_ms));
-          boost::system::error_code ec;
-          timer.async_wait(yctx[ec]);
-        } else {
-          std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-        }
-      }
-    }
+    rdma_fence_before("the fallback", false, false);
     read_op->params.rdma_token.clear();
     read_op->params.rdma_bytes = nullptr;
     read_op->params.rdma_crc64 = nullptr;
@@ -3069,14 +3108,22 @@ void RGWGetObj::execute(optional_yield y)
     // transparent fallback into a 500.
     op_ret = 0;
     op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
+    note_rdma_reads(read_op->params.rdma_submitted,
+                    read_op->params.rdma_fence_needed,
+                    read_op->params.rdma_resent, read_op->params.rdma_fence);
+    rdma_failed_at = op_ret < 0 ? "the fallback read" : nullptr;
   }
   if (read_op->params.rdma_submitted && read_op->params.rdma_fence_needed) {
     rdma_fence_ms = static_cast<uint64_t>(
         std::ceil(read_op->params.rdma_fence * 1000.0));
   }
 
-  if (op_ret >= 0)
+  if (op_ret >= 0) {
     op_ret = filter->flush();
+    if (op_ret < 0) {
+      rdma_failed_at = "flushing the response";
+    }
+  }
 
   rgw::op_counters::tinc(counters, l_rgw_op_get_obj_lat, s->time_elapsed());
 
@@ -3089,6 +3136,7 @@ void RGWGetObj::execute(optional_yield y)
       ldpp_dout(this, 0) << "ERROR: rdma passthrough delivered " << rdma_bytes
                          << " of " << total_len << " bytes" << dendl;
       op_ret = -EIO;
+      rdma_failed_at = "the delivered byte count";
       goto done_err;
     }
     s->rdma_bytes_transferred = rdma_bytes;
@@ -3115,6 +3163,7 @@ void RGWGetObj::execute(optional_yield y)
                                  << "mismatch: delivered " << computed.to_armor()
                                  << " != stored " << stored.to_armor() << dendl;
               op_ret = -EIO;
+              rdma_failed_at = "the delivered checksum";
               goto done_err;
             }
             ldpp_dout(this, 20) << "rdma passthrough crc64nvme verified: "
@@ -3128,13 +3177,23 @@ void RGWGetObj::execute(optional_yield y)
     }
   }
 
+  rdma_fence_before("the response", true, true);
   op_ret = send_response_data(bl, 0, 0);
   if (op_ret < 0) {
+    rdma_failed_at = "sending the response";
     goto done_err;
   }
   return;
 
 done_err:
+  if (rdma_fence_state.sent) {
+    ldpp_dout(this, 1) << "GET with out-of-band delivery failed at "
+                       << (rdma_failed_at ? rdma_failed_at : "the read")
+                       << ": " << cpp_strerror(op_ret) << dendl;
+  }
+  // no answer, not even an error, before nothing of the reads can write
+  // the client's window any more
+  rdma_fence_before("the error response", true, false);
   send_response_data_error(y);
 }
 

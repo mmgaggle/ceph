@@ -1199,6 +1199,10 @@ class Object {
         /// so a fallback need not wait out rdma_fence: every one came back
         /// declined or landed, and none was resent
         bool rdma_fence_needed{true};
+        /// out: a descriptor-bearing operation was sent more than once: an
+        /// earlier attempt may write the window after every reply, so even
+        /// a request that delivered everything waits out rdma_fence
+        bool rdma_resent{false};
       } params;
 
       virtual ~ReadOp() = default;

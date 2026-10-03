@@ -4,6 +4,7 @@
 #include "rgw_rdma_fence.h"
 
 #include <deque>
+#include <sstream>
 
 #include <gtest/gtest.h>
 
@@ -72,4 +73,37 @@ TEST(RgwRdmaFence, NoResultNeedsTheFence)
   // a read that never came back, or one from an OSD that reports neither
   std::deque<result> rs = {with(R::RDMA_DELIVERY_DECLINED), result{}};
   EXPECT_TRUE(rgw::rdma::fence_needed(rs));
+}
+
+TEST(RgwRdmaFence, StripeReplies)
+{
+  using rgw::rdma::classify_stripe;
+  using rgw::rdma::stripe_reply;
+  EXPECT_EQ(stripe_reply::placed, classify_stripe(0, 0));
+  // returned inline - declined, or a push cut off: the GET falls back
+  EXPECT_EQ(stripe_reply::inline_data, classify_stripe(0, 4 << 20));
+  // a failed read fails the GET even if data came with it
+  EXPECT_EQ(stripe_reply::failed, classify_stripe(-ENOENT, 0));
+  EXPECT_EQ(stripe_reply::failed, classify_stripe(-EIO, 4096));
+}
+
+TEST(RgwRdmaFence, Summary)
+{
+  std::deque<result> rs = {
+    with(R::RDMA_DELIVERY_LANDED, 4 << 20),
+    with(R::RDMA_DELIVERY_DECLINED),
+    with(R::RDMA_DELIVERY_DECLINED | R::RDMA_DELIVERY_RESENT),
+    with(0, 1 << 20),
+    with(0)};
+  const auto s = rgw::rdma::summarize(rs);
+  EXPECT_EQ(5u, s.reads);
+  EXPECT_EQ(2u, s.declined);
+  EXPECT_EQ(1u, s.landed);
+  EXPECT_EQ(2u, s.open);
+  EXPECT_EQ(1u, s.resent);
+  EXPECT_EQ(uint64_t(5 << 20), s.bytes);
+  std::ostringstream o;
+  o << s;
+  EXPECT_EQ("5 reads (2 declined, 1 landed, 2 open, 1 resent), 5242880 "
+            "bytes placed", o.str());
 }

@@ -8649,20 +8649,55 @@ int RGWRados::Object::Read::read(int64_t ofs, int64_t end,
 }
 
 int get_obj_data::flush_rdma(rgw::AioResultList&& results) {
-  int r = rgw::check_for_errors(results);
+  // OSDs that pushed wrote straight into client memory (byte counts
+  // arrive through the per-stripe delivery out-params). A stripe read
+  // that failed fails the GET; an inline reply means that OSD did not
+  // push - no RDMA support, expired lease, resent op, a push it cut off
+  // - and the whole GET must restart in a fallback mode. Either way the
+  // client callback never sees data here.
+  CephContext* cct = rgwrados->ctx();
+  int r = 0;
+  for (const auto& e : results) {
+    // the stripe's delivery result, for the log
+    std::string res = "none";
+    if (auto it = rdma_slot_by_ofs.find(e.id); it != rdma_slot_by_ofs.end()) {
+      const auto& slot = rdma_slots[it->second];
+      std::ostringstream o;
+      o << slot.bytes << " bytes, flags 0x" << std::hex << slot.flags;
+      res = o.str();
+    }
+    switch (rgw::rdma::classify_stripe(e.result, e.data.length())) {
+    case rgw::rdma::stripe_reply::failed:
+      ldout(cct, 1) << "rdma passthrough: the read of " << e.obj.oid
+                    << " (range offset " << e.id - rdma_range_start
+                    << ") failed: " << cpp_strerror(e.result)
+                    << "; delivery result: "
+                    << res
+                    << dendl;
+      if (r == 0 || r == -EOPNOTSUPP) {
+        r = e.result;  // a failure fails the GET; no fallback would help
+      }
+      break;
+    case rgw::rdma::stripe_reply::inline_data:
+      ldout(cct, 4) << "rdma passthrough: the read of " << e.obj.oid
+                    << " (range offset " << e.id - rdma_range_start
+                    << ") came back inline (" << e.data.length()
+                    << " bytes); delivery result: "
+                    << res
+                    << "; falling back" << dendl;
+      if (r == 0) {
+        r = -EOPNOTSUPP;
+      }
+      break;
+    case rgw::rdma::stripe_reply::placed:
+      break;
+    }
+  }
   if (r < 0) {
     return r;
   }
-  // OSDs that pushed wrote straight into client memory (byte counts
-  // arrive through the per-stripe delivery out-params); an inline
-  // reply means that OSD could not push - no RDMA support, expired
-  // lease, resent op - and the whole GET must restart in a fallback
-  // mode. Either way the client callback never sees data here.
   while (!results.empty()) {
     auto& e = results.front();
-    if (e.data.length() > 0) {
-      return -EOPNOTSUPP;
-    }
     // the reply filled this stripe's slot: tell the callback where the
     // bytes landed, relative to the requested range
     if (auto it = rdma_slot_by_ofs.find(e.id); it != rdma_slot_by_ofs.end()) {
@@ -8859,22 +8894,41 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
     state.obj = source->get_obj();
   }
 
+  // every descriptor-bearing read has completed when this runs - drained
+  // after a failure as after success - so its result is final
+  auto note_rdma = [&](int r) {
+    params.rdma_submitted = data.rdma_ops_sent;
+    params.rdma_fence = data.rdma_fence;
+    params.rdma_fence_needed = rgw::rdma::fence_needed(data.rdma_slots);
+    const auto sum = rgw::rdma::summarize(data.rdma_slots);
+    params.rdma_resent = sum.resent > 0;
+    if (!data.rdma_ops_sent || r >= 0) {
+      return;
+    }
+    if (r == -EOPNOTSUPP) {
+      ldpp_dout(dpp, 4) << "rdma passthrough: falling back after " << sum
+                        << "; fence "
+                        << (params.rdma_fence_needed ? "needed" : "not needed")
+                        << dendl;
+    } else {
+      ldpp_dout(dpp, 1) << "rdma passthrough: failed (" << cpp_strerror(r)
+                        << ") after " << sum << "; fence "
+                        << (params.rdma_fence_needed ? "needed" : "not needed")
+                        << dendl;
+    }
+  };
+
   int r = store->iterate_obj(dpp, source->get_ctx(), source->get_bucket_info(), state.obj,
                              ofs, end, chunk_size, _get_obj_iterate_cb, &data, y);
   if (r < 0) {
     ldpp_dout(dpp, 0) << "iterate_obj() failed with " << r << dendl;
     data.cancel(); // drain completions without writing back to client
-    params.rdma_submitted = data.rdma_ops_sent;
-    params.rdma_fence = data.rdma_fence;
-    params.rdma_fence_needed = rgw::rdma::fence_needed(data.rdma_slots);
+    note_rdma(r);
     return r;
   }
 
   r = data.drain();
-  params.rdma_submitted = data.rdma_ops_sent;
-  params.rdma_fence = data.rdma_fence;
-  // every read has its result now
-  params.rdma_fence_needed = rgw::rdma::fence_needed(data.rdma_slots);
+  note_rdma(r);
   if (r < 0) {
     return r;
   }

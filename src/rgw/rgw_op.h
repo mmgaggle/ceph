@@ -494,6 +494,27 @@ protected:
   /// (the pool's delivery lease plus its drain) when the final read
   /// sent delivery descriptors; 0 otherwise
   uint64_t rdma_fence_ms = 0;
+  /// The fence a GET owes once descriptor-bearing reads reached OSDs: a
+  /// write of theirs that no reply accounts for may still land in the
+  /// window until the pools' lease and drain run out, so the window is
+  /// not rewritten (a fallback) and the client is not answered (success
+  /// or error) before that.
+  struct rdma_fence_t {
+    bool sent = false;           ///< descriptor-bearing reads went out
+    bool needed = true;          ///< see rgw::rdma::fence_needed()
+    bool resent = false;         ///< one of them was sent more than once
+    bool client_window = false;  ///< they wrote the client's window
+    bool settled = false;        ///< waited out, or found not needed
+    uint64_t wait_ms = 0;        ///< the longest lease plus drain
+  } rdma_fence_state;
+  /// what the read that just ended left owing
+  void note_rdma_reads(bool submitted, bool needed, bool resent,
+                       double fence_s);
+  /// wait the fence owed, once, before what: a fallback rewriting the
+  /// window, or a response (success or not)
+  void rdma_fence_before(const char* what, bool response, bool success);
+  /// where a GET that sent descriptor-bearing reads failed, for the log
+  const char* rdma_failed_at = nullptr;
   /// true for the modes where the OSDs deliver out of band
   bool rdma_oob_mode() const {
     return rdma_mode == RdmaMode::PASSTHROUGH || rdma_mode == RdmaMode::RELAY;

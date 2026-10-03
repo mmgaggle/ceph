@@ -807,6 +807,7 @@ public:
         bool rdma_fence_needed = true; // out: a fallback must wait out
                                        // rdma_fence first; see
                                        // rgw::rdma::fence_needed()
+        bool rdma_resent = false; // out: a descriptor-bearing op was resent
 
         Params() : lastmod(nullptr), obj_size(nullptr), attrs(nullptr),
 		   target_obj(nullptr), epoch(nullptr)

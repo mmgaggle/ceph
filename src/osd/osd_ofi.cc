@@ -240,6 +240,9 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("budget_refused", s.budget_refused);
   f->dump_unsigned("late_starts", s.late_starts);
   f->dump_unsigned("peer_timeouts", s.peer_timeouts);
+  f->dump_unsigned("peers", s.peers);
+  f->dump_unsigned("pending_inserts", s.pending_inserts);
+  f->dump_unsigned("inserts_refused", s.inserts_refused);
   const auto ws = windows ? windows->stats() : ceph::ofi::WindowPool::stats_t{};
   f->dump_unsigned("windows_acquired", ws.acquired);
   f->dump_unsigned("windows_exhausted", ws.exhausted);

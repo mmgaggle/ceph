@@ -294,11 +294,52 @@ lateness. Delivery goes on. 1 s is a third of the default drain, and
 thousands of times what a cut-off costs, so a cut-off that late is a
 scheduling delay, not a transport that fails to discard.
 
+A cut-off can also end later than the tolerance although the close or
+cancel itself was quick. It then started late because the OSD's threads
+did not run: the process was stopped (``SIGSTOP``), paused for a long
+time, swapped out, or starved, or its virtual machine did not run. The
+OSD says so when nothing polled its endpoint for about as long. The
+endpoint is clean once the close or cancel returns: nothing of the
+writes it cut off is sent any more. So the OSD logs the cut-off to the
+cluster log as an error, with its lateness, raises the
+``OOB_CUTOFF_PAST_TOLERANCE`` health error for
+``osd_oob_cutoff_late_alert_period`` (an hour by default), and goes on
+delivering. Stopping delivery would not undo a write that already
+landed, and it would turn every long pause into an outage until the OSD
+restarts. Set ``osd_oob_cutoff_late_fail_closed`` to stop delivery
+instead.
+
+Who can such a late write reach? Say the OSD received the operation at
+``t``. Its writes must land by ``t + lease + drain``, and one landed
+``L`` later than that:
+
+* A client that received a response for the request is not affected.
+  The OSD replies after the cut-off, the gateway responds after the
+  OSD's reply, and the client reuses its window after the response.
+* The gateway's fallback is not affected. It waits lease plus drain
+  after every operation completed, so past the OSD's reply, which
+  follows the cut-off.
+* A fallback after the Objecter resent the operation, whose first
+  attempt went to the paused OSD, is covered when ``L`` is shorter than
+  the time from ``t`` to when the resent operation completed. The
+  Objecter resends only once the paused OSD is marked down, after
+  ``osd_heartbeat_grace`` (20 s by default) of silence. A pause shorter
+  than that does not lead to a resend at all. And over a software
+  provider, such as the UET reference provider, nothing moves while the
+  OSD's threads do not run, since it sends only while polled. Only a
+  longer pause, over a transport that moves data without the OSD's
+  threads, such as rocm-ernic's emulated UET engine or a NIC, can let a
+  write land after this fence.
+* A client that gave a request up, and reused its window lease plus
+  drain plus the tolerance after sending it, can see its window written.
+  The health error tells an operator that this was possible.
+
 A cut-off can fail. The provider may fail to close the endpoint, so its
-writes go on. Or the close may take longer than the tolerance, or end
-later than it, as when a provider drains its writes instead of
-discarding them. In these cases writes may land in a client's window
-after the fence. The OSD then stops delivering out of band. It delivers every read inline, logs the
+writes go on. Or the close or cancel itself may take longer than the
+tolerance, as when a provider drains its writes instead of discarding
+them, so that every cut-off would be late. In these cases writes may
+land in a client's window after the fence, and may keep doing so. The
+OSD then stops delivering out of band. It delivers every read inline, logs the
 cause to the cluster log, and raises the ``OOB_DELIVERY_UNSAFE`` health
 warning. With ``osd_oob_cutoff_failure`` set to ``abort``, the OSD exits
 instead. That ends the writes of a software provider, and a device
@@ -935,6 +976,12 @@ Executors and out-of-band behavior:
 * ``osd_oob_cutoff_late_tolerance``: how late a cut-off may end, past the
   budget it protects, and still be only counted and warned of
   (``OOB_CUTOFF_LATE``). The default is 1000 ms.
+* ``osd_oob_cutoff_late_fail_closed``: stop delivering when a quick
+  cut-off ends later than the tolerance, instead of logging it and
+  raising ``OOB_CUTOFF_PAST_TOLERANCE``. The default is false.
+* ``osd_oob_cutoff_late_alert_period``: how long ``OOB_CUTOFF_LATE`` and
+  ``OOB_CUTOFF_PAST_TOLERANCE`` stay raised after the latest late
+  cut-off. The default is an hour.
 
 libfabric executor (``ofi``):
 
@@ -980,6 +1027,9 @@ shows:
 * ``cutoffs_failed`` and ``cutoffs_late``, ``max_cutoff_lateness_ms``
   and ``late_tolerance_ms``, ``unsafe`` and ``broken``.
 * ``cutoff_slack_ms``, the scheduling slack, and ``cutoffs_on_behalf``.
+* ``cutoffs_past_tolerance``, the quick cut-offs that ended later than
+  the tolerance, and ``max_poll_gap_ms``, the longest the endpoint went
+  without being polled, of a second or more.
 * ``cutoff_cost_ms``, the current estimate of a cut-off's cost, and
   ``budget_refused`` and ``late_starts``, the reads delivered inline
   because too little of their budget was left.
@@ -992,8 +1042,9 @@ shows:
   `Reusing a window`_.
 
 An OSD whose libfabric executor stopped raises ``OOB_DELIVERY_UNSAFE`` or
-``OOB_DELIVERY_DOWN`` in ``ceph health detail``, and one that cut off
-writes late within the tolerance raises ``OOB_CUTOFF_LATE``.
+``OOB_DELIVERY_DOWN`` in ``ceph health detail``. One that cut off writes
+late raises ``OOB_CUTOFF_LATE`` within the tolerance, and the health
+error ``OOB_CUTOFF_PAST_TOLERANCE`` beyond it.
 
 Accounting
 ----------

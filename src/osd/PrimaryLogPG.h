@@ -1589,6 +1589,8 @@ public:
     OpRequestRef& op,
     ThreadPool::TPHandle &handle) override;
   bool should_use_coroutine(MOSDOp* m);
+  /// unwind a suspended coroutine op, free its stack and its OpContext
+  void stop_coroutine();
   void do_op_impl(OpRequestRef op);
   void do_op(OpRequestRef& op);
   void on_coroutine_complete();

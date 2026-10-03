@@ -243,10 +243,16 @@ use again:
 
 How an OSD cuts off a write depends on the transport:
 
-* The libfabric executor closes its endpoint and opens a new one. A
-  libfabric provider discards the operations of an endpoint that
-  closes. The cut-off also fails the other writes in flight on that
-  endpoint, and those reads are delivered inline.
+* The libfabric executor cancels only the late transfer's writes, and
+  keeps its endpoint, when the provider promises that a cancelled write
+  is discarded: no packet of it is sent once the cancel returns. The
+  UET provider says so through an endpoint option. Other transfers on
+  the OSD, to other clients and for gathers, go on. Without that
+  promise, or when a cancel fails, the executor closes its endpoint and
+  opens a new one. A libfabric provider discards the operations of an
+  endpoint that closes. That cut-off also fails the other writes in
+  flight on the endpoint, and those reads are delivered inline. ``ofi
+  status`` counts both kinds: ``plans_cut_off`` and ``cutoffs``.
 * cuObject cannot cancel a posted write. A posted write keeps retrying
   for the retry budget of the DC transport, about two seconds. So the
   cuObject executor stops waiting that long before the deadline, and
@@ -300,22 +306,54 @@ queue a packet waits in. A soak test with 1.5 s of delay on a client's
 link saw copies land 300 ms after their GET completed.
 
 So a window owner must not reuse a window's memory while a copy of an
-earlier write can still arrive under the window's key. Before it reuses
-the memory, it must do one of these:
+earlier write can still arrive under the window's key. A copy can land
+whenever the key is valid, also while the window sits idle between
+requests, and while its owner writes new data into it. Re-keying just
+before the next request is therefore too late. The owner must do one
+of these:
 
-* Invalidate the key: deregister the memory region and register it
-  again, under a new key. A write that carries the old key then fails
-  instead of landing. This is the usual RDMA practice, and it is cheap
-  on a software provider. Make sure that the provider does not hand the
-  old key out again soon: the UET reference provider's keys are indexes
-  into a table of regions.
-* Wait out the network's longest packet lifetime before writing new data
-  into the window, or issuing a new token for it.
+* Retire the key as soon as the request ends, when the response has
+  arrived, and before the memory is read for another use, written, or
+  lent again: deregister the memory region and register it again,
+  under a new key. A write that carries the old key then fails instead
+  of landing. This is the usual RDMA practice, and it is cheap on a
+  software provider. Make sure that the provider does not hand the old
+  key out again soon: the UET reference provider's keys are indexes
+  into a table of regions. The data of the request itself can still be
+  read before the key is retired: a copy carries the same bytes to the
+  same place.
+* Leave the memory untouched, and issue no new token for it, until the
+  network's longest packet lifetime has passed since the response.
 
-Ceph does the first for the windows it lends itself. An OSD's gather
-windows get a new key when they are released (``osd_oob_rekey_windows``),
-and so do the gateway's relay windows when a session ends
-(``rgw_rdma_rekey_windows``). A key that leaves service is not used for
+A request can also end without a response: the connection to the
+gateway resets, the gateway exits, or the client times out. The OSDs
+may then still write into the window, as `Fencing a window before
+reuse`_ describes: until the pool's ``rdma_delivery_lease`` plus its
+``rdma_delivery_drain`` after the request was sent, and copies of those
+writes until the packet lifetime after that. The owner must retire the
+key at once, or leave the window untouched until then. A soak test that
+killed the gateway saw OSD writes land in clients' windows 50 to 350 ms
+afterwards. That is within the contract, but a client that reuses the
+window at once sees its new data overwritten.
+
+With UET there is a third way. Writes into a region that its owner did
+not mark ``IDEMPOTENT_SAFE`` use RUD instead of RUDI. RUD keeps state
+for each initiator at the target, and places no packet twice. A window
+owner that sets ``FI_UET_RUDI=0`` in its environment registers its
+windows that way, and every OSD then writes them with RUD. It costs
+throughput, which falls apart once the round trip grows past the
+retransmit timeout (``FI_UET_TX_TIMEOUT``, 200 ms by default): every
+packet is sent again before its acknowledgment can arrive. On a test
+cluster with 300 ms of delay on one OSD's port, transfers through it
+kept missing their deadlines: 94 cut-offs in three minutes, and, before
+late writes could be cut off one at a time, about 90% of GETs from
+every client fell back to HTTP.
+
+Ceph does the first for the windows it lends itself, as soon as the
+operation that used a window ends. An OSD's gather windows get a new key
+when the gather releases them (``osd_oob_rekey_windows``), and so do the
+gateway's relay windows when a session ends (``rgw_rdma_rekey_windows``),
+also when a gather or a relay failed. A key that leaves service is not used for
 another window for 10 s, and an endpoint asks a provider with a fixed
 table of regions, such as UET's, for a table of 16384 regions.
 
@@ -903,8 +941,12 @@ writes in flight, and windows lent and exhausted. The ``ofi status``
 output also names the provider and the last provider error. It also
 shows:
 
-* ``cutoffs``, ``cutoffs_failed`` and ``cutoffs_late``, ``unsafe`` and
-  ``broken``. See `Fencing a window before reuse`_.
+* ``cutoffs``, the endpoint resets, and ``plans_cut_off``, the late
+  transfers cancelled alone; ``cancels_failed``, the cancels that fell
+  back to a reset; ``cancel_discards`` and ``close_discards``, what the
+  provider promises (``-1`` when it does not say). See `Fencing a window
+  before reuse`_.
+* ``cutoffs_failed`` and ``cutoffs_late``, ``unsafe`` and ``broken``.
 * ``cutoff_cost_ms``, the current estimate of a cut-off's cost, and
   ``budget_refused`` and ``late_starts``, the reads delivered inline
   because too little of their budget was left.
@@ -929,7 +971,9 @@ Testing
 
 * ``unittest_ofi_rma`` tests the libfabric token format, writes over
   the ``tcp`` and ``shm`` providers, slow and refused first contacts,
-  eviction, cut-offs that fail or end late, the cut-off cost estimate,
+  eviction, cut-offs that fail or end late, late writes cancelled alone
+  (over ``tcp``, with a test hook that stands in for a provider whose
+  cancel discards), the cut-off cost estimate,
   writes that start too late, concurrent writes and their CPU use, and
   that a write with a re-keyed window's old token does not land.
 * ``unittest_rgw_rdma_rc_wire`` tests the ``hipobj-rc-v2`` wire

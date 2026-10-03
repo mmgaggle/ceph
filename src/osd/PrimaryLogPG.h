@@ -1329,10 +1329,10 @@ protected:
    */
   bool deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
 		   std::vector<ceph::rdma::oob_result_t>& oob);
-  /// deliver_oob for one op
+  /// deliver_oob for one op; *started when a transfer was started for it
   bool deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
 		      const ceph::rdma::delivery_t& d,
-		      ceph::rdma::oob_result_t& res);
+		      ceph::rdma::oob_result_t& res, bool* started);
 #endif
 
   // pg on-disk content

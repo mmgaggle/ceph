@@ -74,7 +74,8 @@ public:
 		       const std::string& token,
 		       const ceph::buffer::list& data,
 		       const ceph::osd::oob::placement_plan& plan,
-		       std::chrono::milliseconds budget) override;
+		       std::chrono::milliseconds budget,
+		       bool* started) override;
 
   /// asok/debug counters
   void dump_stats(ceph::Formatter* f) const override;

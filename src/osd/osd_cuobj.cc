@@ -334,8 +334,12 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
 			       const std::string& token,
 			       const ceph::buffer::list& data,
 			       const ceph::osd::oob::placement_plan& plan,
-			       std::chrono::milliseconds budget)
+			       std::chrono::milliseconds budget,
+			       bool* started)
 {
+  if (started) {
+    *started = false;
+  }
   if (!is_available()) {
     return -EOPNOTSUPP;
   }
@@ -414,6 +418,10 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   while (completed < items.size()) {
     while (err == 0 && next < items.size() && outstanding < POLL_BATCH) {
       auto& w = items[next];
+      // a submission that fails may still have sent part of its write
+      if (started) {
+	*started = true;
+      }
       ssize_t r = m_server->handleGetObject(
 	key, buf->handle, window->addr + w.remote_ofs, w.len, token, channel,
 	w.local_ofs, nullptr, /*async_handle=*/&items[next]);

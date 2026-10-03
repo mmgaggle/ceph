@@ -781,7 +781,7 @@ void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
   auto plan = ceph::osd::oob::linear_plan(0, all.length());
   ssize_t r = exec->execute_plan(
     "ec gather", op.push_token, all, plan,
-    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)));
+    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)), nullptr);
   if (r != static_cast<ssize_t>(all.length())) {
     dout(10) << __func__ << ": push to the primary failed (" << r
 	     << "), replying inline" << dendl;

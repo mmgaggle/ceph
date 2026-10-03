@@ -166,8 +166,12 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
 			     const std::string& token,
 			     const ceph::buffer::list& data,
 			     const ceph::osd::oob::placement_plan& plan,
-			     std::chrono::milliseconds budget)
+			     std::chrono::milliseconds budget,
+			     bool* started)
 {
+  if (started) {
+    *started = false;
+  }
   auto t = ceph::ofi::parse_token(token);
   if (!ep || !t) {
     return -EINVAL;
@@ -185,7 +189,7 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
     writes.push_back({tr.local_ofs, tr.len, tr.client_ofs});
   }
   plans_started++;
-  const int r = ep->write(*t, iov.data(), iov.size(), writes, budget);
+  const int r = ep->write(*t, iov.data(), iov.size(), writes, budget, started);
   if (r == -ENOTRECOVERABLE || ep->unsafe()) {
     check_unsafe();
   } else if (r == -ETIMEDOUT) {
@@ -236,6 +240,11 @@ void OSDOfi::release_window(uint64_t id, uint64_t quarantine_ms)
   // window is free at once.
   windows->release(id, std::chrono::milliseconds(quarantine_ms),
 		   cct->_conf.get_val<bool>("osd_oob_rekey_windows"));
+}
+
+bool OSDOfi::delivery_complete() const
+{
+  return ep && ep->delivery_complete();
 }
 
 void OSDOfi::window_sync()

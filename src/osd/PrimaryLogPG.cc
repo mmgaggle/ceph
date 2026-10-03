@@ -9357,6 +9357,15 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
   auto m = ctx->op->get_req<MOSDOp>();
   const auto& deliveries = m->get_rdma_deliveries();
   ceph_assert(oob.size() == rops.size());
+  // an op this OSD started no transfer for is reported declined: nothing
+  // of it reached the window, and its client need not fence the window
+  auto decline_all = [&] {
+    for (size_t i = 0; i < oob.size() && i < deliveries.size(); i++) {
+      if (!deliveries[i].empty()) {
+	oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
+      }
+    }
+  };
   if (deliveries.size() != rops.size()) {
     // the descriptor vector must mirror the ops; anything else is
     // malformed and everything stays inline
@@ -9369,6 +9378,7 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
   // superseded attempt's write is still in flight on another OSD;
   // deliver inline so at most one attempt ever writes the window
   if (m->get_retry_attempt() > 0) {
+    decline_all();
     return false;
   }
   // check_laggy ran at dispatch, but the push runs after the read
@@ -9381,6 +9391,7 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
     dout(10) << __func__ << " past readable_until "
 	     << recovery_state.get_readable_until()
 	     << ", delivering inline" << dendl;
+    decline_all();
     return false;
   }
   // the pool's delivery lease bounds how long after receipt this OSD
@@ -9393,6 +9404,7 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
   if (age > lease) {
     dout(10) << __func__ << " lease expired (" << age << "s > " << lease
 	     << "s), delivering inline" << dendl;
+    decline_all();
     return false;
   }
   bool any = false;
@@ -9400,8 +9412,11 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
     if (deliveries[i].empty()) {
       continue;
     }
-    if (deliver_op_oob(ctx, i, rops[i], deliveries[i], oob[i])) {
+    bool started = false;
+    if (deliver_op_oob(ctx, i, rops[i], deliveries[i], oob[i], &started)) {
       any = true;
+    } else if (!started) {
+      oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
     }
   }
   return any;
@@ -9409,8 +9424,9 @@ bool PrimaryLogPG::deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
 
 bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
 				  const ceph::rdma::delivery_t& d,
-				  ceph::rdma::oob_result_t& res)
+				  ceph::rdma::oob_result_t& res, bool* started)
 {
+  *started = false;
   auto m = ctx->op->get_req<MOSDOp>();
   if (d.flags & ~ceph::rdma::delivery_t::KNOWN_FLAGS) {
     // flag bits we do not implement: deliver inline so future
@@ -9495,9 +9511,13 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
   if (bound <= 0) {
     return false;
   }
+  // an executor that cannot say counts as having started
+  bool exec_started = true;
   ssize_t pushed = exec->execute_plan(
     m->get_hobj().oid.name, d.token, payload, plan,
-    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)));
+    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)),
+    &exec_started);
+  *started = exec_started;
   if (pushed < 0) {
     dout(10) << __func__ << " op " << idx << " plan execution failed ("
 	     << pushed << "), delivering inline" << dendl;
@@ -9511,6 +9531,11 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
     encode(bufferlist(), data_op->outdata);
   }
   res.bytes = static_cast<uint64_t>(pushed);
+  if (exec->delivery_complete()) {
+    // every byte is in the window: nothing of this op lands after the
+    // reply, which follows
+    res.flags |= ceph::rdma::oob_result_t::FLAG_LANDED;
+  }
   if (d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME) {
     // checksum each placed range at the storage node, after it
     // crossed the fabric. Every triple is one contiguous logical
@@ -9563,7 +9588,7 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
   ctx->reply = nullptr;
 
 #ifdef HAVE_OSD_OOB_DELIVERY
-  if (result >= 0 && osd->has_oob_executor() && m->has_rdma_delivery()) {
+  if (m->has_rdma_delivery()) {
     // advisory out-of-band delivery: try to RDMA-write each
     // descriptor-bearing op's read data straight into the client
     // window; on any refusal or failure the reply simply keeps that
@@ -9573,7 +9598,22 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
     std::vector<OSDOp> rops;
     reply->claim_ops(rops);
     std::vector<ceph::rdma::oob_result_t> oob(rops.size());
-    if (deliver_oob(ctx, rops, oob)) {
+    if (result >= 0 && osd->has_oob_executor()) {
+      deliver_oob(ctx, rops, oob);
+    } else {
+      // a failed read, or an OSD without a transport, starts no transfer
+      const auto& deliveries = m->get_rdma_deliveries();
+      for (size_t i = 0; i < oob.size() && i < deliveries.size(); i++) {
+	if (!deliveries[i].empty()) {
+	  oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
+	}
+      }
+    }
+    // report what was delivered, and what was declined: a client that
+    // learns no transfer started for any op need not fence its window
+    if (std::any_of(oob.begin(), oob.end(), [](const auto& r) {
+	  return r.bytes || r.flags;
+	})) {
       reply->set_oob_results(std::move(oob));
     }
     reply->claim_ops(rops);

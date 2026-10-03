@@ -48,12 +48,21 @@ public:
    * receipt of the request. An executor that cannot finish within it
    * cuts its writes off, or does not start them, so that nothing lands
    * after the window's owner may reuse the window.
+   *
+   * *started, when given, says whether any write was handed to the
+   * transport: false means that nothing of the plan reached the window,
+   * whatever the result, and the OSD tells the client so.
    */
   virtual ssize_t execute_plan(const std::string& key,
 			       const std::string& token,
 			       const ceph::buffer::list& data,
 			       const ceph::osd::oob::placement_plan& plan,
-			       std::chrono::milliseconds budget) = 0;
+			       std::chrono::milliseconds budget,
+			       bool* started) = 0;
+
+  /// true when a plan that succeeded had every byte placed in the
+  /// window's memory before execute_plan() returned
+  virtual bool delivery_complete() const { return false; }
 
   /// asok/debug counters
   virtual void dump_stats(ceph::Formatter* f) const = 0;

@@ -61,12 +61,14 @@ public:
 		       const std::string& token,
 		       const ceph::buffer::list& data,
 		       const ceph::osd::oob::placement_plan& plan,
-		       std::chrono::milliseconds budget) override;
+		       std::chrono::milliseconds budget,
+		       bool* started) override;
   void dump_stats(ceph::Formatter* f) const override;
   std::optional<window_t> acquire_window(size_t size) override;
   void release_window(uint64_t id, uint64_t quarantine_ms) override;
   void window_sync() override;
   void get_alerts(std::map<std::string, std::string>& alerts) const override;
+  bool delivery_complete() const override;
 
 private:
   CephContext* cct;

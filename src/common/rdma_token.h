@@ -180,6 +180,19 @@ struct oob_result_t {
   static constexpr uint32_t FLAG_CRC64_COMBINABLE = 1u << 1;
   /// ranges holds one crc_range_t per contiguous placed extent
   static constexpr uint32_t FLAG_CRC64_RANGES = 1u << 2;
+  /// set by the OSD: no transfer was started for this op, so nothing of
+  /// it reached the window, and its data is inline. Older OSDs never set
+  /// it, and a reader that does not know it treats the op as inline.
+  static constexpr uint32_t FLAG_DECLINED = 1u << 3;
+  /// set by the OSD: every write of this op completed, delivery-complete,
+  /// before the OSD replied, so nothing of it lands after the reply (bar a
+  /// transport's late duplicate of a completed write, which the window's
+  /// owner retires by re-keying)
+  static constexpr uint32_t FLAG_LANDED = 1u << 4;
+  /// set by the client library, never on the wire: the operation was sent
+  /// more than once, and an earlier attempt may have started a transfer
+  /// this result knows nothing of
+  static constexpr uint32_t FLAG_RESENT = 1u << 5;
 
   uint64_t bytes = 0;
   uint64_t crc64 = 0;

@@ -89,6 +89,13 @@ int OSDOfi::init()
 	    << "that miss their deadline: the kernel still delivers what it "
 	    << "queued. Use it for tests only." << dendl;
   }
+  if (const auto st = ep->stats(); st.close_discards == 0) {
+    // a late write is then only cut off once the provider has drained it,
+    // which the endpoint measures, and treats as unsafe when it ends late
+    dout(0) << "WARNING: " << ep->provider() << " says closing an endpoint "
+	    << "does not discard its writes; a write that misses its deadline "
+	    << "can land late, which stops out-of-band delivery" << dendl;
+  }
   if (!ep->delivery_complete()) {
     dout(0) << "WARNING: " << ep->provider() << " does not promise "
 	    << "delivery-complete writes; a reply may race the bytes it "
@@ -232,6 +239,10 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("staging_busy", s.staging_busy);
   f->dump_unsigned("timeouts", s.timeouts);
   f->dump_unsigned("cutoffs", s.resets);
+  f->dump_unsigned("plans_cut_off", s.plans_cut_off);
+  f->dump_unsigned("cancels_failed", s.cancels_failed);
+  f->dump_bool("cancel_discards", s.cancel_discards);
+  f->dump_int("close_discards", s.close_discards);
   f->dump_unsigned("cutoffs_failed", s.cutoffs_failed);
   f->dump_unsigned("cutoffs_late", s.cutoffs_late);
   f->dump_bool("unsafe", s.unsafe);

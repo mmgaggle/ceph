@@ -253,14 +253,18 @@ use again:
   off, within ``rdma_delivery_drain`` after the lease. This covers an
   OSD that disappears during the request, and an operation that the
   gateway's RADOS client sent again. Before a fallback rewrites the
-  window, the gateway waits for the lease plus the drain, which it
-  reads from the OSDMap. It skips the wait when every stripe came back
-  declined, so no transfer started, or landed, so every write completed
-  before the reply, and no stripe was resent. A stripe that was resent,
-  one an OSD started a transfer for and then returned inline, one from
-  an older OSD, and one without a result, as when its read timed out,
-  keep the wait. The window is then quiet before it is written
-  again.
+  window, and before it answers the client with an error, the gateway
+  waits for the lease plus the drain, which it reads from the OSDMap,
+  counted from when the last stripe operation completed. It skips the
+  wait when every stripe came back declined, so no transfer started, or
+  landed, so every write completed before the reply, and no stripe was
+  resent. A stripe that was resent, one an OSD started a transfer for
+  and then returned inline (a push cut off), one from an older OSD, and
+  one without a result, as when its read timed out, keep the wait.
+  Before a success, every stripe's OSD placed its bytes before
+  replying, and the gateway waits only when a stripe was resent: its
+  earlier attempt may still write. The window is then quiet before it
+  is written again, and before the client hears back.
 
 How an OSD cuts off a write depends on the transport:
 
@@ -441,7 +445,10 @@ Ceph does the first for the windows it lends itself, as soon as the
 operation that used a window ends, in place where the provider can. An OSD's gather windows get a new key
 when the gather releases them (``osd_oob_rekey_windows``), and so do the
 gateway's relay windows when a session ends (``rgw_rdma_rekey_windows``),
-also when a gather or a relay failed. When a window is registered again
+also when a gather or a relay failed. A window whose gather or relay
+did not finish cleanly stays out of use for its quarantine all the same,
+and for 10 s at least: its old key keeps a late write out only if the
+provider drops what carries it. When a window is registered again
 instead, the key that leaves service is not used for another window for
 10 s, and an endpoint asks a provider with a fixed table of regions,
 such as UET's, for a table of 16384 regions.
@@ -493,9 +500,16 @@ second is from the primary to the client.
 The primary lends one registered window to each peer shard that it
 reads from, and puts the window's token in the sub-read. The shard
 reads as usual, writes all the data it read into the window, and
-replies with only the extents. The primary rebuilds the shard buffers
-from the window and returns the window to its pool. The primary still
-reads its own shard directly.
+replies with only the extents and the crc32c of what it wrote. The
+primary copies the shard buffers out of the window, checks the copy
+against that checksum, and returns the window to its pool. A copy that
+does not match - a write that completed short, or landed somewhere else,
+or a late write into the window - counts as a failed shard read: the
+primary logs the window and its key, counts it in
+``gather_crc_mismatch``, quarantines the window, and reads the
+remaining shards inline to rebuild the data. The check costs a crc32c of
+the shard data on each side, and does not cover data that was wrong at
+rest. The primary still reads its own shard directly.
 
 The gather is advisory too. A shard that cannot write replies inline.
 A shard follows the same bounds as for client delivery, counted from
@@ -503,9 +517,11 @@ when the sub-read arrived. A window whose data the primary did not use
 stays out of use for the pool's ``rdma_delivery_lease`` plus its
 ``rdma_delivery_drain``. This covers a shard that replied inline, and
 a read that was cancelled or restarted. With ``osd_oob_rekey_windows``,
-the libfabric executor instead gives a released window a new key, after
-which no write meant for the last gather can land, and lends it again
-at once. See `Reusing a window`_.
+the libfabric executor also gives every released window a new key,
+after which no write meant for the last gather can land where the
+provider drops writes with a retired key. A window whose data the
+primary used is lent again at once; one whose data it did not use keeps
+its quarantine. See `Reusing a window`_.
 
 The first transport in ``osd_oob_transports`` that started lends the
 windows. The libfabric executor registers them on its endpoint. The
@@ -590,10 +606,11 @@ can then still start a write into the session buffer until the pool's
 ``rdma_delivery_lease`` expires. That write can land until the pool's
 ``rdma_delivery_drain`` runs out after the lease. The gateway keeps the
 buffer out of use for the lease plus the drain. With
-``rgw_rdma_rekey_windows``, the gateway instead gives the buffer's
+``rgw_rdma_rekey_windows``, the gateway also gives the buffer's
 libfabric window a new key when the session ends, after which no OSD
-write meant for that session can land, and the buffer is free at once.
-See `Reusing a window`_.
+write meant for that session can land. After a clean session the buffer
+is free at once; after a failed one it keeps the quarantine. See
+`Reusing a window`_.
 
 PUT
 ---
@@ -1057,7 +1074,11 @@ shows:
 * ``peer_timeouts``: reads that gave up, with nothing sent, while a new
   peer was added to the address vector. ``peers``, ``pending_inserts``
   and ``inserts_refused``. See `libfabric`_.
-* ``windows_rekeyed``, ``windows_rekey_failed`` and ``key_collisions``;
+* ``gather_crc_mismatch``: gathered shard data that did not match its
+  shard's checksum. See `Gathering shard reads out of band`_.
+* ``windows_rekeyed``, ``windows_rekeyed_quarantined`` (re-keyed after a
+  gather that did not finish cleanly, and quarantined all the same),
+  ``windows_rekey_failed`` and ``key_collisions``;
   ``rekeys_in_place`` and ``rekeys_reregistered``, and
   ``rekey_in_place``, whether the provider re-keys in place. See
   `Reusing a window`_.
@@ -1084,8 +1105,15 @@ Testing
   cancelled alone
   (over ``tcp``, with a test hook that stands in for a provider whose
   cancel discards), the cut-off cost estimate,
-  writes that start too late, concurrent writes and their CPU use, and
-  that a write with a re-keyed window's old token does not land.
+  writes that start too late, concurrent writes and their CPU use,
+  that a write with a re-keyed window's old token does not land, and
+  the gather window cycle under load, with cut-offs alongside.
+* ``unittest_ec_gather`` tests the check of gathered shard data against
+  its shard's checksum.
+* ``unittest_rdma_delivery`` follows a push that an OSD cut off through
+  the client library into the gateway's decision to fall back to HTTP.
+* ``unittest_rgw_rdma_fence`` tests when the gateway fences, and how it
+  reads each stripe's reply.
 * ``unittest_rgw_rdma_rc_wire`` tests the ``hipobj-rc-v2`` wire
   encoding.
 * ``ceph_test_rgw_ofi_get`` is an S3 client for OSD-direct delivery

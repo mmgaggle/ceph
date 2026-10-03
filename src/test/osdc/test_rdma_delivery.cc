@@ -314,3 +314,57 @@ TEST(RdmaDelivery, ResultReachesEitherForm)
 
   o->put();
 }
+
+// A result for an op sent more than once is marked resent: an earlier
+// attempt may have started a transfer the reply knows nothing of, and a
+// caller must then fence its window. One sent once is not.
+TEST(RdmaDelivery, ResentResultsAreMarked)
+{
+  ::ObjectOperation op;
+  ceph::buffer::list bl;
+  int rv = 0;
+  ceph::rdma::oob_result_t got;
+  op.read(0, 4096, &bl, &rv, nullptr);
+  op.set_rdma_delivery("t0", 0, 0, &got);
+  auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                             std::move(op.ops), 0, (Context*)nullptr,
+                             nullptr);
+  o->rdma_delivery.swap(op.rdma_delivery);
+  o->rdma_oob_result.swap(op.rdma_oob_result);
+
+  ceph::rdma::oob_result_t declined;
+  declined.flags = ceph::rdma::oob_result_t::FLAG_DECLINED;
+  o->attempts = 1;
+  Objecter::deliver_rdma_oob_result(o, 0, declined);
+  EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_DECLINED, got.flags);
+
+  o->attempts = 2;
+  Objecter::deliver_rdma_oob_result(o, 0, declined);
+  EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_DECLINED |
+            ceph::rdma::oob_result_t::FLAG_RESENT, got.flags);
+  o->put();
+}
+
+// A split read's result: declined only when every sub-read declined,
+// landed only when every one landed and bytes moved, resent when any was.
+TEST(RdmaDelivery, FoldTransferFlags)
+{
+  using R = ceph::rdma::oob_result_t;
+  using ceph::rdma::fold_transfer_flags;
+  EXPECT_EQ(0u, fold_transfer_flags({}, 0));
+  EXPECT_EQ(R::FLAG_DECLINED,
+            fold_transfer_flags({R::FLAG_DECLINED, R::FLAG_DECLINED}, 0));
+  // one sub-read started a transfer: not declined
+  EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_DECLINED, 0}, 0));
+  EXPECT_EQ(R::FLAG_LANDED,
+            fold_transfer_flags({R::FLAG_LANDED, R::FLAG_LANDED}, 8192));
+  // a sub-read delivered without the promise: not landed
+  EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_LANDED, 0}, 8192));
+  // landed needs bytes
+  EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_LANDED}, 0));
+  EXPECT_EQ(R::FLAG_DECLINED | R::FLAG_RESENT,
+            fold_transfer_flags({R::FLAG_DECLINED,
+                                 R::FLAG_DECLINED | R::FLAG_RESENT}, 0));
+  // the crc flags are not folded here
+  EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_CRC64NVME}, 4096));
+}

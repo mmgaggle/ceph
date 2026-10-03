@@ -2403,6 +2403,12 @@ void Objecter::op_post_split_op_complete(Op* op, bs::error_code ec, int rc) {
       _session_op_remove(op->session, op);
       sl.unlock();
       op->split_op_tids.reset();
+      if (op->has_rdma_delivery()) {
+	// The split was an attempt: its sub-reads may have started
+	// transfers into the window. Send the retry as a resend, which
+	// the primary delivers inline and the result marks resent.
+	op->attempts = std::max(op->attempts, 1);
+      }
       ceph_tid_t tid = 0;
       _op_submit(op, rl, &tid);
     }
@@ -4013,8 +4019,15 @@ bool Objecter::rdma_oob_wanted(const Op *op, unsigned i)
 }
 
 void Objecter::deliver_rdma_oob_result(Op *op, unsigned i,
-				       const ceph::rdma::oob_result_t& r)
+				       const ceph::rdma::oob_result_t& in)
 {
+  // An op sent more than once may have started a transfer in an earlier
+  // attempt that this result knows nothing of: say so, so that a caller
+  // fences its window before reusing it.
+  ceph::rdma::oob_result_t r = in;
+  if (op->attempts > 1) {
+    r.flags |= ceph::rdma::oob_result_t::FLAG_RESENT;
+  }
   if (i < op->rdma_oob_result.size() && op->rdma_oob_result[i]) {
     *op->rdma_oob_result[i] = r;
   }

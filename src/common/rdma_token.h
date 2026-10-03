@@ -223,6 +223,29 @@ struct oob_result_t {
 WRITE_CLASS_ENCODER(oob_result_t)
 
 /**
+ * The declined, landed and resent flags of a result assembled from the
+ * results of its parts, as a split read assembles its sub-reads': declined
+ * when every part declined, landed when every part landed and some bytes
+ * moved, resent when any part was resent. The crc flags are the caller's.
+ */
+inline uint32_t fold_transfer_flags(const std::vector<uint32_t>& parts,
+				    uint64_t bytes)
+{
+  if (parts.empty()) {
+    return 0;
+  }
+  bool declined = true, landed = bytes > 0, resent = false;
+  for (uint32_t f : parts) {
+    declined = declined && (f & oob_result_t::FLAG_DECLINED);
+    landed = landed && (f & oob_result_t::FLAG_LANDED);
+    resent = resent || (f & oob_result_t::FLAG_RESENT);
+  }
+  return (declined ? oob_result_t::FLAG_DECLINED : 0) |
+    (landed ? oob_result_t::FLAG_LANDED : 0) |
+    (resent ? oob_result_t::FLAG_RESENT : 0);
+}
+
+/**
  * Concatenate-combine a set of ranges into the CRC-64/NVME of the
  * window range they cover. The ranges may arrive in any order (they
  * are sorted by ofs here) but must tile [first.ofs, last.ofs+len)

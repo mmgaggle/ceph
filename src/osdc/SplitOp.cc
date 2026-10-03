@@ -605,6 +605,18 @@ void SplitOp::complete() {
                             r.ranges.end());
         }
       }
+      // declined when every sub-read started no transfer, landed when
+      // every one placed all its bytes before replying, resent when any
+      // was resent
+      std::vector<uint32_t> part_flags;
+      for (auto& [index, sub_read] : sub_reads) {
+        for (unsigned j = 0; j < sub_read.parent_ops.size(); ++j) {
+          if (sub_read.parent_ops[j] == (int)i && j < sub_read.oob.size()) {
+            part_flags.push_back(sub_read.oob[j].flags);
+          }
+        }
+      }
+      agg.flags |= ceph::rdma::fold_transfer_flags(part_flags, agg.bytes);
       if (all_ranged && ranged_bytes == agg.bytes) {
         agg.flags |= ceph::rdma::oob_result_t::FLAG_CRC64_RANGES;
         if (auto crc = ceph::rdma::fold_crc64_ranges(agg.ranges)) {

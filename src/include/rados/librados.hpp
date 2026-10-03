@@ -634,6 +634,14 @@ inline namespace v14_2_0 {
      * per contiguous range it placed when RDMA_DELIVERY_CRC64_RANGES
      * is set; a caller holding every range of a window can fold them
      * in offset order regardless of how the OSDs interleaved them.
+     *
+     * A caller that falls back to another path after a read was not
+     * delivered must not let anything else write the window until no
+     * write of the read can land any more. It need not wait when every
+     * descriptor-bearing read it sent reported RDMA_DELIVERY_DECLINED or
+     * RDMA_DELIVERY_LANDED and none reported RDMA_DELIVERY_RESENT;
+     * otherwise, and for a read that got no result at all, it waits the
+     * pool's lease plus drain.
      */
     struct rdma_delivery_range {
       uint64_t ofs = 0;     ///< client-window offset (token base relative)
@@ -655,6 +663,19 @@ inline namespace v14_2_0 {
     static constexpr uint32_t RDMA_DELIVERY_CRC64_COMBINABLE = 2;
     /// result flag: ranges is populated
     static constexpr uint32_t RDMA_DELIVERY_CRC64_RANGES = 4;
+    /// result flag: the OSD started no transfer for this read, so nothing
+    /// of it reached the window; its data came back inline. An older OSD
+    /// never sets it.
+    static constexpr uint32_t RDMA_DELIVERY_DECLINED = 8;
+    /// result flag: every byte was in the window before the OSD replied,
+    /// so nothing of this read lands after the reply (bar a transport's
+    /// late duplicate of a completed write, which retiring the window's
+    /// key stops)
+    static constexpr uint32_t RDMA_DELIVERY_LANDED = 16;
+    /// result flag: the operation was sent more than once; an earlier
+    /// attempt may have started a transfer that this result knows nothing
+    /// of, and may land until the pool's lease and drain after it
+    static constexpr uint32_t RDMA_DELIVERY_RESENT = 32;
     void set_rdma_delivery(const std::string& token, uint64_t base_offset,
 			   uint32_t flags, rdma_delivery_result *result);
     void checksum(rados_checksum_type_t type, const bufferlist &init_value_bl,

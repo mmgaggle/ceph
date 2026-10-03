@@ -1271,8 +1271,14 @@ int FilterObject::FilterReadOp::iterate(const DoutPrefixProvider* dpp, int64_t o
   next->params.rdma_bytes = params.rdma_bytes;
 
   int ret = next->iterate(dpp, ofs, end, cb, y);
-  if (ret < 0)
+  if (ret < 0) {
+    /* a failed passthrough read is retried in a fallback mode, which
+     * needs to know whether descriptor-bearing ops reached the OSDs and
+     * how long to fence the window */
+    params.rdma_submitted = next->params.rdma_submitted;
+    params.rdma_fence = next->params.rdma_fence;
     return ret;
+  }
 
   /* Copy params out of next */
   params = next->params;

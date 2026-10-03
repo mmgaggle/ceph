@@ -256,10 +256,68 @@ How an OSD cuts off a write depends on the transport:
   kernel delivers them later. The OSD logs a warning at startup. Use
   ``tcp`` for tests only.
 
+The libfabric executor stops waiting for its writes early enough to cut
+them off within the drain: by what a cut-off is expected to take. The
+first guess is 100 ms. Each cut-off then moves the estimate to twice what
+it took plus 20 ms. Closing and reopening an endpoint takes well under
+1 ms on ``tcp`` and on the UET reference provider, so the estimate soon
+settles near 20 ms. A transfer whose budget is shorter than the estimate
+is delivered inline, and ``budget_refused`` counts it. A transfer that
+has too little budget left when it is about to start is also delivered
+inline, before it sends anything, and ``late_starts`` counts it.
+Starting it would only cut it off at once, and every other write in
+flight with it.
+
+A cut-off can fail. The provider may fail to close the endpoint, so its
+writes go on. Or the close may take longer than the drain left, as when
+a provider drains its writes instead of discarding them. In both cases
+writes may land in a client's window after the fence. The OSD then
+stops delivering out of band. It delivers every read inline, logs the
+cause to the cluster log, and raises the ``OOB_DELIVERY_UNSAFE`` health
+warning. With ``osd_oob_cutoff_failure`` set to ``abort``, the OSD exits
+instead. That ends the writes of a software provider, and a device
+drops the queue pair's. Restart the OSD once the transport is fixed.
+``OOB_DELIVERY_DOWN`` means that a cut-off could not reopen the endpoint;
+no write is at risk then, but delivery has stopped.
+
 The lease and the drain bound the OSD side only. They are not a bound
 on how long a client keeps a window registered. Both are measured
 against the wall clock, so they are a best-effort fence across clock
 steps. Give them some slack.
+
+Reusing a window
+----------------
+
+The fence covers writes that an OSD cut off. It does not cover a
+duplicate of a write that already completed. A provider that retransmits
+without connection state at the target, as UET's RUDI mode does, can
+deliver a copy of a packet after the write it belongs to has completed,
+and after the response that reported the bytes placed. The target keeps
+no record of the write, so it places the copy wherever the copy's key
+points. Copies can arrive until the network's longest packet lifetime
+has passed. That is short on a healthy fabric, but it grows with every
+queue a packet waits in. A soak test with 1.5 s of delay on a client's
+link saw copies land 300 ms after their GET completed.
+
+So a window owner must not reuse a window's memory while a copy of an
+earlier write can still arrive under the window's key. Before it reuses
+the memory, it must do one of these:
+
+* Invalidate the key: deregister the memory region and register it
+  again, under a new key. A write that carries the old key then fails
+  instead of landing. This is the usual RDMA practice, and it is cheap
+  on a software provider. Make sure that the provider does not hand the
+  old key out again soon: the UET reference provider's keys are indexes
+  into a table of regions.
+* Wait out the network's longest packet lifetime before writing new data
+  into the window, or issuing a new token for it.
+
+Ceph does the first for the windows it lends itself. An OSD's gather
+windows get a new key when they are released (``osd_oob_rekey_windows``),
+and so do the gateway's relay windows when a session ends
+(``rgw_rdma_rekey_windows``). A key that leaves service is not used for
+another window for 10 s, and an endpoint asks a provider with a fixed
+table of regions, such as UET's, for a table of 16384 regions.
 
 Erasure-coded pools
 ===================
@@ -317,7 +375,10 @@ A shard follows the same bounds as for client delivery, counted from
 when the sub-read arrived. A window whose data the primary did not use
 stays out of use for the pool's ``rdma_delivery_lease`` plus its
 ``rdma_delivery_drain``. This covers a shard that replied inline, and
-a read that was cancelled or restarted.
+a read that was cancelled or restarted. With ``osd_oob_rekey_windows``,
+the libfabric executor instead gives a released window a new key, after
+which no write meant for the last gather can land, and lends it again
+at once. See `Reusing a window`_.
 
 The first transport in ``osd_oob_transports`` that started lends the
 windows. The libfabric executor registers them on its endpoint. The
@@ -401,7 +462,11 @@ A relay can fail after the OSDs received delivery descriptors. An OSD
 can then still start a write into the session buffer until the pool's
 ``rdma_delivery_lease`` expires. That write can land until the pool's
 ``rdma_delivery_drain`` runs out after the lease. The gateway keeps the
-buffer out of use for the lease plus the drain.
+buffer out of use for the lease plus the drain. With
+``rgw_rdma_rekey_windows``, the gateway instead gives the buffer's
+libfabric window a new key when the session ends, after which no OSD
+write meant for that session can land, and the buffer is free at once.
+See `Reusing a window`_.
 
 PUT
 ---
@@ -527,7 +592,18 @@ the insert first waits until the writes in flight are done, so that
 none of them misses its cut-off, and writes that start meanwhile wait
 for it, again only until their deadlines. The OSD logs at startup which
 case applies: ``concurrent peer inserts`` or ``peer inserts pause
-writes``.
+writes``. In the second case the executor's other work waits for the
+insert too: a gather window's token, the progress thread that places
+data in gather windows, and the gather's read of a window. Gathers are
+then delivered inline until the insert ends.
+
+Clients choose their endpoint names, so the executor bounds what they
+can make it do. At most 64 first contacts are queued or running at
+once; a read for yet another new client is delivered inline at once,
+and ``inserts_refused`` counts it. The address vector holds at most 1024
+peers. A new one evicts the least recently used peers that no write is
+using, never one that is being added. A failed insert is remembered for
+a second, and reads for that client are delivered inline meanwhile.
 
 Providers that progress manually place incoming data only while the
 application polls them. Each window owner in Ceph polls its endpoint
@@ -594,7 +670,14 @@ travels over UDP, to port 4793 by default.
 The wrapper must discard an endpoint's writes when the endpoint closes,
 as ``fi_endpoint(3)`` requires. The OSD relies on that to cut off a late
 write. A wrapper that drains its writes on close instead lets a cut-off
-write land after the deadline.
+write land after the deadline. The OSD measures each cut-off, and treats
+one that ends after the deadline as a failed cut-off. See
+`Fencing a window before reuse`_.
+
+A wrapper that offers ``FI_THREAD_SAFE`` lets the OSD add a new client
+while its writes to other clients go on. One that offers only
+``FI_THREAD_DOMAIN`` pauses the OSD's writes for each new client. See
+`libfabric`_.
 
 The reference provider has these limits:
 
@@ -603,19 +686,27 @@ The reference provider has these limits:
 * It keeps process-wide state, so each process has one interface and
   one endpoint. Processes on one host need separate interfaces and
   addresses.
-* The first write to a new peer runs ``ip route``, ``arp`` and ``ping``
-  to find the next hop. If the peer does not answer the ping, that
-  takes 10 seconds. The provider offers only ``FI_THREAD_DOMAIN``, so
-  the OSD's endpoint sends nothing else meanwhile. Reads whose deadline
-  passes during the wait are delivered inline.
+* The first write to a new peer finds the next hop. Current versions
+  ask the kernel over rtnetlink, and wait for ARP at most
+  ``UET_NH_WAIT_MS`` (1 s by default). Older versions run ``ip route``,
+  ``arp`` and ``ping``, which takes 10 seconds when the peer does not
+  answer the ping, as rocm-ernic's emulated UET NIC did not. Reads whose
+  deadline passes during the wait are delivered inline.
+* A memory key is the index of a region in a table that the provider
+  fills round robin, so a key comes back after as many registrations as
+  the table holds. The OSD and the gateway ask for 16384 regions. See
+  `Reusing a window`_.
+* RUDI keeps no state at the target, so duplicates of completed writes
+  can arrive late. See `Reusing a window`_.
 * It sends writes unencrypted, because the security sublayer is not
   configured.
 * It supports IPv4 only.
 
 To run several endpoints on one host, put each UET interface in its own
-VRF, the gateway's interface included. The provider finds peers with
-``ip route get``. Without VRFs, a peer's address is a local address of
-the host, so the lookup fails or the ping gets no answer.
+VRF, the gateway's interface included. The provider finds a peer's next
+hop by a route lookup on its own interface. Without VRFs, a peer's
+address is a local address of the host, so the lookup finds no next hop
+on the wire.
 
 Integrity
 =========
@@ -715,6 +806,9 @@ libfabric endpoint (``ofi``):
 * ``rgw_ofi_domain`` and ``rgw_ofi_node``: the domain and the local
   address to bind. The address must be reachable from the OSDs. When
   they are empty, the provider chooses.
+* ``rgw_rdma_rekey_windows``: give a relay window a new memory key when
+  its session ends, so that no OSD write meant for the session can land
+  in the next one. The default is true. See `Reusing a window`_.
 
 cuObject server (``cuobj``):
 
@@ -765,6 +859,13 @@ Executors and out-of-band behavior:
 * ``osd_oob_window_size`` and ``osd_oob_window_count``: the window
   pool, 16 windows of 8 MiB by default. A shard read larger than a
   window, or a gather that finds no free window, uses inline replies.
+* ``osd_oob_rekey_windows``: give a gather window a new memory key when
+  it is released, so that no write meant for an earlier gather can land
+  in a later one. The default is true. See `Reusing a window`_.
+* ``osd_oob_cutoff_failure``: what the OSD does when a transport fails to
+  cut off writes, or cuts them off late. ``disable``, the default, stops
+  out-of-band delivery and raises ``OOB_DELIVERY_UNSAFE``. ``abort``
+  makes the OSD exit. See `Fencing a window before reuse`_.
 
 libfabric executor (``ofi``):
 
@@ -799,9 +900,22 @@ Each executor reports its counters through the OSD's admin socket::
 
 The counters cover plans started, completed and failed, bytes written,
 writes in flight, and windows lent and exhausted. The ``ofi status``
-output also names the provider and the last provider error. Its
-``peer_timeouts`` counts writes that gave up, with nothing sent, while
-a new peer was added to the address vector.
+output also names the provider and the last provider error. It also
+shows:
+
+* ``cutoffs``, ``cutoffs_failed`` and ``cutoffs_late``, ``unsafe`` and
+  ``broken``. See `Fencing a window before reuse`_.
+* ``cutoff_cost_ms``, the current estimate of a cut-off's cost, and
+  ``budget_refused`` and ``late_starts``, the reads delivered inline
+  because too little of their budget was left.
+* ``peer_timeouts``: reads that gave up, with nothing sent, while a new
+  peer was added to the address vector. ``peers``, ``pending_inserts``
+  and ``inserts_refused``. See `libfabric`_.
+* ``windows_rekeyed``, ``windows_rekey_failed`` and ``key_collisions``.
+  See `Reusing a window`_.
+
+An OSD whose libfabric executor stopped raises ``OOB_DELIVERY_UNSAFE`` or
+``OOB_DELIVERY_DOWN`` in ``ceph health detail``.
 
 Accounting
 ----------
@@ -814,7 +928,10 @@ Testing
 -------
 
 * ``unittest_ofi_rma`` tests the libfabric token format, writes over
-  the ``tcp`` and ``shm`` providers, and a slow first write to a peer.
+  the ``tcp`` and ``shm`` providers, slow and refused first contacts,
+  eviction, cut-offs that fail or end late, the cut-off cost estimate,
+  writes that start too late, concurrent writes and their CPU use, and
+  that a write with a re-keyed window's old token does not land.
 * ``unittest_rgw_rdma_rc_wire`` tests the ``hipobj-rc-v2`` wire
   encoding.
 * ``ceph_test_rgw_ofi_get`` is an S3 client for OSD-direct delivery
@@ -831,8 +948,9 @@ Limitations
   complete before the next operation on that thread.
 * An OSD copies each read into a staging buffer. It does not register
   the read's own buffers.
-* Every call into one libfabric endpoint is serialized, which matches
-  the ``FI_THREAD_DOMAIN`` threading level that the executor asks for.
+* Every call into one libfabric endpoint is serialized, except the
+  adding and removing of peers on a provider that offers
+  ``FI_THREAD_SAFE``.
 * Every libfabric endpoint of one provider must use the same address
   family. Mixed IPv4 and IPv6 endpoints are not tested.
 * Shard-direct erasure-coded reads deliver sparse reads inline.

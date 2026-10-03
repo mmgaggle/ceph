@@ -322,14 +322,20 @@ void Service::release_buffer(Buffer* b, std::chrono::milliseconds quarantine)
     // A new key, so that no OSD write meant for the last session lands
     // once the buffer serves another: not one a failed relay left in
     // flight, and not a provider's late duplicate of one that completed,
-    // which the delivery lease does not bound. With the old key gone,
-    // neither can land, and the buffer needs no quarantine.
+    // which the delivery lease does not bound. After a clean session the
+    // buffer is free at once. After a failed one it keeps its quarantine
+    // anyway, and the key quarantine at least: writes the relay left in
+    // flight may still be on the way, and the new key keeps them out only
+    // if the provider drops what carries the old one.
     const ceph::ofi::Endpoint::window_t w{b->ofi_window,
 					  static_cast<char*>(b->ptr), b->size};
     if (int r = ofi_ep->rekey_window(w); r == 0) {
       b->osd_token = ofi_ep->window_token(w, 0, b->size);
-      b->quarantined_until = clock::time_point::min();
-      return;
+      if (quarantine.count() == 0) {
+        b->quarantined_until = clock::time_point::min();
+        return;
+      }
+      quarantine = std::max(quarantine, ofi_ep->key_quarantine());
     } else {
       ldout(cct, 1) << "rgw_rdma_rc: re-keying a relay window: "
                     << cpp_strerror(r) << " (" << ofi_ep->last_error()

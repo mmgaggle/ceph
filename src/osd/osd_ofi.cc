@@ -236,8 +236,12 @@ void OSDOfi::release_window(uint64_t id, uint64_t quarantine_ms)
   // A new key, so that no write meant for this gather lands once the
   // window is lent again: not a peer's that missed it, and not a
   // provider's late duplicate of one that completed, which the delivery
-  // lease does not bound. With the old key gone neither can land, and the
-  // window is free at once.
+  // lease does not bound. A gather that consumed the push gives no
+  // quarantine, and the window is free at once. One that did not - the
+  // shard replied inline, or the read was cancelled - keeps it out for
+  // the quarantine anyway: the shard's push may still be on the way, and
+  // the new key keeps it out only if the provider drops what carries the
+  // old one.
   windows->release(id, std::chrono::milliseconds(quarantine_ms),
 		   cct->_conf.get_val<bool>("osd_oob_rekey_windows"));
 }
@@ -297,6 +301,7 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("windows_acquired", ws.acquired);
   f->dump_unsigned("windows_exhausted", ws.exhausted);
   f->dump_unsigned("windows_rekeyed", ws.rekeyed);
+  f->dump_unsigned("windows_rekeyed_quarantined", ws.rekeyed_quarantined);
   f->dump_unsigned("windows_rekey_failed", ws.rekey_failed);
   f->dump_unsigned("rekeys_in_place", s.rekeys_in_place);
   f->dump_unsigned("rekeys_reregistered", s.rekeys_reregistered);

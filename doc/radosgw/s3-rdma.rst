@@ -263,22 +263,42 @@ How an OSD cuts off a write depends on the transport:
   ``tcp`` for tests only.
 
 The libfabric executor stops waiting for its writes early enough to cut
-them off within the drain: by what a cut-off is expected to take. The
-first guess is 100 ms. Each cut-off then moves the estimate to twice what
-it took plus 20 ms. Closing and reopening an endpoint takes well under
-1 ms on ``tcp`` and on the UET reference provider, so the estimate soon
-settles near 20 ms. A transfer whose budget is shorter than the estimate
-is delivered inline, and ``budget_refused`` counts it. A transfer that
+them off within the drain: by what a cut-off is expected to take, plus a
+scheduling slack. The first guess of the cost is 100 ms. Each cut-off
+then moves the estimate to twice what it took plus 20 ms. Closing and
+reopening an endpoint takes well under 1 ms on ``tcp`` and on the UET
+reference provider, so the estimate soon settles near 20 ms. The slack
+covers a thread that the scheduler did not run in time. It starts at
+50 ms and follows how late cut-offs actually started: twice the delay
+plus 5 ms. Any thread of the executor that polls its endpoint also cuts
+off every transfer whose time has come, so that one idle thread does
+not delay a cut-off; ``cutoffs_on_behalf`` counts those. A transfer
+whose budget is shorter than the cost and the slack together is
+delivered inline, and ``budget_refused`` counts it. A transfer that
 has too little budget left when it is about to start is also delivered
 inline, before it sends anything, and ``late_starts`` counts it.
 Starting it would only cut it off at once, and every other write in
 flight with it.
 
+A cut-off can still end after the budget it protects, usually because
+it started late on a loaded host. Whoever waits for the OSD's reply is
+not affected: the reply follows the cut-off. That covers a client that
+receives a response, and the gateway's fallback, which waits the lease
+plus the drain after every operation has completed. Only a client that
+gives a request up, and counts the fence from when it sent the request,
+needs to allow for it. So a cut-off that ends late by no more than
+``osd_oob_cutoff_late_tolerance`` (1 s by default), and that itself
+took no longer, is counted in ``cutoffs_late``, and the OSD raises the
+``OOB_CUTOFF_LATE`` health warning for ten minutes, with the worst
+lateness. Delivery goes on. 1 s is a third of the default drain, and
+thousands of times what a cut-off costs, so a cut-off that late is a
+scheduling delay, not a transport that fails to discard.
+
 A cut-off can fail. The provider may fail to close the endpoint, so its
-writes go on. Or the close may take longer than the drain left, as when
-a provider drains its writes instead of discarding them. In both cases
-writes may land in a client's window after the fence. The OSD then
-stops delivering out of band. It delivers every read inline, logs the
+writes go on. Or the close may take longer than the tolerance, or end
+later than it, as when a provider drains its writes instead of
+discarding them. In these cases writes may land in a client's window
+after the fence. The OSD then stops delivering out of band. It delivers every read inline, logs the
 cause to the cluster log, and raises the ``OOB_DELIVERY_UNSAFE`` health
 warning. With ``osd_oob_cutoff_failure`` set to ``abort``, the OSD exits
 instead. That ends the writes of a software provider, and a device
@@ -329,8 +349,11 @@ A request can also end without a response: the connection to the
 gateway resets, the gateway exits, or the client times out. The OSDs
 may then still write into the window, as `Fencing a window before
 reuse`_ describes: until the pool's ``rdma_delivery_lease`` plus its
-``rdma_delivery_drain`` after the request was sent, and copies of those
-writes until the packet lifetime after that. The owner must retire the
+``rdma_delivery_drain`` after the request was sent, plus the OSDs'
+``osd_oob_cutoff_late_tolerance`` for a cut-off that ends late, plus
+the time the request took to reach the OSDs, which count from receipt.
+Copies of those writes can follow until the packet lifetime after
+that. The owner must retire the
 key at once, or leave the window untouched until then. A soak test that
 killed the gateway saw OSD writes land in clients' windows 50 to 350 ms
 afterwards. That is within the contract, but a client that reuses the
@@ -901,9 +924,13 @@ Executors and out-of-band behavior:
   it is released, so that no write meant for an earlier gather can land
   in a later one. The default is true. See `Reusing a window`_.
 * ``osd_oob_cutoff_failure``: what the OSD does when a transport fails to
-  cut off writes, or cuts them off late. ``disable``, the default, stops
-  out-of-band delivery and raises ``OOB_DELIVERY_UNSAFE``. ``abort``
-  makes the OSD exit. See `Fencing a window before reuse`_.
+  cut off writes, or cuts them off later than the tolerance.
+  ``disable``, the default, stops out-of-band delivery and raises
+  ``OOB_DELIVERY_UNSAFE``. ``abort`` makes the OSD exit. See `Fencing a
+  window before reuse`_.
+* ``osd_oob_cutoff_late_tolerance``: how late a cut-off may end, past the
+  budget it protects, and still be only counted and warned of
+  (``OOB_CUTOFF_LATE``). The default is 1000 ms.
 
 libfabric executor (``ofi``):
 
@@ -946,7 +973,9 @@ shows:
   back to a reset; ``cancel_discards`` and ``close_discards``, what the
   provider promises (``-1`` when it does not say). See `Fencing a window
   before reuse`_.
-* ``cutoffs_failed`` and ``cutoffs_late``, ``unsafe`` and ``broken``.
+* ``cutoffs_failed`` and ``cutoffs_late``, ``max_cutoff_lateness_ms``
+  and ``late_tolerance_ms``, ``unsafe`` and ``broken``.
+* ``cutoff_slack_ms``, the scheduling slack, and ``cutoffs_on_behalf``.
 * ``cutoff_cost_ms``, the current estimate of a cut-off's cost, and
   ``budget_refused`` and ``late_starts``, the reads delivered inline
   because too little of their budget was left.
@@ -957,7 +986,8 @@ shows:
   See `Reusing a window`_.
 
 An OSD whose libfabric executor stopped raises ``OOB_DELIVERY_UNSAFE`` or
-``OOB_DELIVERY_DOWN`` in ``ceph health detail``.
+``OOB_DELIVERY_DOWN`` in ``ceph health detail``, and one that cut off
+writes late within the tolerance raises ``OOB_CUTOFF_LATE``.
 
 Accounting
 ----------
@@ -971,7 +1001,9 @@ Testing
 
 * ``unittest_ofi_rma`` tests the libfabric token format, writes over
   the ``tcp`` and ``shm`` providers, slow and refused first contacts,
-  eviction, cut-offs that fail or end late, late writes cancelled alone
+  eviction, cut-offs that fail or end late, within and beyond the
+  tolerance, writers left idle near their deadlines, late writes
+  cancelled alone
   (over ``tcp``, with a test hook that stands in for a provider whose
   cancel discards), the cut-off cost estimate,
   writes that start too late, concurrent writes and their CPU use, and

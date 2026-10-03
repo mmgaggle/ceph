@@ -211,6 +211,7 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("staging_busy", s.staging_busy);
   f->dump_unsigned("timeouts", s.timeouts);
   f->dump_unsigned("cutoffs", s.resets);
+  f->dump_unsigned("peer_timeouts", s.peer_timeouts);
   f->dump_unsigned("windows_acquired", windows_acquired);
   f->dump_unsigned("windows_exhausted", windows_exhausted);
   f->dump_string("last_error", ep->last_error());

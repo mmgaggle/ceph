@@ -300,6 +300,7 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   const auto ws = windows ? windows->stats() : ceph::ofi::WindowPool::stats_t{};
   f->dump_unsigned("windows_acquired", ws.acquired);
   f->dump_unsigned("windows_exhausted", ws.exhausted);
+  f->dump_unsigned("gather_crc_mismatch", gather_crc_mismatch);
   f->dump_unsigned("windows_rekeyed", ws.rekeyed);
   f->dump_unsigned("windows_rekeyed_quarantined", ws.rekeyed_quarantined);
   f->dump_unsigned("windows_rekey_failed", ws.rekey_failed);

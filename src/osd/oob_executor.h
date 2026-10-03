@@ -108,4 +108,8 @@ public:
    * the shard's reply, and nothing else orders the two.
    */
   virtual void window_sync() {}
+
+  /// a shard's push into one of our windows did not match the shard's
+  /// checksum of it: the read went to the other shards instead
+  virtual void note_gather_crc_mismatch() {}
 };

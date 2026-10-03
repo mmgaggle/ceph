@@ -75,6 +75,13 @@ add_executable(unittest_oob_placement
 add_ceph_unittest(unittest_oob_placement)
 target_link_libraries(unittest_oob_placement osd global)
 
+# unittest_ec_gather
+add_executable(unittest_ec_gather
+  test_ec_gather.cc
+  )
+add_ceph_unittest(unittest_ec_gather)
+target_link_libraries(unittest_ec_gather osd global)
+
 # unittest_ecbackend_l (legacy EC)
 add_executable(unittest_ecbackend_l
   TestECBackendL.cc

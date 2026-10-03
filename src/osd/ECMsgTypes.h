@@ -23,6 +23,8 @@
 #include "os/ObjectStore.h"
 #include "boost/tuple/tuple.hpp"
 
+#include <optional>
+
 struct ECSubWrite {
   pg_shard_t from;
   ceph_tid_t tid;
@@ -152,6 +154,10 @@ struct ECSubReadReply {
   /// window rather than carried in buffers_read, in the order they sit
   /// there back to back
   std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
+  /// crc32c (seeded with -1) of the data pushed, as the shard read it;
+  /// the primary takes the window's content only if it matches. Unset
+  /// from a shard that pushed nothing, or predates it.
+  std::optional<uint32_t> pushed_crc;
   void encode(ceph::buffer::list &bl) const;
   void encode(ceph::buffer::list &p_bl,
 	      ceph::buffer::list &d_pl,

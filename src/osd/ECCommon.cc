@@ -614,7 +614,8 @@ void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
     read.push_token.clear();
     // our own shard is read through a message to ourselves; there is
     // nothing to gain pushing it back to this OSD
-    if (gather_exec && pg_shard != get_parent()->whoami_shard() &&
+    if (gather_exec && !rop.gather.inline_only &&
+	pg_shard != get_parent()->whoami_shard() &&
 	!rop.gather.find(pg_shard)) {
       uint64_t bytes = 0;
       for (auto& [hoid, extents] : read.to_read) {

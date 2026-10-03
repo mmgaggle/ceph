@@ -420,9 +420,9 @@ void ECSubReadReply::encode(bufferlist &p_bl,
 			    bufferlist &d_bl,
 			    uint64_t features) const
 {
-  // only a primary that sent a push token reads pushed, and such a
-  // primary is new enough to decode v4
-  uint8_t ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 4 : 1;
+  // only a primary that sent a push token reads pushed and pushed_crc,
+  // and such a primary is new enough to decode v5
+  uint8_t ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 5 : 1;
   uint8_t compat_ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 2 : 1;
   ENCODE_START(ver, compat_ver, p_bl);
   encode(from, p_bl);
@@ -456,6 +456,9 @@ void ECSubReadReply::encode(bufferlist &p_bl,
   if (ver >= 4) {
     encode(pushed, p_bl);
   }
+  if (ver >= 5) {
+    encode(pushed_crc, p_bl);
+  }
   ENCODE_FINISH(p_bl);
 }
 
@@ -467,7 +470,7 @@ void ECSubReadReply::decode(bufferlist::const_iterator &bl)
 void ECSubReadReply::decode(bufferlist::const_iterator &p_bl,
 			    bufferlist::const_iterator &d_bl)
 {
-  DECODE_START(4, p_bl);
+  DECODE_START(5, p_bl);
   decode(from, p_bl);
   decode(tid, p_bl);
   if (struct_v < 2) {
@@ -512,6 +515,11 @@ void ECSubReadReply::decode(bufferlist::const_iterator &p_bl,
     decode(pushed, p_bl);
   } else {
     pushed.clear();
+  }
+  if (struct_v >= 5) {
+    decode(pushed_crc, p_bl);
+  } else {
+    pushed_crc.reset();
   }
 
   DECODE_FINISH(p_bl);

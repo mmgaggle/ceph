@@ -14,6 +14,7 @@
  */
 
 #include "ECBackend.h"
+#include "osd/ec_gather.h"
 #include "osd/oob_placement.h"
 
 #include <iostream>
@@ -790,6 +791,9 @@ void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
   dout(20) << __func__ << ": pushed " << all.length()
 	   << " bytes to the primary" << dendl;
   reply->pushed = std::move(pushed);
+  // what the primary finds in its window has to match this before it
+  // passes for our data
+  reply->pushed_crc = all.crc32c(-1);
   reply->buffers_read.clear();
 }
 
@@ -854,26 +858,35 @@ void ECBackend::handle_sub_read_reply(
       rop.gather.release(from, false);
     } else {
       // the shard placed its data in our window: rebuild the buffers the
-      // reply would have carried, in the order it placed them
+      // reply would have carried, in the order it placed them, and check
+      // them against the shard's checksum of what it placed
       rop.gather.exec->window_sync();
-      uint64_t cursor = 0;
-      bool ok = true;
-      for (auto &&[hoid, extents] : op.pushed) {
-	for (auto &&[offset, len] : extents) {
-	  if (cursor + len > w->size) {
-	    ok = false;
-	    break;
-	  }
-	  bufferlist bl;
-	  bl.append(w->ptr + cursor, len);
-	  op.buffers_read[hoid].emplace_back(offset, std::move(bl));
-	  cursor += len;
-	}
-      }
-      dout(20) << __func__ << ": " << cursor << " bytes from shard "
+      const auto t = ceph::osd::oob::take_pushed(
+	w->ptr, w->size, op.pushed, op.pushed_crc, op.buffers_read);
+      dout(20) << __func__ << ": " << t.bytes << " bytes from shard "
 	       << from << " arrived out of band" << dendl;
-      rop.gather.release(from, ok);
-      if (!ok) {
+      if (t.mismatch) {
+	// whatever is in the window, it is not what the shard placed: a
+	// push that completed short, or a write that landed after it.
+	// Read the object from the other shards instead.
+	dout(0) << __func__ << ": the " << t.bytes << " bytes shard " << from
+		<< " pushed into gather window " << w->id << " (" << w->token
+		<< ") do not match its checksum: crc32c 0x" << std::hex
+		<< t.crc << " != 0x" << *op.pushed_crc << std::dec
+		<< "; reading from the other shards" << dendl;
+	rop.gather.exec->note_gather_crc_mismatch();
+      } else if (t.overrun) {
+	dout(0) << __func__ << ": shard " << from << " pushed more than "
+		<< "gather window " << w->id << " holds ("
+		<< w->size << " bytes); reading from the other shards"
+		<< dendl;
+      }
+      // a window holding anything but the push may still take writes:
+      // it goes back quarantined, and the reads that rebuild what this
+      // shard's push should have brought come back inline
+      rop.gather.release(from, t.ok());
+      if (!t.ok()) {
+	rop.gather.inline_only = true;
 	for (auto &&[hoid, extents] : op.pushed) {
 	  op.buffers_read.erase(hoid);
 	  op.errors[hoid] = -EIO;

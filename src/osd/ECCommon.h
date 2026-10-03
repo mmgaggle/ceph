@@ -300,12 +300,15 @@ struct ECCommon {
     OSDOobExecutor* exec = nullptr;
     uint64_t quarantine_ms = 0;
     std::map<pg_shard_t, OSDOobExecutor::window_t> windows;
+    /// a window held something other than its shard's push: the reads
+    /// this gather still sends, to rebuild what it lost, come back inline
+    bool inline_only = false;
 
     gather_windows_t() = default;
     gather_windows_t(const gather_windows_t&) = delete;
     gather_windows_t(gather_windows_t&& o) noexcept
       : exec(o.exec), quarantine_ms(o.quarantine_ms),
-	windows(std::move(o.windows)) {
+	windows(std::move(o.windows)), inline_only(o.inline_only) {
       o.windows.clear();
     }
     ~gather_windows_t() {

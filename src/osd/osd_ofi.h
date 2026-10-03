@@ -67,6 +67,7 @@ public:
   std::optional<window_t> acquire_window(size_t size) override;
   void release_window(uint64_t id, uint64_t quarantine_ms) override;
   void window_sync() override;
+  void note_gather_crc_mismatch() override { gather_crc_mismatch++; }
   void get_alerts(std::map<std::string, std::string>& alerts) const override;
   bool delivery_complete() const override;
 
@@ -91,5 +92,6 @@ private:
   std::atomic<uint64_t> plans_completed{0};
   std::atomic<uint64_t> plans_failed{0};
   std::atomic<uint64_t> bytes_pushed{0};
+  std::atomic<uint64_t> gather_crc_mismatch{0};
 
 };

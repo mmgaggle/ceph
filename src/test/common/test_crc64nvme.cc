@@ -30,7 +30,9 @@ TEST(Crc64Nvme, Canonical)
 TEST(Crc64Nvme, MatchesSpdk)
 {
   // the OSD computes with the madler implementation; rgw's digests use
-  // the vendored spdk tables - they must agree
+  // spdk_crc64_nvme(), ISA-L's crc64_rocksoft_refl() when ceph-common is
+  // built with ISA-L and the vendored spdk table otherwise - they must
+  // agree
   std::mt19937_64 rng(7);
   std::vector<char> buf(1 << 16);
   for (auto& c : buf) {

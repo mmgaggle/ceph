@@ -264,6 +264,10 @@ add_executable(unittest_crc64nvme
   )
 add_ceph_unittest(unittest_crc64nvme)
 target_link_libraries(unittest_crc64nvme ceph-common)
+if(WITH_EC_ISA_PLUGIN)
+  # it also checks ISA-L's crc64_rocksoft_refl() directly
+  target_link_libraries(unittest_crc64nvme ISAL::ISAL)
+endif()
 
 # unittest_rdma_token
 add_executable(unittest_rdma_token

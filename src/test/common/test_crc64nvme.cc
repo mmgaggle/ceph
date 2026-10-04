@@ -3,36 +3,122 @@
 
 #include "common/crc64nvme.h"
 
+#include <algorithm>
 #include <random>
+#include <vector>
 
+#include "acconfig.h"
 #include "include/buffer.h"
 #include "gtest/gtest.h"
 
 extern "C" {
+#include "common/madler/crc64nvme.h"
 #include "common/spdk/crc64.h"
+#ifdef WITH_EC_ISA_PLUGIN
+#include "isa-l/include/crc64.h"
+#endif
 }
 
-// canonical CRC-64/NVME check value from the NVMe specification
+// the CRC-64/NVME check value, the CRC of "123456789" (the NVM Command
+// Set specification 1.1, Figure 153, gives it bit-reversed, as
+// 11199E50_6128D175h)
 static constexpr uint64_t CHECK_123456789 = 0xae8b14860a799888ull;
 
 TEST(Crc64Nvme, Canonical)
 {
   const char* s = "123456789";
   EXPECT_EQ(CHECK_123456789, ceph::crc64nvme(0, s, 9));
+  EXPECT_EQ(CHECK_123456789, crc64nvme_word(0, s, 9));
   // empty input
   EXPECT_EQ(0u, ceph::crc64nvme(0, s, 0));
+  EXPECT_EQ(CHECK_123456789, ceph::crc64nvme(CHECK_123456789, s, 0));
+  EXPECT_EQ(CHECK_123456789, ceph::crc64nvme(CHECK_123456789, nullptr, 0));
   // incremental == one-shot
   uint64_t inc = ceph::crc64nvme(0, s, 4);
   inc = ceph::crc64nvme(inc, s + 4, 5);
   EXPECT_EQ(CHECK_123456789, inc);
 }
 
+TEST(Crc64Nvme, NvmGuardTestCases)
+{
+  // NVM Command Set specification 1.1, 5.3.1.3.5, Figure 155: "64b CRC
+  // Test Cases for 4 KiB Logical Block with no Metadata"
+  const struct {
+    const char* contents;
+    uint8_t (*byte)(size_t i);
+    uint64_t guard;
+  } cases[] = {
+    {"each byte cleared to 00h",
+     [](size_t) -> uint8_t { return 0x00; }, 0x6482d367eb22b64eull},
+    {"each byte set to FFh",
+     [](size_t) -> uint8_t { return 0xff; }, 0xc0ddba7302eca3acull},
+    {"incrementing 00h to FFh, repeating",
+     [](size_t i) -> uint8_t { return i & 0xff; }, 0x3e729f5f6750449cull},
+    {"decrementing FFh to 00h, repeating",
+     [](size_t i) -> uint8_t { return 0xff - (i & 0xff); },
+     0x9a2df64b8e9e517eull},
+  };
+  for (const auto& c : cases) {
+    std::vector<unsigned char> block(4096);
+    for (size_t i = 0; i < block.size(); i++) {
+      block[i] = c.byte(i);
+    }
+    EXPECT_EQ(c.guard, ceph::crc64nvme(0, block.data(), block.size()))
+      << c.contents;
+    EXPECT_EQ(c.guard, crc64nvme_word(0, block.data(), block.size()))
+      << c.contents;
+    EXPECT_EQ(c.guard, spdk_crc64_nvme(block.data(), block.size(), 0))
+      << c.contents;
+#ifdef WITH_EC_ISA_PLUGIN
+    EXPECT_EQ(c.guard, crc64_rocksoft_refl(0, block.data(), block.size()))
+      << c.contents;
+#endif
+    // and as a bufferlist of odd-sized segments
+    bufferlist bl;
+    for (size_t pos = 0, len = 1; pos < block.size(); pos += len, len += 2) {
+      len = std::min(len, block.size() - pos);
+      bl.append(ceph::buffer::copy(
+        reinterpret_cast<const char*>(block.data()) + pos, len));
+    }
+    EXPECT_LT(1u, bl.get_num_buffers());
+    EXPECT_EQ(c.guard, ceph::crc64nvme(bl)) << c.contents;
+  }
+}
+
+TEST(Crc64Nvme, MatchesMadler)
+{
+  // whichever implementation ceph::crc64nvme() chose, it agrees with
+  // madler at every length across the kernels' block boundaries, at
+  // every alignment, and with a nonzero seed
+  std::mt19937_64 rng(1234);
+  std::vector<unsigned char> buf(16 + (1 << 20));
+  for (auto& c : buf) {
+    c = static_cast<unsigned char>(rng());
+  }
+  auto check = [&](size_t off, size_t len, uint64_t seed) {
+    const unsigned char* p = buf.data() + off;
+    const uint64_t want = crc64nvme_word(seed, p, len);
+    EXPECT_EQ(want, ceph::crc64nvme(seed, p, len))
+      << "off=" << off << " len=" << len << " seed=" << seed;
+#ifdef WITH_EC_ISA_PLUGIN
+    EXPECT_EQ(want, crc64_rocksoft_refl(seed, p, len))
+      << "off=" << off << " len=" << len << " seed=" << seed;
+#endif
+  };
+  for (size_t len = 0; len <= 4096; len++) {
+    check(len % 16, len, (len & 1) ? rng() : 0);
+  }
+  for (size_t off = 0; off < 16; off++) {
+    check(off, 1 << 20, rng());
+  }
+}
+
 TEST(Crc64Nvme, MatchesSpdk)
 {
-  // the OSD computes with the madler implementation; rgw's digests use
-  // spdk_crc64_nvme(), ISA-L's crc64_rocksoft_refl() when ceph-common is
-  // built with ISA-L and the vendored spdk table otherwise - they must
-  // agree
+  // the OSD computes with ceph::crc64nvme() (ISA-L or madler, chosen at
+  // run time); rgw's digests use spdk_crc64_nvme() (ISA-L when
+  // ceph-common is built with it, the vendored spdk table otherwise) -
+  // they must agree
   std::mt19937_64 rng(7);
   std::vector<char> buf(1 << 16);
   for (auto& c : buf) {
@@ -81,4 +167,33 @@ TEST(Crc64Nvme, Bufferlist)
   EXPECT_EQ(CHECK_123456789, ceph::crc64nvme(bl));
   bufferlist empty;
   EXPECT_EQ(0u, ceph::crc64nvme(empty));
+}
+
+TEST(Crc64Nvme, ChainedSegments)
+{
+  // one call per segment, as over a read reply's bufferlist: segments of
+  // odd lengths that start at odd addresses, chained through the seed
+  std::mt19937_64 rng(99);
+  const std::pair<size_t, size_t> shapes[] = {  // longest segment, total
+    {7, 1 << 16}, {300, 1 << 18}, {70000, 1 << 20}};
+  for (auto [max_seg, n] : shapes) {
+    std::vector<char> src(n);
+    for (auto& c : src) {
+      c = static_cast<char>(rng());
+    }
+    const uint64_t want = crc64nvme_word(0, src.data(), n);
+    const ceph::buffer::ptr whole = ceph::buffer::copy(src.data(), n);
+    bufferlist bl;
+    uint64_t chained = 0;
+    unsigned segs = 0;
+    for (size_t pos = 0; pos < n; segs++) {
+      const size_t len = std::min<size_t>(1 + rng() % max_seg, n - pos);
+      bl.append(ceph::buffer::ptr(whole, pos, len));
+      chained = ceph::crc64nvme(chained, src.data() + pos, len);
+      pos += len;
+    }
+    ASSERT_EQ(segs, bl.get_num_buffers());
+    EXPECT_EQ(want, ceph::crc64nvme(bl)) << "max_seg=" << max_seg;
+    EXPECT_EQ(want, chained) << "max_seg=" << max_seg;
+  }
 }

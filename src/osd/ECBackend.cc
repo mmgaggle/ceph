@@ -644,6 +644,11 @@ void ECBackend::handle_sub_read(
       lgeneric_derr(cct) << __func__ << ": failed to decode OI for " << *i
               << ": " << e.what() << dendl;
       get_parent()->clog_warn() << "corrupt object info attribute for " << *i;
+      // as for every other error here, nothing of the object goes back
+      // with it: the primary asserts an errored object brought no data
+      reply->attrs_read.erase(*i);
+      reply->buffers_read.erase(*i);
+      reply->omaps_complete.erase(*i);
       reply->errors[*i] = -EIO;
       continue;
     }

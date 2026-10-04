@@ -101,6 +101,23 @@ void ECCommon::RecoveryBackend::RecoveryOp::dump(Formatter *f) const {
 
 void ECCommon::ReadPipeline::complete_read_op(ReadOp &&rop) {
   dout(20) << __func__ << " completing " << rop << dendl;
+#ifndef WITH_CRIMSON
+  if (rop.do_redundant_reads && !rop.for_recovery &&
+      !rop.in_progress.empty() && cct->_conf->osd_ec_repair_on_read) {
+    // a fast read done before every shard replied: the replies still to
+    // come may carry media errors (@see ECBackend::handle_sub_read_reply)
+    late_read_t late;
+    late.pending = rop.in_progress;
+    for (auto &&[hoid, res] : rop.complete) {
+      if (res.r == 0) {
+        late.decoded.insert(hoid);
+      }
+    }
+    if (!late.decoded.empty()) {
+      late_reads.emplace(rop.tid, std::move(late));
+    }
+  }
+#endif
   auto req_iter = rop.to_read.begin();
   auto resiter = rop.complete.begin();
   ceph_assert(rop.to_read.size() == rop.complete.size());
@@ -130,6 +147,7 @@ void ECCommon::ReadPipeline::on_change() {
   tid_to_read_map.clear();
   shard_to_read_map.clear();
   in_progress_client_reads.clear();
+  late_reads.clear();
 }
 
 std::pair<const shard_id_set, const shard_id_set>
@@ -778,6 +796,13 @@ struct ClientReadCompleter final : ECCommon::ReadCompleter {
           result.insert(read.offset, read.size,
                         res.buffers_read.get_ro_buffer(read.offset, read.size));
         }
+      }
+      if (!res.media_errors.empty()) {
+        // the data is whole without the shards whose store failed to
+        // read it: the PG may repair them, the read completes regardless
+        dout(10) << __func__ << " " << hoid << " decoded around media errors"
+                 << " on shards " << res.media_errors << dendl;
+        read_pipeline.get_parent()->ec_repair_on_read(hoid, res.media_errors);
       }
     }
     dout(20) << __func__ << " calling complete_object with result="

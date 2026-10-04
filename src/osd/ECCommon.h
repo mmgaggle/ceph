@@ -207,6 +207,9 @@ struct ECCommon {
   struct read_result_t {
     int r;
     std::map<pg_shard_t, int> errors;
+    /// shards whose own store failed the read with a media error (-EIO)
+    /// and that the decode did without: a client read has them repaired
+    std::set<pg_shard_t> media_errors;
     std::optional<std::map<std::string, ceph::buffer::list, std::less<>>> attrs;
     std::optional<ceph::buffer::list> omap_header;
     std::optional<std::map<std::string, ceph::buffer::list>> omap_entries;
@@ -221,6 +224,9 @@ struct ECCommon {
 
     void print(std::ostream &os) const {
       os << "read_result_t(r=" << r << ", errors=" << errors;
+      if (!media_errors.empty()) {
+        os << ", media_errors=" << media_errors;
+      }
       if (attrs) {
         os << ", attrs=" << *(attrs);
       } else {
@@ -441,6 +447,18 @@ struct ECCommon {
     std::map<ceph_tid_t, ReadOp> tid_to_read_map;
     std::map<pg_shard_t, std::set<ceph_tid_t>> shard_to_read_map;
     std::list<ClientAsyncReadStatus> in_progress_client_reads;
+
+    /**
+     * A fast read completes once enough shards have replied. Until the
+     * rest do, it is remembered by tid with the objects it decoded, so
+     * that a late reply carrying a media error still has that shard
+     * repaired. Not kept with osd_ec_repair_on_read off.
+     */
+    struct late_read_t {
+      std::set<pg_shard_t> pending;   ///< shards yet to reply
+      std::set<hobject_t> decoded;    ///< objects the read completed
+    };
+    std::map<ceph_tid_t, late_read_t> late_reads;
 
     CephContext *cct;
     ceph::ErasureCodeInterfaceRef ec_impl;

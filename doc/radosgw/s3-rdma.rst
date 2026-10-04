@@ -840,8 +840,8 @@ primary logs the window and its key, counts it in
 remaining shards inline to rebuild the data. A push whose extents run
 past the end of its window, and pushed extents with no window to find
 them in, fail the same way, without the count. The primary records
-these failures as transport faults, not media errors. See `Shard read
-errors`_. The check costs a
+these failures as transport faults, not media errors, so it never
+repairs a shard for one. See `Shard read errors`_. The check costs a
 crc32c of the shard data on each side, and does not cover data that was
 wrong at rest. The primary reads its own shard without a window.
 
@@ -895,14 +895,30 @@ and the primary decodes around the bad shard. A bounce answers the read
 before any transfer starts, so it costs the gateway neither a fallback
 nor a fence. See `Retries`_.
 
+When a shard's store fails a client read that the primary of a pool
+with ``allow_ec_optimizations`` decodes, the primary also repairs the
+shard, unless ``osd_ec_repair_on_read`` is off. It marks the object
+missing on that shard and recovers it at once. It logs ``<pgid> shard
+<shard> failed to read <object> v <version> with a media error;
+marking it missing to repair it from the other shards`` to the cluster
+log as a warning, and counts the shard in the OSD performance counter
+``ec_read_repair``. The PG goes through recovery with ``repair`` set,
+and the pushes count as repairs on the OSDs that take them, toward
+``OSD_TOO_MANY_REPAIRS``. The read completes with the
+decoded data either way. The primary repairs only in an active and
+clean PG with no scrub running and no write holding the object, and
+only while k+1 shards that the read did not find damaged hold the
+object. A pool with m=1 therefore never repairs on read. A shard left
+alone is found by the next read of the object, or by a deep scrub.
+
 A gather window fault is not a media error. The shard is healthy and
 the fabric lost its push, so the primary records the fault as
-``-EBADMSG`` and reads around the shard. Both
+``-EBADMSG``, reads around the shard, and does not repair it. Both
 kinds of failure appear in the cluster-log warning ``Error(s) ignored
 for <object> (shard errors ...) enough copies available``: ``-5`` for a
 media error, ``-74`` for a gather fault. With
 ``osd_read_ec_check_for_errors`` on (off by default), the read fails
-with ``-EIO`` instead, whatever the cause.
+with ``-EIO`` instead, whatever the cause, and nothing is repaired.
 
 Reliable Connection clients (hipobj-rc-v2)
 ==========================================
@@ -1500,6 +1516,10 @@ Only the libfabric executor cuts off writes, so these two options apply
 to it alone. The cuObject executor stops waiting ahead of the deadline
 instead. See `Fencing a window before reuse`_.
 
+``osd_ec_repair_on_read``
+  Have the primary repair a shard whose store failed a client read with
+  a media error. The default is true. See `Shard read errors`_.
+
 Operations
 ==========
 
@@ -1580,10 +1600,12 @@ error ``OOB_CUTOFF_PAST_TOLERANCE`` beyond it. ``OOB_CUTOFF_LATE`` is not
 shown while ``OOB_CUTOFF_PAST_TOLERANCE`` is. Only the libfabric
 executor raises these checks.
 
-The OSD performance counter ``ec_direct_read_redirect_eio`` counts
-shard-direct reads that a shard could not read with a media error, and
-bounced to the primary. Each bounce also goes to the cluster log. See
-`Shard read errors`_.
+Two OSD performance counters count erasure-coded reads that hit a media
+error. ``ec_direct_read_redirect_eio`` counts shard-direct reads that a
+shard could not read and bounced to the primary.
+``ec_read_repair`` counts the shards that a primary marked missing to
+repair them after a read decoded around their media error. Each event
+also goes to the cluster log. See `Shard read errors`_.
 
 Accounting
 ----------

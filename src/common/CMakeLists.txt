@@ -220,6 +220,13 @@ if(WITH_BREAKPAD)
   target_link_libraries(common-common-objs PUBLIC
     Breakpad::client)
 endif()
+if(WITH_EC_ISA_PLUGIN)
+  # the ISA-L that src/erasure-code/isa builds is linked into ceph-common
+  # (ceph_common_deps): spdk_crc64_nvme() uses its PCLMUL/VPCLMUL (or
+  # PMULL) crc64_rocksoft_refl() in place of the byte-at-a-time table
+  set_property(SOURCE spdk/crc64.c APPEND PROPERTY
+    COMPILE_DEFINITIONS SPDK_CONFIG_ISAL)
+endif()
 
 set(common_mountcephfs_srcs
   armor.c

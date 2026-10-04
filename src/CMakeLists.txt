@@ -667,6 +667,12 @@ if(WITH_BREAKPAD)
   list(APPEND ceph_common_deps Breakpad::client)
 endif()
 
+if(WITH_EC_ISA_PLUGIN)
+  # ISA-L, built by src/erasure-code/isa, for its CRC-64 (see
+  # src/common/CMakeLists.txt)
+  list(APPEND ceph_common_deps ISAL::ISAL)
+endif()
+
 add_library(common STATIC ${ceph_common_objs})
 target_link_libraries(common
   ${ceph_common_deps}
@@ -714,6 +720,15 @@ if(NOT APPLE AND NOT FREEBSD AND NOT WIN32)
     TARGET ceph-common
     APPEND APPEND_STRING
     PROPERTY LINK_FLAGS "-Wl,-Bsymbolic -Wl,-Bsymbolic-functions")
+endif()
+if(WITH_EC_ISA_PLUGIN AND NOT APPLE AND NOT WIN32)
+  # keep ISA-L out of the dynamic symbol table, where its symbols would
+  # interpose on the ISA-L routines that plugins build in themselves:
+  # libceph-common's, and, through common's link interface, that of
+  # whatever links the static common (ceph-osd, linked with -rdynamic,
+  # would export every ISA-L routine it pulls in)
+  target_link_options(ceph-common PRIVATE "LINKER:--exclude-libs,libisal.a")
+  target_link_options(common INTERFACE "LINKER:--exclude-libs,libisal.a")
 endif()
 
 if(MINGW)

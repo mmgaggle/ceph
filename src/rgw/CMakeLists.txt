@@ -23,11 +23,6 @@ if(WITH_RADOSGW_ARROW_FLIGHT)
   message("-- arrow flight is installed")
 endif(WITH_RADOSGW_ARROW_FLIGHT)
 
-if(CEPH_HAVE_ISAL)
-  message("-- building RGW with ISA-L support")
-  add_definitions(-DSPDK_CONFIG_ISAL)
-endif()
-
 function(gperf_generate input output)
   add_custom_command(
     OUTPUT ${output}

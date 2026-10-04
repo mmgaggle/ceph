@@ -739,6 +739,9 @@ void ECBackend::handle_sub_read(
   reply->from = get_parent()->whoami_shard();
   reply->tid = op.tid;
 
+  // the push stays last: the primary returns its window clean when the
+  // reply carries no bytes, so nothing may drop read bytes after a push
+  // was attempted, and a failed push leaves buffers_read as it was
   if (!op.push_token.empty()) {
     push_sub_read(op, reply,
 		  received.is_zero() ? ceph_clock_now() : received);
@@ -871,8 +874,19 @@ void ECBackend::handle_sub_read_reply(
   ReadOp &rop = iter->second;
   if (const auto* w = rop.gather.find(from); w) {
     if (op.pushed.empty()) {
-      // the shard replied inline: a push it attempted may still land
-      rop.gather.release(from, false);
+      // the shard replied inline: a push it attempted may still land.
+      // One that read no bytes - every object failed, a media error
+      // say - attempted none (push_sub_read pushes only what it read),
+      // so its window goes back clean. Quarantining it would let one
+      // object a shard cannot read, read over and over, take every
+      // window this OSD can lend.
+      uint64_t read = 0;
+      for (auto &&[hoid, extents] : op.buffers_read) {
+	for (auto &&[offset, bl] : extents) {
+	  read += bl.length();
+	}
+      }
+      rop.gather.release(from, read == 0);
     } else {
       // the shard placed its data in our window: rebuild the buffers the
       // reply would have carried, in the order it placed them, and check

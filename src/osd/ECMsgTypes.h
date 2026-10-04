@@ -124,7 +124,10 @@ struct ECSubRead {
   /// out-of-band delivery token for a gather: push the data read into
   /// the primary's window it names (in to_read order, back to back)
   /// instead of returning it; empty for an ordinary sub-read. Advisory:
-  /// a shard that cannot push returns the data inline.
+  /// a shard that cannot push returns the data inline. A shard writes
+  /// into the window only bytes it also returns, listed in the reply's
+  /// pushed or carried inline in buffers_read: a reply with neither
+  /// wrote nothing, and the primary returns its window clean.
   std::string push_token;
   /**
     * Calculate the cost of the SubOp read operation for mClock scheduler.

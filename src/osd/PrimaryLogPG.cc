@@ -4378,8 +4378,11 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     return;
   }
 
-  if (result == -EAGAIN) {
-    // clean up after the ctx
+  if (result == -EAGAIN || ctx->sent_reply) {
+    // clean up after the ctx. sent_reply: the op was answered while its
+    // ops ran (bounce_ec_direct_read), maybe by a nested read (a
+    // cls_cxx_read in a CALL) whose caller swallowed the -EAGAIN;
+    // whatever the result, don't reply again or deliver its data.
     close_op_ctx(ctx);
     return;
   }
@@ -5996,6 +5999,9 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
         bytes_read = r;
         // Don't update op.extent.length - causes issues with recursive
         // calls from operations like CHECKSUM
+      } else if (r == -EIO) {
+        // this shard cannot be read; the primary can rebuild it
+        result = bounce_ec_direct_read(soid, ctx, r);
       } else if (r == -EAGAIN) {
         result = -EAGAIN;
       } else {
@@ -6115,6 +6121,9 @@ int PrimaryLogPG::do_sparse_read(OpContext *ctx, OSDOp& osd_op) {
     int r = osd->store->fiemap(ch, ghobject_t(soid, ghobject_t::NO_GEN,
   			      info.pgid.shard),
   	       shard_offset, shard_length, m);
+    if (r == -EIO && ctx->op->ec_direct_read()) {
+      return bounce_ec_direct_read(soid, ctx, r);
+    }
     if (r < 0)  {
       return r;
     }
@@ -6122,7 +6131,11 @@ int PrimaryLogPG::do_sparse_read(OpContext *ctx, OSDOp& osd_op) {
     bufferlist data_bl;
     r = pgbackend->objects_readv_sync(soid, m, op.flags, &data_bl);
     if (r == -EIO) {
-      r = rep_repair_primary_object(soid, ctx);
+      // repair on read is for replicated pools; a shard-direct read
+      // goes back to the primary, which rebuilds the data instead
+      r = ctx->op->ec_direct_read() ?
+        bounce_ec_direct_read(soid, ctx, r) :
+        rep_repair_primary_object(soid, ctx);
     }
     if (r < 0) {
       dout(10) << " sparse_read failed r=" << r << " from object " << soid << dendl;
@@ -6133,7 +6146,12 @@ int PrimaryLogPG::do_sparse_read(OpContext *ctx, OSDOp& osd_op) {
     // Maybe at first, there is no much whole objects. With continued use, more
     // and more whole object exist. So from this point, for spare-read add
     // checksum make sense.
-    if ((uint64_t)r == oi.size && oi.is_data_digest()) {
+    // A shard-direct read returns one shard's chunks, which the
+    // whole-object digest does not cover. (ECBackend::objects_readv_sync
+    // returns 0, so today r == oi.size only for an empty object; this
+    // keeps it out should that return the byte count.)
+    if (!ctx->op->ec_direct_read() &&
+        (uint64_t)r == oi.size && oi.is_data_digest()) {
       uint32_t crc = data_bl.crc32c(-1);
       if (oi.data_digest != crc) {
         osd->clog->error() << info.pgid << std::hex
@@ -6164,6 +6182,36 @@ int PrimaryLogPG::do_sparse_read(OpContext *ctx, OSDOp& osd_op) {
   ctx->delta_stats.num_rd_kb += shift_round_up(bytes_read, 10);
   ctx->delta_stats.num_rd++;
   return 0;
+}
+
+/*
+ * A shard-direct read (CEPH_OSD_FLAG_EC_DIRECT_READ) reads this shard
+ * alone, so it has nothing to rebuild from when the shard cannot be
+ * read (a checksum or media error, which the store reports as -EIO).
+ * Instead of failing the client, bounce it like the other direct-read
+ * refusals: the Objecter resends the read to the primary as a plain
+ * read, which the ECBackend read pipeline serves by reading around the
+ * bad shard and decoding. The resend never carries EC_DIRECT_READ, so
+ * it cannot bounce again, even when this shard is the primary's own.
+ * Nothing here repairs the shard; the next deep scrub reports it.
+ *
+ * The op is answered here, once: sent_reply makes execute_ctx close the
+ * ctx without replying, also when the read was nested (a cls_cxx_read
+ * in a CALL) and the -EAGAIN does not make it back up.
+ */
+int PrimaryLogPG::bounce_ec_direct_read(
+  const hobject_t& soid, OpContext *ctx, int r)
+{
+  if (!ctx->sent_reply) {
+    osd->clog->error() << info.pgid << " shard-direct read of " << soid
+                       << " failed: " << cpp_strerror(r)
+                       << ", bounced to primary osd." << get_primary().osd
+                       << " to reconstruct";
+    osd->logger->inc(l_osd_ec_direct_read_redirect_eio);
+    osd->reply_op_error(ctx->op, -EAGAIN);
+    ctx->sent_reply = true;
+  }
+  return -EAGAIN;
 }
 
 int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
@@ -16231,8 +16279,18 @@ bool PrimaryLogPG::_range_available_for_scrub(const hobject_t& begin,
 int PrimaryLogPG::rep_repair_primary_object(const hobject_t& soid, OpContext *ctx)
 {
   OpRequestRef op = ctx->op;
-  // Only supports replicated pools
-  ceph_assert(!pool.info.is_erasure());
+  // Only supports replicated pools. An EC read at the primary takes the
+  // ECBackend read pipeline, which decodes around an unreadable shard,
+  // and the callers bounce a shard-direct read before coming here.
+  // Should an EC read get here anyway, bounce or fail it: don't crash.
+  if (pool.info.is_erasure()) {
+    if (op->ec_direct_read()) {
+      return bounce_ec_direct_read(soid, ctx, -EIO);
+    }
+    derr << __func__ << " " << soid << " cannot repair an EC object here"
+         << dendl;
+    return -EIO;
+  }
 
   if (!is_primary()) {
     // Must be a balanced/localized read that has failed on a replica.

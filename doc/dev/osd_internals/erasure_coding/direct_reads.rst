@@ -108,6 +108,14 @@ will be a single attempt at the read; should this attempt fail, the I/O
 operation will be failed back to the client without further retries at this
 layer.
 
+The exception is a read error on the shard itself (``EIO``: a checksum or
+media error). The shard has nothing to reconstruct the data from, so it
+bounces the read with ``EAGAIN``, as it does for a missing object, and the
+Objecter reissues it to the primary as a normal read, which decodes the data
+from the other shards. Each such bounce is written to the cluster log and
+counted in the ``ec_direct_read_redirect_eio`` OSD perf counter. Nothing
+repairs the shard; the next deep scrub reports it.
+
 Missing objects
 ---------------
 

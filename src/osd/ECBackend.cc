@@ -849,6 +849,23 @@ void ECBackend::handle_sub_read_reply(
   if (iter == read_pipeline.tid_to_read_map.end()) {
     //canceled
     dout(20) << __func__ << ": dropped " << op << dendl;
+    if (auto late = read_pipeline.late_reads.find(op.tid);
+	late != read_pipeline.late_reads.end()) {
+      // a fast read that completed without this shard: a media error it
+      // reports still marks a damaged copy of an object the read decoded
+      for (auto &&[hoid, err] : op.errors) {
+	if (err == -EIO && late->second.decoded.contains(hoid)) {
+	  dout(10) << __func__ << ": late reply from shard " << from
+		   << " failed to read " << hoid << " with a media error"
+		   << dendl;
+	  read_pipeline.get_parent()->ec_repair_on_read(hoid, {from});
+	}
+      }
+      late->second.pending.erase(from);
+      if (late->second.pending.empty()) {
+	read_pipeline.late_reads.erase(late);
+      }
+    }
     return;
   }
   ReadOp &rop = iter->second;
@@ -883,20 +900,23 @@ void ECBackend::handle_sub_read_reply(
       }
       // a window holding anything but the push may still take writes:
       // it goes back quarantined, and the reads that rebuild what this
-      // shard's push should have brought come back inline
+      // shard's push should have brought come back inline. The fault is
+      // the fabric's, not the shard's media: -EBADMSG, unlike the -EIO
+      // of a failed store read, never has the shard repaired.
       rop.gather.release(from, t.ok());
       if (!t.ok()) {
 	rop.gather.inline_only = true;
 	for (auto &&[hoid, extents] : op.pushed) {
 	  op.buffers_read.erase(hoid);
-	  op.errors[hoid] = -EIO;
+	  op.errors[hoid] = -EBADMSG;
 	}
       }
     }
   } else if (!op.pushed.empty()) {
-    // pushed data with no window of ours to find it in
+    // pushed data with no window of ours to find it in: lost in
+    // transport, like a push that does not match its checksum
     for (auto &&[hoid, extents] : op.pushed) {
-      op.errors[hoid] = -EIO;
+      op.errors[hoid] = -EBADMSG;
     }
   }
   if (cct->_conf->bluestore_debug_inject_read_err) {
@@ -1108,19 +1128,35 @@ void ECBackend::handle_sub_read_reply(
 
       if (!err) {
         ceph_assert(rop.complete.at(oid).r == 0);
-        if (!rop.complete.at(oid).errors.empty()) {
+        auto &res = rop.complete.at(oid);
+        if (!res.errors.empty()) {
           if (cct->_conf->osd_read_ec_check_for_errors) {
             rop.debug_log.emplace_back(ECUtil::COMPLETE_ERROR, op.from);
             dout(10) << __func__ << ": Not ignoring errors, use one shard" << dendl;
-            err = rop.complete.at(oid).errors.begin()->second;
-            rop.complete.at(oid).r = err;
+            err = res.errors.begin()->second;
+            if (err == -EBADMSG) {
+              // a gather window fault reaches the reader as the -EIO it
+              // always was
+              err = -EIO;
+            }
+            res.r = err;
           } else {
-            get_parent()->clog_warn() << "Error(s) ignored for "
-              << iter->first << " enough copies available";
-            dout(10) << __func__ << " Error(s) ignored for " << iter->first
+            get_parent()->clog_warn() << "Error(s) ignored for " << oid
+              << " (shard errors " << res.errors << ")"
+              << " enough copies available";
+            dout(10) << __func__ << " Error(s) ignored for " << oid
+		     << " (shard errors " << res.errors << ")"
 		     << " enough copies available" << dendl;
             rop.debug_log.emplace_back(ECUtil::ERROR_CLEAR, op.from);
-            rop.complete.at(oid).errors.clear();
+            // a shard whose own store failed the read with -EIO holds a
+            // damaged copy: the decode does without it, and a client
+            // read then has the PG repair it (ClientReadCompleter)
+            for (auto &&[shard, shard_err] : res.errors) {
+              if (shard_err == -EIO) {
+                res.media_errors.insert(shard);
+              }
+            }
+            res.errors.clear();
           }
         }
         // avoid re-read for completed object as we may send remaining reads for

@@ -36,6 +36,9 @@
  *   BasicOSDMapUpdate – write, update OSDMap epoch, verify read still works.
  *   PrimaryFailover   – write, fail OSD 0, verify new primary and degraded
  *                       read with EC reconstruction.
+ *   MediaError*, OtherReadErrors*, FastReadLateMediaError*
+ *                     – a read decoded around a shard's -EIO names that
+ *                       shard to the PG for repair (optimized EC only).
  */
 
 #include <gtest/gtest.h>
@@ -43,6 +46,7 @@
 #include "test/osd/TestCommon.h"
 #include "crush/CrushWrapper.h"
 #include "messages/MOSDECSubOpWrite.h"
+#include "messages/MOSDECSubOpReadReply.h"
 
 using namespace std;
 
@@ -922,6 +926,189 @@ TEST_P(TestECFailover, PrimaryFailover) {
   EXPECT_TRUE(new_primary_listener != nullptr) << "Primary listener should exist after failover";
   EXPECT_GT(new_primary_listener->osdmap->get_epoch(), 1)
     << "OSDMap epoch should have incremented after failover";
+}
+
+// ---------------------------------------------------------------------------
+// TestECFailover: repair on read
+// ---------------------------------------------------------------------------
+
+/**
+ * A read that decodes around a shard whose store failed with a media error
+ * (-EIO) still returns the object, and names that shard, and only that
+ * shard, to the PG for repair.
+ */
+TEST_P(TestECFailover, MediaErrorIsReportedForRepair) {
+  if (!get_pool().has_flag(pg_pool_t::FLAG_EC_OPTIMIZATIONS)) {
+    GTEST_SKIP() << "repair on read is optimized EC only";
+  }
+  const std::string obj_name = "test_media_error_repair";
+  const std::string test_data(get_stripe_width(), 'M');
+  auto* primary = get_primary_listener();
+  create_and_write_verify(obj_name, test_data);
+  primary->ec_read_repairs.clear();
+
+  // shard 1 holds data a full stripe read needs
+  const int bad = 1;
+  const hobject_t hoid = make_test_object(obj_name);
+  store->inject_read_error(
+    ghobject_t(hoid, ghobject_t::NO_GEN, shard_id_t(bad)), -EIO);
+
+  verify_object(obj_name, test_data, 0, test_data.size());
+
+  ASSERT_EQ(1u, primary->ec_read_repairs.size());
+  EXPECT_EQ(hoid, primary->ec_read_repairs[0].first);
+  EXPECT_EQ(std::set<pg_shard_t>{pg_shard_t(bad, shard_id_t(bad))},
+	    primary->ec_read_repairs[0].second);
+
+  // the injection was one-shot: a clean read names nothing
+  verify_object(obj_name, test_data, 0, test_data.size());
+  EXPECT_EQ(1u, primary->ec_read_repairs.size());
+}
+
+/**
+ * The primary's own shard is read like any other, and a media error on it
+ * is reported the same way.
+ */
+TEST_P(TestECFailover, MediaErrorOnThePrimaryShardIsReported) {
+  if (!get_pool().has_flag(pg_pool_t::FLAG_EC_OPTIMIZATIONS)) {
+    GTEST_SKIP() << "repair on read is optimized EC only";
+  }
+  const std::string obj_name = "test_media_error_primary";
+  const std::string test_data(get_stripe_width(), 'P');
+  auto* primary = get_primary_listener();
+  create_and_write_verify(obj_name, test_data);
+  primary->ec_read_repairs.clear();
+
+  const pg_shard_t me = primary->pg_whoami;
+  const hobject_t hoid = make_test_object(obj_name);
+  store->inject_read_error(
+    ghobject_t(hoid, ghobject_t::NO_GEN, me.shard), -EIO);
+
+  verify_object(obj_name, test_data, 0, test_data.size());
+
+  ASSERT_EQ(1u, primary->ec_read_repairs.size());
+  EXPECT_EQ(hoid, primary->ec_read_repairs[0].first);
+  EXPECT_EQ(std::set<pg_shard_t>{me}, primary->ec_read_repairs[0].second);
+}
+
+/**
+ * An error that is not a media error (here a shard that has no copy of
+ * the object) is decoded around but not reported for repair.
+ */
+TEST_P(TestECFailover, OtherReadErrorsAreNotReportedForRepair) {
+  if (!get_pool().has_flag(pg_pool_t::FLAG_EC_OPTIMIZATIONS)) {
+    GTEST_SKIP() << "repair on read is optimized EC only";
+  }
+  const std::string obj_name = "test_enoent_no_repair";
+  const std::string test_data(get_stripe_width(), 'N');
+  auto* primary = get_primary_listener();
+  create_and_write_verify(obj_name, test_data);
+  primary->ec_read_repairs.clear();
+
+  const hobject_t hoid = make_test_object(obj_name);
+  store->inject_read_error(
+    ghobject_t(hoid, ghobject_t::NO_GEN, shard_id_t(1)), -ENOENT);
+
+  verify_object(obj_name, test_data, 0, test_data.size());
+
+  EXPECT_TRUE(primary->ec_read_repairs.empty());
+}
+
+/**
+ * A shard whose data is lost on its way to the primary (here a reply that
+ * says the data was pushed into a gather window the primary never lent)
+ * is read around like a failed shard. Its media is healthy, so nothing is
+ * reported for repair.
+ */
+TEST_P(TestECFailover, TransportFaultIsNotReportedForRepair) {
+  if (!get_pool().has_flag(pg_pool_t::FLAG_EC_OPTIMIZATIONS)) {
+    GTEST_SKIP() << "repair on read is optimized EC only";
+  }
+  const std::string obj_name = "test_transport_fault_no_repair";
+  const std::string test_data(get_stripe_width(), 'T');
+  auto* primary = get_primary_listener();
+  create_and_write_verify(obj_name, test_data);
+  primary->ec_read_repairs.clear();
+
+  // shard 1 holds data a full stripe read needs: its reply carries the
+  // extents of a push instead of the data
+  const int bad = 1;
+  const hobject_t hoid = make_test_object(obj_name);
+  int tampered = 0;
+  messenger->on_send = [hoid, bad, &tampered](int, int, Message *msg) {
+    if (msg->get_type() != MSG_OSD_EC_READ_REPLY) {
+      return;
+    }
+    auto *reply = static_cast<MOSDECSubOpReadReply*>(msg);
+    if (reply->op.from.shard != shard_id_t(bad)) {
+      return;
+    }
+    auto i = reply->op.buffers_read.find(hoid);
+    if (i == reply->op.buffers_read.end()) {
+      return;
+    }
+    auto &pushed = reply->op.pushed[hoid];
+    for (auto &&[offset, bl] : i->second) {
+      pushed.emplace_back(offset, bl.length());
+    }
+    reply->op.buffers_read.erase(i);
+    ++tampered;
+  };
+
+  verify_object(obj_name, test_data, 0, test_data.size());
+  messenger->on_send = nullptr;
+
+  EXPECT_EQ(1, tampered);
+  EXPECT_TRUE(primary->ec_read_repairs.empty());
+}
+
+/**
+ * A fast read reads every shard and completes as soon as enough of them
+ * have replied, so a media error on the last parity shard typically
+ * arrives after the read is done. It is reported all the same, once.
+ */
+TEST_P(TestECFailover, FastReadLateMediaErrorIsReported) {
+  if (!get_pool().has_flag(pg_pool_t::FLAG_EC_OPTIMIZATIONS)) {
+    GTEST_SKIP() << "repair on read is optimized EC only";
+  }
+  const std::string obj_name = "test_fast_read_late_eio";
+  const std::string test_data(get_stripe_width(), 'F');
+  auto* primary = get_primary_listener();
+  create_and_write_verify(obj_name, test_data);
+  primary->ec_read_repairs.clear();
+
+  const int bad = k + m - 1;
+  const hobject_t hoid = make_test_object(obj_name);
+  store->inject_read_error(
+    ghobject_t(hoid, ghobject_t::NO_GEN, shard_id_t(bad)), -EIO);
+
+  bufferlist out;
+  bool completed = false;
+  int result = -1;
+  std::list<std::pair<ec_align_t, std::pair<bufferlist*, Context*>>> to_read;
+  to_read.push_back(std::make_pair(
+    ec_align_t(0, test_data.size(), 0),
+    std::make_pair(&out, (Context*)new LambdaContext(
+      [&completed, &result](int r) {
+	completed = true;
+	result = r;
+      }))));
+  auto* ec_switch = dynamic_cast<ECSwitch*>(get_primary_backend());
+  ASSERT_TRUE(ec_switch != nullptr);
+  ec_switch->objects_read_async(
+    hoid, test_data.size(), to_read, new LambdaContext([](int) {}),
+    true /* fast_read */);
+  event_loop->run_until_idle();
+
+  ASSERT_TRUE(completed);
+  EXPECT_GE(result, 0);
+  ASSERT_EQ(test_data.size(), out.length());
+  EXPECT_EQ(test_data, out.to_str());
+
+  ASSERT_EQ(1u, primary->ec_read_repairs.size());
+  EXPECT_EQ(hoid, primary->ec_read_repairs[0].first);
+  EXPECT_EQ(std::set<pg_shard_t>{pg_shard_t(bad, shard_id_t(bad))},
+	    primary->ec_read_repairs[0].second);
 }
 
 // ---------------------------------------------------------------------------

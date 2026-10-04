@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <string>
@@ -110,6 +112,11 @@ public:
   virtual void window_sync() {}
 
   /// a shard's push into one of our windows did not match the shard's
-  /// checksum of it: the read went to the other shards instead
-  virtual void note_gather_crc_mismatch() {}
+  /// checksum of it: the read went to the other shards instead. Counted
+  /// here, whichever transport lent the window.
+  void note_gather_crc_mismatch() { gather_crc_mismatch++; }
+  uint64_t get_gather_crc_mismatch() const { return gather_crc_mismatch; }
+
+private:
+  std::atomic<uint64_t> gather_crc_mismatch{0};
 };

@@ -520,4 +520,5 @@ void OSDCuObj::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("bytes_pushed", m_bytes_pushed.load());
   f->dump_unsigned("writes_inflight", m_writes_inflight.load());
   f->dump_unsigned("buffers_leaked", m_buffers_leaked.load());
+  f->dump_unsigned("gather_crc_mismatch", get_gather_crc_mismatch());
 }

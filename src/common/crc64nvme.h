@@ -16,7 +16,13 @@ namespace ceph {
  * Values are the canonical checksum (seed 0 yields the standard
  * result, e.g. "123456789" -> 0xae8b14860a799888); callers that need
  * the AWS/at-rest byte order (rgw's stored digests) byteswap at that
- * boundary. Incremental use: pass the previous return value as crc.
+ * boundary. Incremental use: pass the previous return value as crc;
+ * empty input returns crc unchanged.
+ *
+ * Computed with ISA-L's carry-less multiply kernels when ceph-common is
+ * built with ISA-L and the CPU has PCLMUL and SSE4.1 (x86-64) or PMULL
+ * (aarch64), else with madler's slicing-by-8 tables; the values are the
+ * same.
  */
 uint64_t crc64nvme(uint64_t crc, const void* data, size_t len);
 uint64_t crc64nvme(const ceph::buffer::list& bl);

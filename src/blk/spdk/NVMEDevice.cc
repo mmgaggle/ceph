@@ -747,6 +747,8 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
       dout(20) << __func__ << " write/zero op successfully, left "
                << queue->queue_op_seq - queue->completed_op_seq << dendl;
     }
+    // release_segs touches the ioc, so it goes before the callback
+    task->release_segs(queue);
     // check waiting count before doing callback (which may
     // destroy this ioc).
     if (ctx->priv) {
@@ -756,7 +758,6 @@ void io_complete(void *t, const struct spdk_nvme_cpl *completion)
     } else {
       ctx->try_aio_wake();
     }
-    task->release_segs(queue);
     delete task;
   } else if (task->command == IOCommand::READ_COMMAND) {
     // on error the bounce buffers may hold another I/O's data; don't

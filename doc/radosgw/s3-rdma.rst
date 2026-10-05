@@ -154,7 +154,8 @@ no descriptor. An OSD replies inline in these cases:
 With an inline reply, the OSD also says whether it started a transfer
 for the operation at all. When it did not, as in the cases above, or
 when its executor sent nothing (no staging buffer, a budget already
-spent, no address for the client yet), the result is marked declined:
+spent, no address for the client yet, an endpoint busy adding a
+client), the result is marked declined:
 nothing of the operation reached the window. When the OSD delivered the
 data over a transport whose writes are delivery-complete, the result is
 marked landed: every byte was in the window before the reply. The RADOS
@@ -523,15 +524,17 @@ operation that used a window ends, in place where the provider can. An
 OSD's libfabric gather windows get a new key when the gather releases
 them (``osd_oob_rekey_windows``), and so do the gateway's libfabric
 relay windows when a session ends (``rgw_rdma_rekey_windows``), also
-when a gather or a relay failed. Windows behind a cuObject DC target
-keep their key. A window whose gather or relay may still have a write
-in flight stays out of use for its quarantine all the same, and for
-10 s at least: its old key keeps a late write out only if the provider
-drops what carries it. A window whose re-key fails also stays out of
-use for 10 s. When a window is registered again instead, the key that
-leaves service is not used for another window for 10 s, and an endpoint
-asks a provider with a fixed table of regions, such as UET's, for a
-table of 16384 regions.
+when a gather or a relay failed. A gather window returned while a
+``FI_THREAD_DOMAIN`` provider adds a client gets its new key from a
+later gather instead, and is not lent before (see `libfabric`_).
+Windows behind a cuObject DC target keep their key. A window whose
+gather or relay may still have a write in flight stays out of use for
+its quarantine all the same, and for 10 s at least: its old key keeps
+a late write out only if the provider drops what carries it. A window
+whose re-key fails also stays out of use for 10 s. When a window is
+registered again instead, the key that leaves service is not used for
+another window for 10 s, and an endpoint asks a provider with a fixed
+table of regions, such as UET's, for a table of 16384 regions.
 
 Erasure-coded pools
 ===================
@@ -890,21 +893,41 @@ logs a warning at startup.
 
 The first write to a peer adds the peer to the provider's address
 vector. Some providers take long to do that. A thread of the executor
-adds the peer, and the writes to that peer wait for it, each only until
-its deadline. A write that gives up has sent nothing, and its read is
-delivered inline. The insert goes on, so a later read finds the peer
-ready. The executor asks the provider for a thread-safe domain. With
-one, writes to other peers go on during the insert. A provider that
-offers only ``FI_THREAD_DOMAIN`` allows no other call meanwhile. Then
-the insert first waits until the writes in flight are done, so that
-none of them misses its cut-off, and writes that start meanwhile wait
-for it, again only until their deadlines. The OSD logs at startup which
-case applies: ``concurrent peer inserts`` or ``peer inserts pause
-writes``. In the second case the executor's other work waits for the
-insert too: a gather window's token, the progress thread that places
-data in gather windows, and the gather's read of a window. Gathers then
-wait for the insert, and a shard's push whose budget runs out meanwhile
-is delivered inline.
+adds the peer. A write that gives up waiting for it has sent nothing,
+and its read is delivered inline. The insert goes on, so a later read
+finds the peer ready. The executor asks the provider for a thread-safe
+domain. With one, the writes to a new peer wait for its insert, each
+only until its deadline, and writes to other peers go on meanwhile.
+The OSD logs at startup which case applies: ``concurrent peer
+inserts`` or ``peer inserts pause writes``.
+
+A provider that offers only ``FI_THREAD_DOMAIN`` allows no other call
+during an insert, and adds one peer at a time. The insert first waits
+until the writes in flight are done, so that none of them misses its
+cut-off, and then holds the endpoint until the provider returns. The
+endpoint is quiet from when the insert starts to wait until it is
+done. An op thread waits for a quiet endpoint at most 10 ms, also when
+the insert is for its own read's client, and not at all once the
+endpoint has been quiet for 10 ms. It then goes on without the
+endpoint, so that the operations queued behind it do not wait too:
+
+* A read for any client, a new client's first read included, is
+  delivered inline, and declined. A push this OSD makes as a shard of
+  an erasure-coded read is delivered inline. ``insert_busy`` counts
+  both.
+* A gather lends no window, and its shards reply inline.
+  ``windows_declined_insert`` counts the windows not lent.
+* A gather window returned meanwhile gets its new key from a later
+  gather, and is not lent before. ``windows_rekeys_put_off`` counts
+  it.
+
+A quiet spell shorter than 10 ms, as when ``tcp`` adds a peer while no
+write is in flight, refuses nothing. Inserts queued back to back quiet
+the endpoint one after another. The progress thread that places data
+in gather windows waits for the insert, so a shard pushing into a
+window lent before it waits too, within its budget, holding its op
+thread: a push that runs out of budget is cut off, and the shard
+replies inline.
 
 Clients choose their endpoint names, so the executor bounds what they
 can make it do. At most 64 first contacts are queued or running at
@@ -991,8 +1014,9 @@ discard. See `Fencing a window before reuse`_.
 
 A wrapper that offers ``FI_THREAD_SAFE`` lets the OSD add a new client
 while its writes to other clients go on. One that offers only
-``FI_THREAD_DOMAIN`` pauses the OSD's writes for each new client. See
-`libfabric`_.
+``FI_THREAD_DOMAIN`` pauses the OSD's writes for each new client, and
+reads, the new client's first among them, are delivered inline
+meanwhile. See `libfabric`_.
 
 The reference provider has these limits:
 
@@ -1291,8 +1315,20 @@ last error (``last_error``). It also shows:
   because too little of their budget was left.
 * ``peer_timeouts``: reads that gave up, with nothing sent, while a new
   peer was added to the address vector or while they waited for the
-  endpoint. ``peers``, ``pending_inserts`` and ``inserts_refused``. See
-  `libfabric`_.
+  endpoint; with a ``FI_THREAD_DOMAIN`` provider, ``insert_busy``
+  counts those that gave up on an insert. ``peers``,
+  ``pending_inserts`` and ``inserts_refused``. See `libfabric`_.
+* ``insert_busy``: calls of op threads that gave up on an insert of a
+  ``FI_THREAD_DOMAIN`` provider, having waited for it at most 10 ms:
+  writes refused with nothing sent, to a known client or to a new one
+  not yet added (the read delivered inline and declined, or the
+  shard's push delivered inline), gathers' reads of a window ordered
+  without the endpoint, and, rarely, a gather window's token or new
+  key asked for just as an insert began.
+  ``windows_declined_insert``: gather windows not lent meanwhile, one
+  for each shard a gather would have lent one to.
+  ``windows_rekeys_put_off``: windows returned meanwhile, re-keyed by a
+  later gather. See `libfabric`_.
 * ``windows_rekeyed``, ``windows_rekeyed_quarantined`` (re-keyed after a
   gather that did not finish cleanly, and quarantined all the same),
   ``windows_rekey_failed`` and ``key_collisions``;
@@ -1328,9 +1364,11 @@ Testing
 
 * ``unittest_ofi_rma`` tests the libfabric token format, writes over
   the ``tcp`` and ``shm`` providers, slow and refused first contacts,
-  eviction, cut-offs that fail or end late, within and beyond the
-  tolerance, writers left idle near their deadlines, late writes
-  cancelled alone
+  that slow first contacts on a ``FI_THREAD_DOMAIN`` endpoint hold no
+  op thread longer than the insert wait, whether it lends, returns or
+  reads a window or writes to a known or a new peer, eviction,
+  cut-offs that fail or end late, within and beyond the tolerance,
+  writers left idle near their deadlines, late writes cancelled alone
   (over ``tcp``, with a test hook that stands in for a provider whose
   cancel discards), the cut-off cost estimate,
   writes that start too late, concurrent writes and their CPU use,

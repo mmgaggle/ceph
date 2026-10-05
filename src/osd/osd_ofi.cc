@@ -243,7 +243,8 @@ void OSDOfi::release_window(uint64_t id, uint64_t quarantine_ms)
   // shard replied inline, or the read was cancelled - keeps it out for
   // the quarantine anyway: the shard's push may still be on the way, and
   // the new key keeps it out only if the provider drops what carries the
-  // old one.
+  // old one. An insert that holds a FI_THREAD_DOMAIN endpoint puts the
+  // re-key off to a later acquire, rather than hold up this op thread.
   windows->release(id, std::chrono::milliseconds(quarantine_ms),
 		   cct->_conf.get_val<bool>("osd_oob_rekey_windows"));
 }
@@ -299,9 +300,12 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("peers", s.peers);
   f->dump_unsigned("pending_inserts", s.pending_inserts);
   f->dump_unsigned("inserts_refused", s.inserts_refused);
+  f->dump_unsigned("insert_busy", s.insert_busy);
   const auto ws = windows ? windows->stats() : ceph::ofi::WindowPool::stats_t{};
   f->dump_unsigned("windows_acquired", ws.acquired);
   f->dump_unsigned("windows_exhausted", ws.exhausted);
+  f->dump_unsigned("windows_declined_insert", ws.declined_insert);
+  f->dump_unsigned("windows_rekeys_put_off", ws.rekeys_put_off);
   f->dump_unsigned("gather_crc_mismatch", get_gather_crc_mismatch());
   f->dump_unsigned("windows_rekeyed", ws.rekeyed);
   f->dump_unsigned("windows_rekeyed_quarantined", ws.rekeyed_quarantined);

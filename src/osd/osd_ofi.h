@@ -63,6 +63,14 @@ public:
 
   bool is_available() const override;
   bool handles(const std::string& token) const override;
+  // A provider that offers only FI_THREAD_DOMAIN stops the endpoint
+  // while it adds a new client's address, for seconds perhaps. The op
+  // threads that call the methods below wait for that only briefly
+  // (ceph::ofi::config_t::insert_wait): a read for any client, the new
+  // one's included, is delivered inline meanwhile, and declined, a
+  // shard's push is delivered inline, a gather lends no window, so that
+  // its shards reply inline, and a returned window gets its new key from
+  // a later gather.
   ssize_t execute_plan(const std::string& key,
 		       const std::string& token,
 		       const ceph::buffer::list& data,

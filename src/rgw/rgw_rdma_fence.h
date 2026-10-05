@@ -38,6 +38,21 @@ bool fence_needed(const Results& results)
   return false;
 }
 
+/**
+ * Whether a write of a GET's descriptor-bearing reads, every one of them
+ * completed, may still land in the window: the fence a response waits
+ * out, or a relay window's quarantine in its place. needed is what
+ * fence_needed() says of the results, resent whether one of them is
+ * RDMA_DELIVERY_RESENT. After a GET that failed, when the fence is
+ * needed. After one that delivered everything, each stripe's OSD placed
+ * its bytes before replying, so only when a read was resent: its earlier
+ * attempt may write after every reply.
+ */
+inline bool write_may_land(bool success, bool needed, bool resent)
+{
+  return success ? resent : needed;
+}
+
 /// what a passthrough GET makes of one stripe read's reply
 enum class stripe_reply {
   failed,  ///< the read failed: the GET fails with its error

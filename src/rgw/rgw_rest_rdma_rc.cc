@@ -541,9 +541,14 @@ void GetOp::execute_ready(optional_yield y)
   if (op_ret == 0 && !status.http && s->obj_size == 0) {
     op_ret = -ERANGE;  // replaced by an empty object since PREPARE
   }
-  if (op_ret == 0 && !status.http) {
+  // whether the reads delivered the range: what the OSDs may still write
+  // into the buffer depends on that, not on the push to the client
+  bool delivered = op_ret == 0 && !status.http;
+  if (delivered) {
     if (int r = push(true); r < 0) {
       op_ret = r;
+      // a buffer short of the range was not delivered after all
+      delivered = push_outcome != Outcome::OK;
     }
   }
   Outcome outcome = Outcome::OK;
@@ -564,15 +569,22 @@ void GetOp::execute_ready(optional_yield y)
       }
     }
   }
+  // an OSD that received a delivery descriptor may still write into
+  // the buffer until its lease and drain run out: after reads that did
+  // not finish cleanly, and after ones that delivered the range when a
+  // read was resent, whose earlier attempt may write after every reply.
+  // The response does not wait for that; keep the buffer out of the pool
+  // that long instead
+  const std::chrono::milliseconds quarantine{rdma_window_hold_ms(delivered)};
+  if (outcome == Outcome::BUSY && quarantine.count() > 0) {
+    // a retried READY would relay through this buffer, so finish() ends
+    // the session instead of rolling the claim back; do not answer 409,
+    // which tells the client to retry READY
+    outcome = Outcome::WIRE_FAIL;
+  }
   if (outcome != Outcome::OK && status.http == 0) {
     status = status_of(outcome);
   }
-  // an OSD that received a delivery descriptor may still write into
-  // the buffer until its lease runs out when the read did not finish
-  // cleanly; keep the buffer out of the pool that long
-  const auto quarantine = outcome == Outcome::OK
-    ? std::chrono::milliseconds{}
-    : std::chrono::milliseconds{rdma_fence_ms};
   svc->finish(sess, outcome, bytes_done, quarantine);
   sess = nullptr;
 }

@@ -322,11 +322,12 @@ void Service::release_buffer(Buffer* b, std::chrono::milliseconds quarantine)
     // A new key, so that no OSD write meant for the last session lands
     // once the buffer serves another: not one a failed relay left in
     // flight, and not a provider's late duplicate of one that completed,
-    // which the delivery lease does not bound. After a clean session the
-    // buffer is free at once. After a failed one it keeps its quarantine
-    // anyway, and the key quarantine at least: writes the relay left in
-    // flight may still be on the way, and the new key keeps them out only
-    // if the provider drops what carries the old one.
+    // which the delivery lease does not bound. After a session that left
+    // no write in flight the buffer is free at once. After one that did
+    // (a quarantine: its reads failed, or one was resent) it keeps its
+    // quarantine anyway, and the key quarantine at least: those writes may
+    // still be on the way, and the new key keeps them out only if the
+    // provider drops what carries the old one.
     const ceph::ofi::Endpoint::window_t w{b->ofi_window,
 					  static_cast<char*>(b->ptr), b->size};
     if (int r = ofi_ep->rekey_window(w); r == 0) {
@@ -431,6 +432,19 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
     s->buf = acquire_buffer(req.size);
     if (!s->buf) {
       limits_release(req.principal);
+      // for the 503: a buffer an OSD write may still land in counts
+      // against the pool until its quarantine passes
+      const auto now = clock::now();
+      size_t in_use = 0, held = 0;
+      for (const auto& b : pool) {
+        if (b.in_use) {
+          in_use++;
+        } else if (now < b.quarantined_until) {
+          held++;
+        }
+      }
+      ldout(cct, 4) << "rgw_rdma_rc: no free buffer: " << in_use
+                    << " in use, " << held << " in quarantine" << dendl;
       return Error::NO_BUFFER;
     }
   }
@@ -602,9 +616,12 @@ void Service::finish(Session* s, Outcome outcome, uint64_t bytes,
   s->bytes = bytes;
   ldout(cct, 20) << "rgw_rdma_rc: session " << s->id << " finished "
                  << to_string(outcome) << " bytes=" << bytes << dendl;
-  if (outcome == Outcome::BUSY && !s->reap_pending) {
+  if (outcome == Outcome::BUSY && !s->reap_pending &&
+      quarantine.count() == 0) {
     // roll the claim back so the client can retry READY on the same
-    // session; the queue pair goes back to INIT through RESET
+    // session; the queue pair goes back to INIT through RESET. Not with a
+    // quarantine: that READY would relay through this buffer while an
+    // OSD write of this data phase may still land in it
     l.unlock();
     bool rearmed = s->conn.rearm(cct, dev) == 0;
     if (rearmed && s->op == Op::PUT) {
@@ -624,9 +641,9 @@ void Service::finish(Session* s, Outcome outcome, uint64_t bytes,
   s->io_refs = 0;
   s->reap_pending = true;
   s->state = State::REAPING;
-  if (s->buf && quarantine.count() > 0) {
-    s->buf->quarantined_until = clock::now() + quarantine;
-  }
+  // the reap hands it to release_buffer(), which re-keys the buffer and
+  // must not mistake it for a clean one
+  s->quarantine = quarantine;
   reap_locked(l, s->id);
 }
 
@@ -676,14 +693,17 @@ void Service::reap_locked(std::unique_lock<std::mutex>& lock,
   s->buf = nullptr;
   limits_release(s->principal);
   ldout(cct, 20) << "rgw_rdma_rc: reaping session " << s->id << " ("
-                 << to_string(s->last_outcome) << ")" << dendl;
+                 << to_string(s->last_outcome) << ", quarantine "
+                 << s->quarantine.count() << "ms)" << dendl;
   // the queue pair must be gone before its buffer can be handed out
   // again: a posted work request may still reference the region
   lock.unlock();
   s->conn.destroy();
   lock.lock();
-  // a quarantine set by finish() stays; otherwise the buffer is free
-  release_buffer(buf, {});
+  // with the quarantine finish() was given. A session reaped without
+  // finish() has none: it never ran a data phase, or went back to
+  // PREPARED after one that left no write in flight.
+  release_buffer(buf, s->quarantine);
 }
 
 void Service::reaper_loop()

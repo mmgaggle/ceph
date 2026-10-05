@@ -94,6 +94,7 @@
 #include "rgw_cuobj.h"
 #endif
 #include "common/rdma_token.h"
+#include "rgw_rdma_fence.h"
 
 #ifdef WITH_LTTNG
 #define TRACEPOINT_DEFINE
@@ -2700,7 +2701,8 @@ void RGWGetObj::rdma_fence_before(const char* what, bool response,
   }
   if (response && !f.client_window) {
     // the reads wrote a gateway relay window, which goes back to its pool
-    // quarantined for rdma_fence_ms instead of holding up the answer
+    // quarantined for rdma_window_hold_ms() instead of holding up the
+    // answer
     return;
   }
   f.settled = true;
@@ -2714,7 +2716,7 @@ void RGWGetObj::rdma_fence_before(const char* what, bool response,
   // declined or landed, and none was resent. After a GET that delivered
   // everything, each stripe's OSD placed its bytes before replying, and
   // only an earlier attempt of a resent read can still write the window.
-  const bool needed = success ? f.resent : f.needed;
+  const bool needed = rgw::rdma::write_may_land(success, f.needed, f.resent);
   if (!needed) {
     ldpp_dout(this, 4) << "rdma fence: not needed before " << what << ", "
                        << (success ? "every stripe was placed and none "
@@ -2738,6 +2740,18 @@ void RGWGetObj::rdma_fence_before(const char* what, bool response,
   } else {
     std::this_thread::sleep_for(std::chrono::milliseconds(f.wait_ms));
   }
+}
+
+uint64_t RGWGetObj::rdma_window_hold_ms(bool success) const
+{
+  // the fence rdma_fence_before() left to the window's pool, by the same
+  // rule: none when it was waited out already, before a fallback
+  const auto& f = rdma_fence_state;
+  if (!f.sent || f.settled ||
+      !rgw::rdma::write_may_land(success, f.needed, f.resent)) {
+    return 0;
+  }
+  return f.wait_ms;
 }
 
 void RGWGetObj::select_rdma_mode(bool plain_chain)
@@ -3112,10 +3126,6 @@ void RGWGetObj::execute(optional_yield y)
                     read_op->params.rdma_fence_needed,
                     read_op->params.rdma_resent, read_op->params.rdma_fence);
     rdma_failed_at = op_ret < 0 ? "the fallback read" : nullptr;
-  }
-  if (read_op->params.rdma_submitted && read_op->params.rdma_fence_needed) {
-    rdma_fence_ms = static_cast<uint64_t>(
-        std::ceil(read_op->params.rdma_fence * 1000.0));
   }
 
   if (op_ret >= 0) {

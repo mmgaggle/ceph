@@ -509,14 +509,14 @@ OSD's libfabric gather windows get a new key when the gather releases
 them (``osd_oob_rekey_windows``), and so do the gateway's libfabric
 relay windows when a session ends (``rgw_rdma_rekey_windows``), also
 when a gather or a relay failed. Windows behind a cuObject DC target
-keep their key. A window whose gather or relay did not finish cleanly
-stays out of use for its quarantine all the same, and for 10 s at
-least: its old key keeps a late write out only if the provider drops
-what carries it. A window whose re-key fails also stays out of use for
-10 s. When a window is registered again instead, the key that leaves
-service is not used for another window for 10 s, and an endpoint asks a
-provider with a fixed table of regions, such as UET's, for a table of
-16384 regions.
+keep their key. A window whose gather or relay may still have a write
+in flight stays out of use for its quarantine all the same, and for
+10 s at least: its old key keeps a late write out only if the provider
+drops what carries it. A window whose re-key fails also stays out of
+use for 10 s. When a window is registered again instead, the key that
+leaves service is not used for another window for 10 s, and an endpoint
+asks a provider with a fixed table of regions, such as UET's, for a
+table of 16384 regions.
 
 Erasure-coded pools
 ===================
@@ -730,16 +730,25 @@ client that all earlier writes are in its memory.
 A relay can fail after the OSDs received delivery descriptors. An OSD
 can then still take on a write into the session buffer until the pool's
 ``rdma_delivery_lease`` expires. That write can land until the pool's
-``rdma_delivery_drain`` runs out after the lease. The gateway keeps the
-buffer out of use for the lease plus the drain, unless every stripe
-came back declined or landed and none was resent. When a stripe comes
+``rdma_delivery_drain`` runs out after the lease. When the reads fail,
+the gateway keeps the buffer out of use for the lease plus the drain,
+unless every stripe came back declined or landed and none was resent.
+Over cuObject, and over a libfabric provider without delivery-complete
+writes, no stripe comes back landed, so such a relay is held unless
+every stripe was declined. When the reads deliver the whole object,
+every OSD placed its stripe before it replied, and the gateway holds
+the buffer only when a stripe read was resent, because the read's
+earlier attempt can write after every reply. That is so even when the
+writes to the client fail afterwards. A session whose buffer is held
+this way ends, even when the client's queue pair was only not ready,
+which otherwise lets the client send READY again. When a stripe comes
 back inline, the gateway waits for the same fence before staged relay
 copies the object into the buffer. With ``rgw_rdma_rekey_windows``, the
 gateway also gives the buffer's libfabric window a new key when the
 session ends, after which no OSD write meant for that session can land
-where the provider drops writes with a retired key. After a clean
-session the buffer is free at once; after a failed one it keeps the
-quarantine, and for 10 s at least. See `Reusing a window`_.
+where the provider drops writes with a retired key. After a session
+that left no write in flight the buffer is free at once; otherwise it
+keeps the quarantine, and for 10 s at least. See `Reusing a window`_.
 
 PUT
 ---
@@ -1120,8 +1129,12 @@ RC clients:
   device, port and GID.
 * ``rgw_rdma_rc_buffer_size`` and ``rgw_rdma_rc_buffer_count``: the
   session buffers, 16 buffers of 64 MiB by default. Each session holds
-  one buffer from PREPARE until the session ends. A transfer larger
-  than one buffer is refused with ``413``.
+  one buffer from PREPARE until the session ends. A buffer that an OSD
+  write can still land in stays out of use after that, for the pool's
+  lease plus drain and, when it is re-keyed, for 10 s at least. See
+  `GET relay`_. Such a buffer no longer counts against its user's
+  session limit, but no PREPARE can take it until then. A transfer
+  larger than one buffer is refused with ``413``.
 * ``rgw_rdma_rc_max_sessions`` and ``rgw_rdma_rc_max_sessions_per_user``:
   the session limits, 1024 and 64 by default. A PREPARE over a limit,
   or one that finds no free buffer, gets ``503 SlowDown``.

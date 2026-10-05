@@ -490,10 +490,6 @@ protected:
   /// delivery, so RELAY_STAGED)
   std::string relay_token;
   size_t relay_window = 0;
-  /// after execute(): how long an OSD may still write into the window
-  /// (the pool's delivery lease plus its drain) when the final read
-  /// sent delivery descriptors; 0 otherwise
-  uint64_t rdma_fence_ms = 0;
   /// The fence a GET owes once descriptor-bearing reads reached OSDs: a
   /// write of theirs that no reply accounts for may still land in the
   /// window until the pools' lease and drain run out, so the window is
@@ -513,6 +509,12 @@ protected:
   /// wait the fence owed, once, before what: a fallback rewriting the
   /// window, or a response (success or not)
   void rdma_fence_before(const char* what, bool response, bool success);
+  /// after execute(): how long a relay window must stay out of use for
+  /// the fence the response did not wait out (the pools' lease plus
+  /// drain), given whether the reads delivered the whole range, whatever
+  /// became of the relay to the client after that; 0 when no write of
+  /// the reads can land any more (see rgw::rdma::write_may_land())
+  uint64_t rdma_window_hold_ms(bool success) const;
   /// where a GET that sent descriptor-bearing reads failed, for the log
   const char* rdma_failed_at = nullptr;
   /// true for the modes where the OSDs deliver out of band

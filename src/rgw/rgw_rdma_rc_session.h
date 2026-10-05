@@ -63,8 +63,9 @@ struct Buffer {
   uint64_t ofi_window = 0;
   bool ofi_registered = false;
   bool in_use = false;
-  /// an OSD may still push into a window a failed relay abandoned;
-  /// the window stays out of the pool until this passes
+  /// an OSD may still push into a window after its relay ended (see
+  /// Service::finish()); the window stays out of the pool until this
+  /// passes
   clock::time_point quarantined_until = clock::time_point::min();
 };
 
@@ -81,6 +82,8 @@ enum class State : uint8_t {
 enum class Outcome : uint8_t {
   OK,
   BUSY,         ///< peer not ready; session returns to PREPARED (409)
+                ///< unless an OSD write of the data phase may still
+                ///< land in its buffer
   TIMEOUT,
   VERIFY_FAIL,  ///< completion did not match the session
   WIRE_FAIL,
@@ -113,6 +116,9 @@ struct Session {
   bool reap_pending = false;
   Outcome last_outcome = Outcome::OK;
   uint64_t bytes = 0;          ///< transferred, for the terminal log
+  /// how long an OSD write of the data phase may still land in buf, as
+  /// finish() was told; the reap releases the buffer with it
+  std::chrono::milliseconds quarantine{};
 };
 
 /// service-level errors; the REST layer maps them to HTTP statuses
@@ -203,7 +209,10 @@ class Service {
   /// down once the handler is done with it; BUSY re-arms the queue pair
   /// and returns to PREPARED for another READY; anything else reaps.
   /// quarantine keeps the buffer out of the pool for that long after
-  /// teardown (a relay that may still have OSD writes in flight).
+  /// teardown (a relay that may still have OSD writes in flight), and
+  /// the libfabric key quarantine at least when the buffer is re-keyed.
+  /// A BUSY with a quarantine reaps too: another READY would relay
+  /// through the same buffer while those writes may still land in it.
   void finish(Session* s, Outcome outcome, uint64_t bytes,
               std::chrono::milliseconds quarantine = {});
 

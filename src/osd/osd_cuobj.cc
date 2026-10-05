@@ -378,6 +378,22 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   if (items.empty()) {
     return 0;
   }
+  // cuObject cannot cancel a write it posted: one still in flight when
+  // the OSD stops waiting keeps retrying for the DC transport's retry
+  // budget. Stop waiting that much before the caller's budget runs out,
+  // and do not start at all when the budget does not cover it - decided
+  // before anything is staged, so that a plan refused here holds no
+  // buffer and is not counted as started.
+  if (budget <= CUOBJ_RETRY_BUDGET) {
+    dout(10) << "budget of " << budget.count() << " ms for " << key
+	     << " does not cover the DC retry budget; nothing staged" << dendl;
+    m_budget_refused++;
+    return -ETIMEDOUT;
+  }
+  // counted from here, not from after staging: taking a channel, copying
+  // the data and registering a one-time buffer come out of the budget too
+  utime_t deadline = ceph_clock_now();
+  deadline += std::chrono::duration<double>(budget - CUOBJ_RETRY_BUDGET).count();
   uint16_t channel = get_channel_id();
   if (channel == invalid_channel) {
     return -EIO;
@@ -402,21 +418,19 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   // to completion on the same channel (the library caps poll() at 16
   // events and documents no larger per-channel bound)
   constexpr int POLL_BATCH = 16;
-  // cuObject cannot cancel a write it posted: one still in flight when
-  // the OSD stops waiting keeps retrying for the DC transport's retry
-  // budget. Stop waiting that much before the caller's budget runs out,
-  // and do not start at all when the budget does not cover it.
-  if (budget <= CUOBJ_RETRY_BUDGET) {
-    return -ETIMEDOUT;
-  }
-  utime_t deadline = ceph_clock_now();
-  deadline += std::chrono::duration<double>(budget - CUOBJ_RETRY_BUDGET).count();
   size_t next = 0;
   size_t outstanding = 0;
   size_t completed = 0;
   ssize_t err = 0;
   while (completed < items.size()) {
     while (err == 0 && next < items.size() && outstanding < POLL_BATCH) {
+      // a write posted past the deadline could retry past the budget
+      if (ceph_clock_now() > deadline) {
+	dout(5) << "plan for " << key << " reached its deadline with "
+		<< items.size() - next << " writes not posted" << dendl;
+	err = -ETIMEDOUT;
+	break;
+      }
       auto& w = items[next];
       // a submission that fails may still have sent part of its write
       if (started) {
@@ -436,7 +450,7 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       m_writes_inflight++;
     }
     if (outstanding == 0) {
-      break;  // submission failed before anything went out
+      break;  // nothing in flight, and an error or the deadline stops posts
     }
     cuObjAsyncEvent_t events[POLL_BATCH];
     for (auto& e : events) {
@@ -489,9 +503,11 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
 	err = err ? err : -EIO;
       }
     }
-    if (ceph_clock_now() > deadline) {
+    if (outstanding > 0 && ceph_clock_now() > deadline) {
       // wedged transport: we cannot release the staged buffer while
-      // writes may still reference it - leak it deliberately
+      // writes may still reference it - leak it deliberately. With none
+      // outstanding nothing reads it: the loop completes the plan or,
+      // posting nothing more, fails it, and gives the buffer back.
       derr << "ERROR: plan for " << key << " timed out with " << outstanding
 	   << " writes outstanding; leaking the staging buffer" << dendl;
       m_writes_inflight -= outstanding;
@@ -520,5 +536,6 @@ void OSDCuObj::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("bytes_pushed", m_bytes_pushed.load());
   f->dump_unsigned("writes_inflight", m_writes_inflight.load());
   f->dump_unsigned("buffers_leaked", m_buffers_leaked.load());
+  f->dump_unsigned("budget_refused", m_budget_refused.load());
   f->dump_unsigned("gather_crc_mismatch", get_gather_crc_mismatch());
 }

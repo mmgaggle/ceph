@@ -127,6 +127,7 @@ private:
   std::atomic<uint64_t> m_bytes_pushed{0};
   std::atomic<uint32_t> m_writes_inflight{0};
   std::atomic<uint64_t> m_buffers_leaked{0};
+  std::atomic<uint64_t> m_budget_refused{0};
 
   static thread_local uint16_t tls_channel_id;
   static thread_local bool tls_channel_valid;

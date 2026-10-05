@@ -339,7 +339,9 @@ How an OSD cuts off a write depends on the transport:
 * cuObject cannot cancel a posted write. A posted write keeps retrying
   for the retry budget of the DC transport, about two seconds. So the
   cuObject executor stops waiting that long before the deadline, and
-  does not start a transfer when less than that is left.
+  posts no write after that point. It does not start a transfer when
+  less than that is left; ``cuobj status`` counts those reads in
+  ``budget_refused``.
 * The ``tcp`` provider cannot cut off a write. Closing a socket does not
   discard the bytes that the kernel already queued on it, and the
   kernel delivers them later. The OSD logs a warning at startup. Use
@@ -1227,8 +1229,10 @@ Both report plans started, completed and failed, and bytes written.
 Both also show ``gather_crc_mismatch``: gathered shard data that did not
 match its shard's checksum, whichever executor lent the window. See
 `Gathering shard reads out of band`_. ``cuobj status`` also shows the
-writes in flight, and ``buffers_leaked``, the staging buffers that plans
-which timed out with writes outstanding never gave back. ``ofi status``
+writes in flight, ``buffers_leaked``, the staging buffers that plans
+which timed out with writes outstanding never gave back, and
+``budget_refused``, the reads delivered inline, with nothing staged,
+because less than the DC retry budget was left. ``ofi status``
 shows the windows lent and exhausted, ``staging_busy``, the reads
 delivered inline because no staging buffer was free, the provider and
 how the endpoint cuts off writes (``transport``), and the endpoint's

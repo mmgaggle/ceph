@@ -738,6 +738,8 @@ void PutOp::execute(optional_yield y)
   if (outcome == Outcome::OK) {
     bytes_done = sess->size;
     s->content_length = sess->size;
+    // the body is the session buffer, whatever token READY carries
+    rdma_staging_allowed = false;
     if (s->cct->_conf.get_val<bool>("rgw_rdma_crc64nvme")) {
       final_crc = ceph::crc64nvme(0, sess->buf->ptr, sess->size);
     }

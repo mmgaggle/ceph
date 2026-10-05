@@ -5233,7 +5233,8 @@ void RGWPutObj::execute(optional_yield y)
   std::string rdma_descr;
   bool rdma_put = false;
   auto* cuobj_srv = RGWCuObjServer::get_instance();
-  if (cuobj_srv && cuobj_srv->is_available() && copy_source.empty()) {
+  if (cuobj_srv && cuobj_srv->is_available() && copy_source.empty() &&
+      rdma_staging_allowed) {
     auto rdma_token = s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
     if (rdma_token && ceph::rdma::is_ofi_token(*rdma_token)) {
       // the cuObjServer can only read from cuObject descriptors, and

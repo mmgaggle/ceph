@@ -1411,6 +1411,10 @@ protected:
 
   std::optional<rgw::cksum::Cksum> cksum;
 
+  /// S3-over-RDMA (cuObject): a subclass whose get_data() supplies the
+  /// body (an RC session buffer) clears this before execute(), so that
+  /// no x-amz-rdma-token stages the body from the client's memory
+  bool rdma_staging_allowed = true;
   /// S3-over-RDMA (cuObject): after execute(), whether the body came
   /// from the client's memory (a gateway-staged PUT), which the reply
   /// reports

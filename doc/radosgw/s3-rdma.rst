@@ -1345,7 +1345,12 @@ Limitations
   buffers (``rgw_cuobj_buffer_size``), and a PUT that finds no free
   buffer large enough fails with ``503``. Libfabric clients have no
   gateway-staged mode, so a libfabric GET that cannot use passthrough
-  gets the HTTP body.
+  gets the HTTP body. The gateway reads the body of a PUT with a
+  libfabric token over HTTP, as a gateway that does not run its
+  cuObject server does with any token, and the response has no
+  ``x-amz-rdma-reply`` header. A gateway that runs its cuObject server
+  takes any other token on a PUT for a cuObject descriptor, and a token
+  whose address and size do not parse fails the PUT with ``400``.
 * The gateway does not serve encrypted objects, or objects with a DLO
   or SLO manifest, to RC clients. PREPARE answers ``501`` with the
   unsupported marker, and the client reads the object over HTTP.

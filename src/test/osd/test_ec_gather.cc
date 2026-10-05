@@ -191,3 +191,52 @@ TEST(ECGather, TheReplyCarriesTheChecksum)
   EXPECT_TRUE(old.pushed.empty());
   EXPECT_FALSE(old.pushed_crc);
 }
+
+TEST(ECGather, TheReplySaysWhenNothingWasSent)
+{
+  // a shard whose executor refused the push before sending anything
+  // replies inline and says so, and the primary lends the window again
+  // at once
+  ECSubReadReply r;
+  r.from = pg_shard_t(1, shard_id_t(1));
+  r.tid = 8;
+  const hobject_t hoid(sobject_t("obj", CEPH_NOSNAP));
+  ceph::buffer::list bl;
+  bl.append(std::string(4096, 'i'));
+  r.buffers_read[hoid].emplace_back(0, bl);
+  r.push_declined = true;
+
+  ceph::buffer::list p, d;
+  r.encode(p, d, CEPH_FEATURES_ALL);
+  ECSubReadReply got;
+  auto pit = std::as_const(p).begin();
+  auto dit = std::as_const(d).begin();
+  got.decode(pit, dit);
+  EXPECT_TRUE(got.push_declined);
+  EXPECT_TRUE(got.pushed.empty());
+  EXPECT_FALSE(got.pushed_crc);
+  ASSERT_EQ(1u, got.buffers_read[hoid].size());
+  EXPECT_TRUE(got.buffers_read[hoid].front().second.contents_equal(bl));
+
+  // a shard that may have written says nothing of the kind
+  r.push_declined = false;
+  ceph::buffer::list p2, d2;
+  r.encode(p2, d2, CEPH_FEATURES_ALL);
+  ECSubReadReply wrote;
+  wrote.push_declined = true;
+  auto p2it = std::as_const(p2).begin();
+  auto d2it = std::as_const(d2).begin();
+  wrote.decode(p2it, d2it);
+  EXPECT_FALSE(wrote.push_declined);
+
+  // to a peer from before pushes, it does not go out
+  r.push_declined = true;
+  ceph::buffer::list op, od;
+  r.encode(op, od, 0);
+  op.claim_append(od);
+  ECSubReadReply old;
+  old.push_declined = true;
+  auto oit = std::as_const(op).begin();
+  old.decode(oit);
+  EXPECT_FALSE(old.push_declined);
+}

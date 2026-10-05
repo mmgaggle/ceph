@@ -758,7 +758,10 @@ void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
 {
   // the primary lent us a window: place everything read there, back to
   // back in reply order, and return only the extents. Any refusal or
-  // failure leaves the reply as it is, with the data inline.
+  // failure leaves the reply as it is, with the data inline, and says
+  // whether anything went into the window: when nothing did, the
+  // primary can lend it again at once.
+  reply->push_declined = true;
   OSDOobExecutor* exec =
     get_parent()->get_eclistener()->oob_executor_for(op.push_token);
   if (!exec || reply->buffers_read.empty()) {
@@ -788,12 +791,17 @@ void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
   const double bound = pool.get_rdma_delivery_lease() +
     pool.get_rdma_delivery_drain() - age;
   auto plan = ceph::osd::oob::linear_plan(0, all.length());
+  // an executor that cannot say counts as having started
+  bool started = true;
   ssize_t r = exec->execute_plan(
     "ec gather", op.push_token, all, plan,
-    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)), nullptr);
+    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)),
+    &started);
+  reply->push_declined = !started;
   if (r != static_cast<ssize_t>(all.length())) {
     dout(10) << __func__ << ": push to the primary failed (" << r
-	     << "), replying inline" << dendl;
+	     << (started ? "" : ", nothing sent") << "), replying inline"
+	     << dendl;
     return;
   }
   dout(20) << __func__ << ": pushed " << all.length()
@@ -884,14 +892,18 @@ void ECBackend::handle_sub_read_reply(
       // say - attempted none (push_sub_read pushes only what it read),
       // so its window goes back clean. Quarantining it would let one
       // object a shard cannot read, read over and over, take every
-      // window this OSD can lend.
+      // window this OSD can lend. The window of a shard whose reply
+      // says that its executor refused the push before sending
+      // anything - its endpoint busy adding a client, say - goes back
+      // clean too: quarantining it would keep every window a busy shard
+      // was lent out of use.
       uint64_t read = 0;
       for (auto &&[hoid, extents] : op.buffers_read) {
 	for (auto &&[offset, bl] : extents) {
 	  read += bl.length();
 	}
       }
-      rop.gather.release(from, read == 0);
+      rop.gather.release(from, read == 0 || op.push_declined);
     } else {
       // the shard placed its data in our window: rebuild the buffers the
       // reply would have carried, in the order it placed them, and check

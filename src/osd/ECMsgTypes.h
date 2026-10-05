@@ -127,7 +127,8 @@ struct ECSubRead {
   /// a shard that cannot push returns the data inline. A shard writes
   /// into the window only bytes it also returns, listed in the reply's
   /// pushed or carried inline in buffers_read: a reply with neither
-  /// wrote nothing, and the primary returns its window clean.
+  /// wrote nothing, and the primary returns its window clean, as it does
+  /// for a reply whose push_declined says so.
   std::string push_token;
   /**
     * Calculate the cost of the SubOp read operation for mClock scheduler.
@@ -161,6 +162,11 @@ struct ECSubReadReply {
   /// the primary takes the window's content only if it matches. Unset
   /// from a shard that pushed nothing, or predates it.
   std::optional<uint32_t> pushed_crc;
+  /// the shard held a push token and handed no write for the window to
+  /// its transport: it returns its data inline, and nothing of it can
+  /// land in the window later. False from a shard that may have written,
+  /// or predates it.
+  bool push_declined = false;
   void encode(ceph::buffer::list &bl) const;
   void encode(ceph::buffer::list &p_bl,
 	      ceph::buffer::list &d_pl,

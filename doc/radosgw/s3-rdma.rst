@@ -616,14 +616,17 @@ data it read, since a write it attempted may still land, and a read
 that was cancelled or restarted. A shard that read nothing - every
 object of its sub-read failed, a media error say - attempted no write,
 and its window comes back at once, so one object a shard cannot read,
-read over and over, cannot use up the windows. With ``osd_oob_rekey_windows``,
-the libfabric executor also gives every released window a new key,
-after which no write meant for the last gather can land where the
-provider drops writes with a retired key. A window whose data the
-primary used is lent again at once, unless its new key fails. One whose
-data it did not use keeps its quarantine, and stays out of use for 10 s
-at least once it has a new key. A cuObject window gets no new key. See
-`Reusing a window`_.
+read over and over, cannot use up the windows. So does the window of a
+shard that says in its reply that its executor sent nothing into it:
+the push was refused before any write went out, because the shard's
+endpoint was adding a client, no staging buffer was free, or the lease
+had run out, say. With ``osd_oob_rekey_windows``, the libfabric executor
+also gives every released window a new key, after which no write meant
+for the last gather can land where the provider drops writes with a
+retired key. A window whose data the primary used is lent again at once,
+unless its new key fails. One whose data it did not use keeps its
+quarantine, and stays out of use for 10 s at least once it has a new
+key. A cuObject window gets no new key. See `Reusing a window`_.
 
 The first transport in ``osd_oob_transports`` that started lends the
 windows, and only its executor registers them; another executor on the
@@ -634,8 +637,9 @@ OSD's adapter. Peers must run the same transport to write into a
 window.
 
 The token travels in a new trailing field of the sub-read message, and
-the pushed extents and their crc32c in new trailing fields of the
-reply. An OSD of an older release ignores the token and replies inline.
+the pushed extents, their crc32c, and whether the shard sent nothing,
+in new trailing fields of the reply. An OSD of an older release ignores
+the token and replies inline.
 
 Shard read errors
 -----------------
@@ -914,8 +918,9 @@ endpoint, so that the operations queued behind it do not wait too:
 
 * A read for any client, a new client's first read included, is
   delivered inline, and declined. A push this OSD makes as a shard of
-  an erasure-coded read is delivered inline. ``insert_busy`` counts
-  both.
+  an erasure-coded read is delivered inline, and its reply says that
+  nothing was sent, so the primary lends the window again at once.
+  ``insert_busy`` counts both.
 * A gather lends no window, and its shards reply inline.
   ``windows_declined_insert`` counts the windows not lent.
 * A gather window returned meanwhile gets its new key from a later
@@ -1384,7 +1389,8 @@ Testing
   that a write with a re-keyed window's old token does not land, and
   the gather window cycle under load, with cut-offs alongside.
 * ``unittest_ec_gather`` tests the check of gathered shard data against
-  its shard's checksum.
+  its shard's checksum, and that a reply says when its shard sent
+  nothing into the window.
 * ``unittest_oob_placement`` tests placement plans.
 * ``unittest_oob_abandoned`` tests how the cuObject executor counts a
   completion against the plan that posted it, and when it gives the

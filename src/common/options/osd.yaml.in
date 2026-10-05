@@ -1709,14 +1709,22 @@ options:
 - name: osd_oob_cutoff_failure
   type: str
   level: advanced
-  desc: What an OSD does when an out-of-band transport fails to cut off
-    writes that missed their deadline, or cuts them off late
-  long_desc: Such writes may land in a client's window after the client was
-    told they would not. "disable" stops out-of-band delivery on the OSD,
+  desc: What an OSD does when its libfabric executor fails to cut off
+    writes that missed their deadline
+  long_desc: A cut-off fails when the provider cannot close the endpoint, or
+    when the close or cancel itself takes longer than
+    osd_oob_cutoff_late_tolerance, as when a provider drains its writes
+    instead of discarding them; with osd_oob_cutoff_late_fail_closed, also
+    when a quick cut-off ends later than the tolerance. The writes may then
+    land in a client's window after the client was told they would not. A
+    cut-off that only ends late is counted instead (see
+    osd_oob_cutoff_late_tolerance). "disable" stops the libfabric executor,
     logs to the cluster log and raises the OOB_DELIVERY_UNSAFE health
-    warning; reads are then delivered inline. "abort" also makes the OSD
-    exit, which ends the writes of a software provider and makes a device
-    drop the queue pair's; restart it once the transport is fixed.
+    warning; the reads it would have written are then delivered inline, and
+    it lends no more gather windows. "abort" also makes the OSD exit, which
+    ends the writes of a software provider and makes a device drop the
+    queue pair's; restart it once the transport is fixed. The cuObject
+    executor cannot cut writes off and does not use this option.
   default: disable
   enum_values:
   - disable
@@ -1743,8 +1751,8 @@ options:
 - name: osd_oob_cutoff_late_tolerance
   type: millisecs
   level: advanced
-  desc: How late an out-of-band write's cut-off may end, past the budget it
-    protects, before the OSD stops out-of-band delivery
+  desc: How late a libfabric write's cut-off may end, past the budget it
+    protects, and raise only a health warning
   long_desc: A write still in flight when its budget, the pool's
     rdma_delivery_lease plus rdma_delivery_drain from receipt, runs out is
     cut off. A cut-off that ends after the budget by no more than this, and
@@ -1753,8 +1761,14 @@ options:
     Clients that receive a response, and the gateway's fallback, wait for
     the OSD's reply, which follows the cut-off, so they are not affected; a
     client that gives a request up must allow this much beyond the lease
-    and the drain. A cut-off later than this, or one that takes longer,
-    stops out-of-band delivery (see osd_oob_cutoff_failure).
+    and the drain. One that ends later than this, though it itself took no
+    longer, started late because the OSD's threads did not run; it is
+    counted, logged to the cluster log and raises the
+    OOB_CUTOFF_PAST_TOLERANCE health error, and delivery goes on, unless
+    osd_oob_cutoff_late_fail_closed is set. A cut-off that itself takes
+    longer than this fails, and the libfabric executor stops (see
+    osd_oob_cutoff_failure). The cuObject executor does not use this
+    option.
   default: 1000
   services:
   - osd
@@ -1763,14 +1777,16 @@ options:
 - name: osd_oob_cutoff_late_fail_closed
   type: bool
   level: advanced
-  desc: Stop out-of-band delivery when a cut-off ends later than
+  desc: Stop the libfabric executor when a cut-off ends later than
     osd_oob_cutoff_late_tolerance, though it was quick
   long_desc: A cut-off that ends late although the close or cancel was quick
     started late, because the OSD's threads did not run (the process was
     stopped, paused, swapped out or starved). The transport is clean once it
     returns, so by default the OSD logs the cut-off to the cluster log,
-    raises OOB_CUTOFF_PAST_TOLERANCE, and goes on delivering. True stops
-    out-of-band delivery instead, as for a cut-off that fails.
+    raises OOB_CUTOFF_PAST_TOLERANCE, and goes on delivering. True makes it
+    a cut-off that fails instead, and the libfabric executor stops, as
+    osd_oob_cutoff_failure says. The cuObject executor does not use this
+    option.
   default: false
   services:
   - osd

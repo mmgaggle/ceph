@@ -94,10 +94,13 @@ int OSDOfi::init()
   }
   if (const auto st = ep->stats(); st.close_discards == 0) {
     // a late write is then only cut off once the provider has drained it,
-    // which the endpoint measures, and treats as unsafe when it ends late
+    // which the endpoint measures, and treats as unsafe when the drain
+    // takes longer than the tolerance
     dout(0) << "WARNING: " << ep->provider() << " says closing an endpoint "
 	    << "does not discard its writes; a write that misses its deadline "
-	    << "can land late, which stops out-of-band delivery" << dendl;
+	    << "can land late, and a cut-off that takes longer than "
+	    << "osd_oob_cutoff_late_tolerance stops libfabric delivery"
+	    << dendl;
   }
   if (!ep->delivery_complete()) {
     dout(0) << "WARNING: " << ep->provider() << " does not promise "
@@ -122,10 +125,10 @@ bool OSDOfi::check_unsafe()
   }
   const std::string why = ep->last_error();
   derr << "libfabric delivery is unsafe: " << why
-       << "; out-of-band delivery stopped on this osd" << dendl;
+       << "; libfabric delivery stopped on this osd" << dendl;
   if (clog) {
     clog->error() << "libfabric delivery is unsafe: " << why
-		  << "; out-of-band delivery stopped";
+		  << "; libfabric delivery stopped";
   }
   if (cct->_conf.get_val<std::string>("osd_oob_cutoff_failure") == "abort") {
     ceph_abort_msg("libfabric delivery could not cut off its writes (" + why +
@@ -320,13 +323,13 @@ void OSDOfi::get_alerts(std::map<std::string, std::string>& alerts) const
   if (s.unsafe) {
     alerts.emplace("OOB_DELIVERY_UNSAFE",
 		   "libfabric delivery could not cut off writes in time (" +
-		   ep->last_error() + "); out-of-band delivery stopped");
+		   ep->last_error() + "); libfabric delivery stopped");
     return;
   }
   if (s.broken) {
     alerts.emplace("OOB_DELIVERY_DOWN",
 		   "libfabric delivery could not reopen its endpoint (" +
-		   ep->last_error() + "); out-of-band delivery stopped");
+		   ep->last_error() + "); libfabric delivery stopped");
     return;
   }
   const auto now = std::chrono::steady_clock::now();

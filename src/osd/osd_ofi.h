@@ -36,13 +36,16 @@ namespace ceph::ofi { class Endpoint; class WindowPool; }
  * released, so that no write meant for an earlier gather, a provider's
  * late duplicate included, lands in it once it is lent again.
  *
- * When a cut-off fails or ends late, writes may land in a client's
- * window after the client was told they would not (see
- * ceph::ofi::Endpoint::write()). The executor then stops: it serves no
- * token and lends no window, logs to the cluster log once, and raises
- * the OOB_DELIVERY_UNSAFE health alert. With osd_oob_cutoff_failure set
- * to abort, the OSD exits instead, which ends the writes of a software
- * provider and makes a device drop the queue pair's.
+ * When a cut-off fails, writes may land in a client's window after the
+ * client was told they would not (see ceph::ofi::Endpoint::write()). The
+ * executor then stops: it serves no token and lends no window, logs to
+ * the cluster log once, and raises the OOB_DELIVERY_UNSAFE health alert.
+ * With osd_oob_cutoff_failure set to abort, the OSD exits instead, which
+ * ends the writes of a software provider and makes a device drop the
+ * queue pair's. A quick cut-off that ends later than
+ * osd_oob_cutoff_late_tolerance fails only with
+ * osd_oob_cutoff_late_fail_closed; otherwise the executor logs it to the
+ * cluster log, raises OOB_CUTOFF_PAST_TOLERANCE, and goes on.
  */
 class OSDOfi : public OSDOobExecutor {
 public:

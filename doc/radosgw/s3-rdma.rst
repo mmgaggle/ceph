@@ -402,10 +402,10 @@ writes it cut off is sent any more. So the OSD logs the cut-off to the
 cluster log as an error, with its lateness, raises the
 ``OOB_CUTOFF_PAST_TOLERANCE`` health error for
 ``osd_oob_cutoff_late_alert_period`` (an hour by default), and goes on
-delivering. Stopping delivery would not undo a write that already
+delivering. Stopping the executor would not undo a write that already
 landed, and it would turn every long pause into an outage until the OSD
-restarts. Set ``osd_oob_cutoff_late_fail_closed`` to stop delivery
-instead.
+restarts. Set ``osd_oob_cutoff_late_fail_closed`` to stop the libfabric
+executor instead.
 
 Who can such a late write reach? Say the OSD received the operation at
 ``t``. Its writes must land by ``t + lease + drain``, and one landed
@@ -436,14 +436,18 @@ A cut-off can fail. The provider may fail to close the endpoint, so its
 writes go on. Or the close or cancel itself may take longer than the
 tolerance, as when a provider drains its writes instead of discarding
 them, so that every cut-off would be late. In these cases writes may
-land in a client's window after the fence, and may keep doing so. The
-OSD then stops delivering out of band. It delivers every read inline, logs the
-cause to the cluster log, and raises the ``OOB_DELIVERY_UNSAFE`` health
-warning. With ``osd_oob_cutoff_failure`` set to ``abort``, the OSD exits
-instead. That ends the writes of a software provider, and a device
-drops the queue pair's. Restart the OSD once the transport is fixed.
-``OOB_DELIVERY_DOWN`` means that a cut-off could not reopen the endpoint;
-no write is at risk then, but delivery has stopped.
+land in a client's window after the fence, and may keep doing so. With
+``osd_oob_cutoff_late_fail_closed``, a quick cut-off that ends later
+than the tolerance fails too, although its endpoint is clean. When a
+cut-off fails, the OSD stops its libfabric executor. It delivers inline
+every read that the executor would have written, lends none of its
+gather windows, logs the cause to the cluster log, and raises the
+``OOB_DELIVERY_UNSAFE`` health warning. With ``osd_oob_cutoff_failure``
+set to ``abort``, the OSD exits instead. That ends the writes of a
+software provider, and a device drops the queue pair's. Restart the OSD
+once the transport is fixed. ``OOB_DELIVERY_DOWN`` means that a cut-off
+could not reopen the endpoint; no write is at risk then, but libfabric
+delivery has stopped.
 
 The lease and the drain bound the OSD side only. They are not a bound
 on how long a client keeps a window registered. Both are measured
@@ -978,7 +982,7 @@ it then cancels the late write alone. A wrapper that drains its writes
 on close instead lets a cut-off write land after the deadline. The OSD
 measures each cut-off. One whose close or cancel itself takes longer
 than ``osd_oob_cutoff_late_tolerance``, as a draining close does, counts
-as a failed cut-off, and the OSD stops delivering out of band. The OSD
+as a failed cut-off, and the OSD stops its libfabric executor. The OSD
 also warns at startup when the wrapper says that closing does not
 discard. See `Fencing a window before reuse`_.
 
@@ -1183,18 +1187,25 @@ Executors and out-of-band behavior:
   executor fails to cut off writes, or when the close or cancel itself
   takes longer than the tolerance. With
   ``osd_oob_cutoff_late_fail_closed``, a cut-off that ends later than the
-  tolerance counts too. ``disable``, the default, stops out-of-band
-  delivery and raises ``OOB_DELIVERY_UNSAFE``. ``abort`` makes the OSD
+  tolerance counts too. ``disable``, the default, stops the libfabric
+  executor and raises ``OOB_DELIVERY_UNSAFE``. ``abort`` makes the OSD
   exit. See `Fencing a window before reuse`_.
 * ``osd_oob_cutoff_late_tolerance``: how late a cut-off may end, past the
   budget it protects, and still be only counted and warned of
-  (``OOB_CUTOFF_LATE``). The default is 1000 ms.
-* ``osd_oob_cutoff_late_fail_closed``: stop delivering when a quick
-  cut-off ends later than the tolerance, instead of logging it and
-  raising ``OOB_CUTOFF_PAST_TOLERANCE``. The default is false.
+  (``OOB_CUTOFF_LATE``). A quick cut-off that ends later is counted too,
+  logged to the cluster log, and raises ``OOB_CUTOFF_PAST_TOLERANCE``;
+  delivery goes on. A close or cancel that itself takes longer fails.
+  The default is 1000 ms.
+* ``osd_oob_cutoff_late_fail_closed``: stop the libfabric executor when
+  a quick cut-off ends later than the tolerance, instead of logging it
+  and raising ``OOB_CUTOFF_PAST_TOLERANCE``. The default is false.
 * ``osd_oob_cutoff_late_alert_period``: how long ``OOB_CUTOFF_LATE`` and
   ``OOB_CUTOFF_PAST_TOLERANCE`` stay raised after the latest late
   cut-off. The default is an hour.
+
+Only the libfabric executor cuts off writes, so these four options
+apply to it alone. The cuObject executor stops waiting ahead of the
+deadline instead; see `Fencing a window before reuse`_.
 
 Erasure-coded reads:
 

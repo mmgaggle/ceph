@@ -5234,7 +5234,13 @@ void RGWPutObj::execute(optional_yield y)
   auto* cuobj_srv = RGWCuObjServer::get_instance();
   if (cuobj_srv && cuobj_srv->is_available() && copy_source.empty()) {
     auto rdma_token = s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
-    if (rdma_token) {
+    if (rdma_token && ceph::rdma::is_ofi_token(*rdma_token)) {
+      // the cuObjServer can only read from cuObject descriptors, and
+      // libfabric clients have no staged PUT: the token is advisory and
+      // the body comes over HTTP, as it does with no cuObjServer
+      ldpp_dout(this, 4) << "rgw_cuobj: libfabric token on a PUT, reading "
+                         << "the body over HTTP" << dendl;
+    } else if (rdma_token) {
       rdma_descr = *rdma_token;
       rdma_put = true;
     }
@@ -5243,7 +5249,11 @@ void RGWPutObj::execute(optional_yield y)
   if (rdma_put) {
     size_t total = RGWCuObjServer::parse_rdma_descriptor_size(rdma_descr);
     if (total == 0) {
+      // any token but a libfabric one is taken for a cuObject
+      // descriptor, and a staged PUT is not advisory: one that does not
+      // parse fails, rather than storing whatever body came with it
       ldpp_dout(this, 0) << "rgw_cuobj: ERROR: failed to parse size from RDMA descriptor" << dendl;
+      s->err.message = "x-amz-rdma-token is not a cuObject descriptor";
       op_ret = -EINVAL;
       return;
     }
@@ -5298,6 +5308,7 @@ void RGWPutObj::execute(optional_yield y)
     s->obj_size = ofs;
     s->rdma_bytes_transferred = ofs;
     s->object->set_obj_size(ofs);
+    rdma_staged = true;
   }
   else
 #endif

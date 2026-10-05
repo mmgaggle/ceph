@@ -261,9 +261,6 @@ public:
 class RGWPutObj_ObjStore_S3 : public RGWPutObj_ObjStore {
 private:
   std::map<std::string, std::string> crypt_http_responses;
-#ifdef WITH_RADOSGW_CUOBJ
-  bool rdma_active = false;
-#endif
 
 public:
   RGWPutObj_ObjStore_S3() {}

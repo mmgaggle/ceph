@@ -2950,15 +2950,6 @@ static inline void map_qs_metadata(req_state* s, bool crypto_too)
 
 int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
 {
-#ifdef WITH_RADOSGW_CUOBJ
-  if (auto* cuobj = RGWCuObjServer::get_instance();
-      cuobj && cuobj->is_available()) {
-    if (s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN")) {
-      rdma_active = true;
-    }
-  }
-#endif
-
   if (!s->length) {
     const char *encoding = s->info.env->get("HTTP_TRANSFER_ENCODING");
     if (!encoding || strcmp(encoding, "chunked") != 0) {
@@ -3116,7 +3107,9 @@ void RGWPutObj_ObjStore_S3::send_response()
       dump_etag(s, etag);
       dump_content_length(s, 0);
 #ifdef WITH_RADOSGW_CUOBJ
-      if (rdma_active) {
+      // only when execute() staged the body: with a libfabric token, or
+      // no cuObject server by then, the body came over HTTP
+      if (rdma_staged) {
         dump_header(s, "x-amz-rdma-reply", "200");
         dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
       }

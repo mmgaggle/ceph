@@ -1411,6 +1411,11 @@ protected:
 
   std::optional<rgw::cksum::Cksum> cksum;
 
+  /// S3-over-RDMA (cuObject): after execute(), whether the body came
+  /// from the client's memory (a gateway-staged PUT), which the reply
+  /// reports
+  bool rdma_staged = false;
+
 public:
   RGWPutObj() : ofs(0),
                 supplied_md5_b64(NULL),

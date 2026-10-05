@@ -1703,9 +1703,18 @@ options:
     shard push its data into a window of this OSD's memory over the
     out-of-band transport instead of returning it in the sub-read reply.
     Peers that cannot push reply inline as before.
+  long_desc: An executor registers its gather windows, osd_oob_window_count
+    of osd_oob_window_size bytes, when it starts, and the libfabric executor
+    then also starts the progress thread that places data in them. So a
+    change takes effect only when the OSD restarts.
   default: false
   services:
   - osd
+  flags:
+  - startup
+  see_also:
+  - osd_oob_window_size
+  - osd_oob_window_count
 - name: osd_oob_cutoff_failure
   type: str
   level: advanced

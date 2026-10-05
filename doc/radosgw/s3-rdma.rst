@@ -1176,7 +1176,9 @@ Executors and out-of-band behavior:
   buffer for it instead, of up to four times ``osd_oob_buffer_size``,
   which is slower. A larger read is delivered inline.
 * ``osd_oob_gather``: lend windows when this OSD is the primary of an
-  erasure-coded read. The default is false.
+  erasure-coded read. The default is false. The windows are registered
+  when the executor starts, so a change takes effect only when the OSD
+  restarts.
 * ``osd_oob_window_size`` and ``osd_oob_window_count``: the window
   pool, 16 windows of 8 MiB by default. A shard read larger than a
   window, or one that finds no free window, is returned inline.

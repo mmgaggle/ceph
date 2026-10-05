@@ -30,7 +30,7 @@ OSDOfi::~OSDOfi()
   std::free(pool_mem);
 }
 
-int OSDOfi::init()
+int OSDOfi::init(bool lend_windows)
 {
   const auto& conf = cct->_conf;
   ceph::ofi::config_t cfg;
@@ -39,9 +39,8 @@ int OSDOfi::init()
   cfg.node = conf.get_val<std::string>("osd_ofi_node");
   cfg.stage_size = conf.get_val<Option::size_t>("osd_oob_buffer_size");
   cfg.stage_count = conf.get_val<uint64_t>("osd_oob_buffer_count");
-  const bool gather = conf.get_val<bool>("osd_oob_gather");
   // windows only fill while someone polls a manual-progress provider
-  cfg.progress_thread = gather;
+  cfg.progress_thread = lend_windows;
   cfg.late_tolerance =
     conf.get_val<std::chrono::milliseconds>("osd_oob_cutoff_late_tolerance");
   cfg.late_fail_closed = conf.get_val<bool>("osd_oob_cutoff_late_fail_closed");
@@ -62,7 +61,7 @@ int OSDOfi::init()
   }
 
   size_t slot_size = 0;
-  if (gather) {
+  if (lend_windows) {
     slot_size = conf.get_val<Option::size_t>("osd_oob_window_size");
     const size_t nslots = conf.get_val<uint64_t>("osd_oob_window_count");
     const size_t len = slot_size * nslots;

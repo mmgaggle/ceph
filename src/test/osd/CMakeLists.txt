@@ -88,6 +88,17 @@ add_executable(unittest_ec_gather
 add_ceph_unittest(unittest_ec_gather)
 target_link_libraries(unittest_ec_gather osd global)
 
+if(WITH_OOB_OFI)
+  # unittest_osd_ofi: the libfabric executor over the tcp provider, which
+  # needs no special hardware
+  add_executable(unittest_osd_ofi
+    test_osd_ofi.cc
+    $<TARGET_OBJECTS:unit-main>
+    )
+  add_ceph_unittest(unittest_osd_ofi)
+  target_link_libraries(unittest_osd_ofi osd global)
+endif()
+
 # unittest_ecbackend_l (legacy EC)
 add_executable(unittest_ecbackend_l
   TestECBackendL.cc

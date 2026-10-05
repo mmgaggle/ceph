@@ -60,10 +60,10 @@ thread_local ceph::osd::oob::abandoned_plans<OSDCuObj::held_t>
 static constexpr size_t MAX_RDMA_OP_SIZE = 1ULL << 30;
 
 OSDCuObj::OSDCuObj(CephContext *cct, const std::string& rdma_ip,
-		   uint16_t rdma_port)
+		   uint16_t rdma_port, bool lend_windows)
   : m_cct(cct)
 {
-  if (do_init(rdma_ip, rdma_port) < 0) {
+  if (do_init(rdma_ip, rdma_port, lend_windows) < 0) {
     do_shutdown();
   }
 }
@@ -73,7 +73,8 @@ OSDCuObj::~OSDCuObj()
   do_shutdown();
 }
 
-int OSDCuObj::do_init(const std::string& rdma_ip, uint16_t rdma_port)
+int OSDCuObj::do_init(const std::string& rdma_ip, uint16_t rdma_port,
+		      bool lend_windows)
 {
   auto num_dcis = static_cast<int>(
     m_cct->_conf.get_val<uint64_t>("osd_cuobj_num_dcis"));
@@ -129,7 +130,7 @@ int OSDCuObj::do_init(const std::string& rdma_ip, uint16_t rdma_port)
   dout(1) << "initialized with " << m_pool_count << " RDMA buffers of "
 	  << buf_size << " bytes" << dendl;
 
-  if (m_cct->_conf.get_val<bool>("osd_oob_gather")) {
+  if (lend_windows) {
     // a DC target so peers can push their shard reads into this OSD
     // when it gathers an erasure-coded read
     m_win_size = m_cct->_conf.get_val<Option::size_t>("osd_oob_window_size");

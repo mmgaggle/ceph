@@ -542,6 +542,7 @@ void OSDService::shutdown()
 
 #ifdef HAVE_OSD_OOB_DELIVERY
   oob_executors.clear();
+  oob_lender = nullptr;
 #endif
 #ifdef WITH_OSD_CUOBJ
   // op threads are stopped by now, so no RDMA writes are in flight
@@ -568,14 +569,27 @@ OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
   return nullptr;
 }
 
+bool OSDService::oob_next_lends() const
+{
+  // the preferred transport that starts lends the windows; peers need
+  // the same transport to push into them, and reply inline otherwise.
+  // Only it registers them: windows of another executor would pin
+  // memory, or a DC target, that no gather uses.
+  return cct->_conf.get_val<bool>("osd_oob_gather") && !oob_lender;
+}
+
+void OSDService::add_oob_executor(OSDOobExecutor* e, bool lends)
+{
+  oob_executors.push_back(e);
+  if (lends) {
+    ceph_assert(!oob_lender);
+    oob_lender = e;
+  }
+}
+
 OSDOobExecutor* OSDService::oob_gather_executor() const
 {
-  if (!cct->_conf.get_val<bool>("osd_oob_gather")) {
-    return nullptr;
-  }
-  // the preferred transport that started lends the windows; peers need
-  // the same transport to push into them, and reply inline otherwise
-  return oob_executors.empty() ? nullptr : oob_executors.front();
+  return oob_lender;
 }
 
 bool OSDService::has_oob_executor() const
@@ -593,6 +607,7 @@ void OSDService::fast_shutdown()
   }
 #ifdef HAVE_OSD_OOB_DELIVERY
   oob_executors.clear();
+  oob_lender = nullptr;
 #endif
 #ifdef WITH_OSD_CUOBJ
   // op threads are stopped by now, so no RDMA writes are in flight
@@ -4149,6 +4164,9 @@ int OSD::init()
   // preference
   for (const auto& t : ceph::rdma::parse_transport_list(
 	 cct->_conf.get_val<std::string>("osd_oob_transports"))) {
+    // whether this one, should it start, lends the gather windows; only
+    // then does it register them
+    const bool lend = service.oob_next_lends();
     if (t == ceph::rdma::TRANSPORT_CUOBJ) {
 #ifdef WITH_OSD_CUOBJ
       std::string cuobj_ip = cct->_conf.get_val<std::string>("osd_cuobj_rdma_ip");
@@ -4159,10 +4177,11 @@ int OSD::init()
       }
       auto cuobj_port = static_cast<uint16_t>(
 	cct->_conf.get_val<uint64_t>("osd_cuobj_rdma_port"));
-      auto cuobj = std::make_unique<OSDCuObj>(cct, cuobj_ip, cuobj_port);
+      auto cuobj = std::make_unique<OSDCuObj>(cct, cuobj_ip, cuobj_port,
+					      lend);
       if (cuobj->is_available()) {
 	service.cuobj = cuobj.release();
-	service.oob_executors.push_back(service.cuobj);
+	service.add_oob_executor(service.cuobj, lend);
       } else {
 	derr << "WARNING: cuObject RDMA init failed on " << cuobj_ip
 	     << " (cuObject delivery disabled on this osd)" << dendl;
@@ -4172,9 +4191,9 @@ int OSD::init()
     } else if (t == ceph::rdma::TRANSPORT_OFI) {
 #ifdef WITH_OOB_OFI
       auto ofi = std::make_unique<OSDOfi>(cct, clog);
-      if (int r = ofi->init(); r == 0) {
+      if (int r = ofi->init(lend); r == 0) {
 	service.ofi = ofi.release();
-	service.oob_executors.push_back(service.ofi);
+	service.add_oob_executor(service.ofi, lend);
       } else {
 	derr << "WARNING: libfabric delivery init failed: " << cpp_strerror(r)
 	     << " (libfabric delivery disabled on this osd)" << dendl;

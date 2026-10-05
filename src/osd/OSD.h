@@ -135,6 +135,15 @@ public:
   /// the executors that started, in osd_oob_transports order (owned
   /// through cuobj and ofi above)
   std::vector<OSDOobExecutor*> oob_executors;
+  /// the one of them that lends windows for EC gathers, and the only one
+  /// that registered any; null when none does
+  OSDOobExecutor* oob_lender = nullptr;
+  /// whether the executor about to start is to lend the gather windows,
+  /// and so register them
+  bool oob_next_lends() const;
+  /// an executor that started; lends is what oob_next_lends() said
+  /// before it started
+  void add_oob_executor(OSDOobExecutor* e, bool lends);
   /// the executor that serves a delivery token's transport, or null
   OSDOobExecutor* oob_executor_for(const std::string& token) const;
   /// true when any out-of-band transport is up

@@ -29,9 +29,10 @@ namespace ceph::ofi { class Endpoint; class WindowPool; }
  * vector, so any OSD holding the token can write, as with cuObject's DC
  * transport.
  *
- * With osd_oob_gather, the executor also lends windows: a pool of
- * osd_oob_window_count windows of osd_oob_window_size bytes registered
- * for remote writes, which shards of an erasure-coded read push into.
+ * When the OSD has it lend the gather windows (osd_oob_gather, see
+ * OSDService::oob_next_lends()), the executor also registers them: a
+ * pool of osd_oob_window_count windows of osd_oob_window_size bytes open
+ * to remote writes, which shards of an erasure-coded read push into.
  * With osd_oob_rekey_windows, a window gets a new memory key when it is
  * released, so that no write meant for an earlier gather, a provider's
  * late duplicate included, lands in it once it is lent again.
@@ -55,8 +56,10 @@ public:
   OSDOfi(const OSDOfi&) = delete;
   OSDOfi& operator=(const OSDOfi&) = delete;
 
-  /// open the endpoint, the staging buffers and the window pool
-  int init();
+  /// open the endpoint and the staging buffers, and, when this executor
+  /// lends the gather windows, the window pool and the progress thread
+  /// that places data in it
+  int init(bool lend_windows);
 
   bool is_available() const override;
   bool handles(const std::string& token) const override;

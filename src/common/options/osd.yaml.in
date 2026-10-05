@@ -1658,9 +1658,9 @@ options:
     executor. Each executor serves the delivery descriptors of its own
     transport, and a descriptor that no executor serves is delivered inline.
     When osd_oob_gather is on, the first transport that started lends the
-    gather windows. The OSD skips, with a warning, a transport that it was
-    built without or that fails to start. Empty turns out-of-band delivery
-    off.
+    gather windows, and only it registers them. The OSD skips, with a
+    warning, a transport that it was built without or that fails to start.
+    Empty turns out-of-band delivery off.
   default:
   services:
   - osd
@@ -1703,8 +1703,9 @@ options:
     shard push its data into a window of this OSD's memory over the
     out-of-band transport instead of returning it in the sub-read reply.
     Peers that cannot push reply inline as before.
-  long_desc: An executor registers its gather windows, osd_oob_window_count
-    of osd_oob_window_size bytes, when it starts, and the libfabric executor
+  long_desc: The first transport in osd_oob_transports that started lends
+    the windows, and only its executor registers them, osd_oob_window_count
+    of osd_oob_window_size bytes, when it starts; the libfabric executor
     then also starts the progress thread that places data in them. So a
     change takes effect only when the OSD restarts.
   default: false

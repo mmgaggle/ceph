@@ -623,9 +623,12 @@ at least once it has a new key. A cuObject window gets no new key. See
 `Reusing a window`_.
 
 The first transport in ``osd_oob_transports`` that started lends the
-windows. The libfabric executor registers them on its endpoint. The
-cuObject executor puts them behind a DC target on the OSD's adapter.
-Peers must run the same transport to write into a window.
+windows, and only its executor registers them; another executor on the
+OSD registers none. The libfabric executor registers them on its
+endpoint, and starts a progress thread that places the data pushed
+into them. The cuObject executor puts them behind a DC target on the
+OSD's adapter. Peers must run the same transport to write into a
+window.
 
 The token travels in a new trailing field of the sub-read message, and
 the pushed extents and their crc32c in new trailing fields of the
@@ -813,15 +816,15 @@ does not name the real cause.
 Locked memory must be raised
   Every OSD registers ``osd_oob_buffer_count`` times
   ``osd_oob_buffer_size`` of memory for each executor, which is 256 MiB
-  at the defaults. With ``osd_oob_gather``, each executor also
-  registers ``osd_oob_window_count`` times ``osd_oob_window_size`` for
-  gather windows, 128 MiB more. A cuObject executor whose buffers are
-  all in use registers a one-time buffer of up to four times
-  ``osd_oob_buffer_size``. The gateway's cuObject server registers
-  ``rgw_cuobj_buffer_count`` times ``rgw_cuobj_buffer_size``, 1 GiB at
-  the defaults. That is far above the usual 8 MiB ``memlock`` limit.
-  Give the OSDs, and the gateway in staged mode,
-  ``LimitMEMLOCK=infinity``. For a vstart cluster, run
+  at the defaults. With ``osd_oob_gather``, the executor that lends the
+  gather windows also registers ``osd_oob_window_count`` times
+  ``osd_oob_window_size`` for them, 128 MiB more, once per OSD. A
+  cuObject executor whose buffers are all in use registers a one-time
+  buffer of up to four times ``osd_oob_buffer_size``. The gateway's
+  cuObject server registers ``rgw_cuobj_buffer_count`` times
+  ``rgw_cuobj_buffer_size``, 1 GiB at the defaults. That is far above
+  the usual 8 MiB ``memlock`` limit. Give the OSDs, and the gateway in
+  staged mode, ``LimitMEMLOCK=infinity``. For a vstart cluster, run
   ``ulimit -l unlimited``.
 
 The RDMA address must belong to the RDMA device
@@ -1176,9 +1179,10 @@ Executors and out-of-band behavior:
   buffer for it instead, of up to four times ``osd_oob_buffer_size``,
   which is slower. A larger read is delivered inline.
 * ``osd_oob_gather``: lend windows when this OSD is the primary of an
-  erasure-coded read. The default is false. The windows are registered
-  when the executor starts, so a change takes effect only when the OSD
-  restarts.
+  erasure-coded read. The default is false. The first transport in
+  ``osd_oob_transports`` that started lends them, and its executor
+  registers them when it starts, so a change takes effect only when the
+  OSD restarts.
 * ``osd_oob_window_size`` and ``osd_oob_window_count``: the window
   pool, 16 windows of 8 MiB by default. A shard read larger than a
   window, or one that finds no free window, is returned inline.

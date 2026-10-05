@@ -39,7 +39,10 @@ class OSDDcTarget;
  */
 class OSDCuObj : public OSDOobExecutor {
 public:
-  OSDCuObj(CephContext *cct, const std::string& rdma_ip, uint16_t rdma_port);
+  /// lend_windows: this executor lends the gather windows, and so opens
+  /// the DC target behind them (see OSDService::oob_next_lends())
+  OSDCuObj(CephContext *cct, const std::string& rdma_ip, uint16_t rdma_port,
+	   bool lend_windows);
   ~OSDCuObj() override;
 
   OSDCuObj(const OSDCuObj&) = delete;
@@ -82,7 +85,8 @@ public:
   void dump_stats(ceph::Formatter* f) const override;
 
   /// gather windows: slots of a pool behind a DC target on this OSD, so
-  /// peers' cuObject servers can push shard reads here (osd_oob_gather)
+  /// peers' cuObject servers can push shard reads here (osd_oob_gather);
+  /// none unless the executor lends them
   std::optional<window_t> acquire_window(size_t size) override;
   void release_window(uint64_t id, uint64_t quarantine_ms) override;
 
@@ -94,7 +98,8 @@ private:
     std::atomic<bool> in_use{false};
   };
 
-  int do_init(const std::string& rdma_ip, uint16_t rdma_port);
+  int do_init(const std::string& rdma_ip, uint16_t rdma_port,
+	      bool lend_windows);
   void do_shutdown();
 
   /// claim a pooled buffer of at least needed bytes, or register a

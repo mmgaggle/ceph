@@ -2794,10 +2794,11 @@ void RGWGetObj::select_rdma_mode(bool plain_chain)
   }
 #ifdef WITH_RADOSGW_CUOBJ
   // the gateway's own cuObjServer can only write to cuObject descriptors;
-  // a libfabric token that cannot pass through goes over HTTP
+  // a libfabric token that cannot pass through goes over HTTP, and so
+  // does a token the server could not take the window's address from
   if (auto* cuobj = RGWCuObjServer::get_instance();
       cuobj && cuobj->is_available() &&
-      rdma_token.find(":ofi1:") == std::string::npos) {
+      ceph::rdma::is_cuobj_descriptor(rdma_token)) {
     // reserve the staging buffer up front: once the response headers
     // are out there is no way left to signal a staging failure
     if (!rdma_buf) {

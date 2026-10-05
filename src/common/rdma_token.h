@@ -32,6 +32,17 @@ inline constexpr size_t RDMA_TOKEN_MAX_LEN = 512;
 /// malformed input.
 std::optional<token_window> parse_rdma_token(std::string_view token);
 
+/// Whether a token is a libfabric one (common/ofi_rma.h): its third
+/// field is the libfabric tag, where a cuObject descriptor has its
+/// memory key. The OSD's cuObject executor and the gateway's PUT take
+/// any other token for a cuObject descriptor. Only the shape is
+/// checked; a libfabric token can still fail to parse.
+bool is_ofi_token(std::string_view token);
+
+/// Whether a token is a cuObject descriptor that names a window: not a
+/// libfabric token, and parse_rdma_token() reads its addr and size.
+bool is_cuobj_descriptor(std::string_view token);
+
 /// out-of-band transport names, as osd_oob_transports and
 /// rgw_rdma_transports list them
 inline constexpr std::string_view TRANSPORT_OFI = "ofi";

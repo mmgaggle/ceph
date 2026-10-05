@@ -180,9 +180,7 @@ void OSDCuObj::do_shutdown()
 
 bool OSDCuObj::handles(const std::string& token) const
 {
-  // libfabric descriptors carry a transport tag in their third field; a
-  // cuObject descriptor has its memory key there
-  return token.find(":ofi1:") == std::string::npos;
+  return !ceph::rdma::is_ofi_token(token);
 }
 
 bool OSDCuObj::is_available() const

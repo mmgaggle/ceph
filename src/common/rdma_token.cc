@@ -3,6 +3,7 @@
 
 #include "common/rdma_token.h"
 #include "common/crc64nvme.h"
+#include "common/ofi_rma.h"
 
 #include <algorithm>
 #include <cctype>
@@ -46,6 +47,27 @@ std::optional<token_window> parse_rdma_token(std::string_view token)
     return std::nullopt;
   }
   return token_window{*addr, *size};
+}
+
+bool is_ofi_token(std::string_view token)
+{
+  const auto first = token.find(':');
+  if (first == std::string_view::npos) {
+    return false;
+  }
+  const auto second = token.find(':', first + 1);
+  if (second == std::string_view::npos) {
+    return false;
+  }
+  // the third field runs to the next colon, or to the end
+  auto tag = token.substr(second + 1);
+  tag = tag.substr(0, tag.find(':'));
+  return tag == ceph::ofi::TOKEN_TAG;
+}
+
+bool is_cuobj_descriptor(std::string_view token)
+{
+  return !is_ofi_token(token) && parse_rdma_token(token).has_value();
 }
 
 std::optional<uint64_t> fold_crc64_ranges(std::vector<crc_range_t> ranges)

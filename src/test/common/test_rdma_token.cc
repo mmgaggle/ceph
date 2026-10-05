@@ -67,3 +67,42 @@ TEST(RdmaToken, TransportList)
   // caller to report
   EXPECT_EQ(parse_transport_list("ofi,,ofi,foo"), (V{"ofi", "foo"}));
 }
+
+TEST(RdmaToken, OfiShape)
+{
+  using ceph::rdma::is_ofi_token;
+  const std::string ofi =
+    "7f0012345000:c00000:ofi1:verbs;ofi_rxm:020012340a00000100ff:1f";
+  EXPECT_TRUE(is_ofi_token(ofi));
+  EXPECT_TRUE(is_ofi_token("0:10:ofi1:tcp:0200:1"));
+  // a libfabric token has the addr:size prefix too, so parsing the
+  // window cannot tell the two apart
+  auto w = parse_rdma_token(ofi);
+  ASSERT_TRUE(w);
+  EXPECT_EQ(0xc00000ull, w->size);
+
+  EXPECT_FALSE(is_ofi_token(valid_token));
+  EXPECT_FALSE(is_ofi_token(""));
+  EXPECT_FALSE(is_ofi_token("ofi1"));
+  EXPECT_FALSE(is_ofi_token("0:10"));
+  EXPECT_FALSE(is_ofi_token("0:10:"));
+  // only the third field counts
+  EXPECT_FALSE(is_ofi_token("ofi1:0:10:tcp"));
+  EXPECT_FALSE(is_ofi_token("0:10:ofi10:tcp:0200:1"));
+  EXPECT_FALSE(is_ofi_token("0:10:1:ofi1:0200:1"));
+}
+
+TEST(RdmaToken, CuobjDescriptor)
+{
+  using ceph::rdma::is_cuobj_descriptor;
+  EXPECT_TRUE(is_cuobj_descriptor(valid_token));
+  EXPECT_TRUE(is_cuobj_descriptor("ff:10:rest-is-opaque"));
+  // a libfabric token parses, but is not one
+  EXPECT_FALSE(is_cuobj_descriptor("0:10:ofi1:tcp:0200:1"));
+  // neither is a token whose window does not parse, such as an RC
+  // queue-pair token, which has no colons
+  EXPECT_FALSE(is_cuobj_descriptor(std::string(88, 'a')));
+  EXPECT_FALSE(is_cuobj_descriptor(""));
+  EXPECT_FALSE(is_cuobj_descriptor("xyz:1234:rkey"));
+  EXPECT_FALSE(is_cuobj_descriptor("0:10"));
+}

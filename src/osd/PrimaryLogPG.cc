@@ -16298,7 +16298,12 @@ int PrimaryLogPG::rep_repair_primary_object(const hobject_t& soid, OpContext *ct
     // failed with EAGAIN to the client which will then retry the
     // request to the primary
     dout(10) << __func__ << " not primary, failing op with EAGAIN" << dendl;
-    osd->reply_op_error(op, -EAGAIN);
+    // answered once, as bounce_ec_direct_read does: a read nested in a
+    // CALL may not carry the -EAGAIN back up to execute_ctx
+    if (!ctx->sent_reply) {
+      osd->reply_op_error(op, -EAGAIN);
+      ctx->sent_reply = true;
+    }
     return -EAGAIN;
   }
 

@@ -6193,7 +6193,9 @@ int PrimaryLogPG::do_sparse_read(OpContext *ctx, OSDOp& osd_op) {
  * read, which the ECBackend read pipeline serves by reading around the
  * bad shard and decoding. The resend never carries EC_DIRECT_READ, so
  * it cannot bounce again, even when this shard is the primary's own.
- * Nothing here repairs the shard; the next deep scrub reports it.
+ * Nothing here repairs the shard: the primary does, when its read
+ * around the shard meets the same media error (osd_ec_repair_on_read),
+ * and otherwise the next deep scrub reports it.
  *
  * The op is answered here, once: sent_reply makes execute_ctx close the
  * ctx without replying, also when the read was nested (a cls_cxx_read

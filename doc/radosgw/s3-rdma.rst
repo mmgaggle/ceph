@@ -593,8 +593,12 @@ The gather is advisory too. A shard that cannot write replies inline.
 A shard follows the same bounds as for client delivery, counted from
 when the sub-read arrived. A window whose data the primary did not use
 stays out of use for the pool's ``rdma_delivery_lease`` plus its
-``rdma_delivery_drain``. This covers a shard that replied inline, and
-a read that was cancelled or restarted. With ``osd_oob_rekey_windows``,
+``rdma_delivery_drain``. This covers a shard that replied inline with
+data it read, since a write it attempted may still land, and a read
+that was cancelled or restarted. A shard that read nothing - every
+object of its sub-read failed, a media error say - attempted no write,
+and its window comes back at once, so one object a shard cannot read,
+read over and over, cannot use up the windows. With ``osd_oob_rekey_windows``,
 the libfabric executor also gives every released window a new key,
 after which no write meant for the last gather can land where the
 provider drops writes with a retired key. A window whose data the

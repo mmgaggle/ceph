@@ -107,9 +107,10 @@ private:
   uint16_t get_channel_id();
   static constexpr uint16_t invalid_channel = UINT16_MAX;
 
-  /// the staging buffer of a plan that timed out with writes still
-  /// posted on this thread's channel: the thread posts no other plan
-  /// until they complete, and the buffer goes back with the last of them
+  /// the staging buffer of a plan that ended with writes still posted
+  /// on this thread's channel, when it timed out or a poll failed
+  /// without a reset: the thread posts no other plan until they
+  /// complete, and the buffer goes back with the last of them
   struct held_t {
     BufEntry* buf = nullptr;
     bool transient = false;

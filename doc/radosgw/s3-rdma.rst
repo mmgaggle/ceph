@@ -1239,11 +1239,13 @@ Both also show ``gather_crc_mismatch``: gathered shard data that did not
 match its shard's checksum, whichever executor lent the window. See
 `Gathering shard reads out of band`_. ``cuobj status`` also shows the
 writes in flight, ``buffers_leaked``, the staging buffers that plans
-which timed out with writes outstanding kept, ``buffers_reclaimed``,
-those that came back since, ``stale_completions``, the completions of
-those writes that a later read took, ``channel_busy``, the reads
-delivered inline, with nothing staged, because writes of a plan that
-timed out were still posted on the thread's channel, and
+kept because they ended with writes outstanding, when they timed out
+or a poll of the channel failed without resetting it,
+``buffers_reclaimed``, those that came back since,
+``stale_completions``, the completions of those writes that a later
+read took, ``channel_busy``, the reads delivered inline, with nothing
+staged, because writes of such a plan were still posted on the
+thread's channel, and
 ``budget_refused``, the reads delivered inline, with nothing staged,
 because less than the DC retry budget was left. A kept buffer comes
 back when a later cuObject read on the same op worker thread finds its

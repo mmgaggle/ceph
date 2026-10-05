@@ -588,9 +588,8 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       continue;
     }
     if (n < 0) {
-      // on -EIO the return is NOT a completion count and the library
-      // has reset the QP, flushing the remaining writes; scan for the
-      // events that were filled, then abandon the plan
+      // a failed poll returns no completion count: scan for the events
+      // that were filled, then fail the plan
       for (const auto& e : events) {
 	if (!e.async_handle) {
 	  continue;
@@ -605,8 +604,23 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       }
       derr << "ERROR: poll failed for " << key << ": " << n << dendl;
       err = err ? err : -EIO;
-      // after a QP reset nothing more will complete; count the rest
-      // as flushed
+      if (n != -EIO && outstanding > 0) {
+	// only -EIO says that the library reset the QP: the writes still
+	// outstanding may go on reading the staging buffer, so keep it
+	// until a later read on this thread finds them completed
+	derr << "ERROR: plan " << first << " for " << key << " failed with "
+	     << outstanding << " writes outstanding; keeping the staging "
+	     << "buffer until they complete" << dendl;
+	m_writes_inflight -= outstanding;
+	m_buffers_leaked++;
+	m_plans_failed++;
+	tls_abandoned.abandon(first, items.size(), outstanding,
+			      {buf, transient});
+	return err == -EOPNOTSUPP ? -EIO : err;
+      }
+      // on -EIO the library has reset the QP, flushing the remaining
+      // writes: nothing more of them will complete, count them as
+      // flushed
       m_writes_inflight -= outstanding;
       completed += outstanding;
       outstanding = 0;

@@ -240,3 +240,40 @@ TEST(ECGather, TheReplySaysWhenNothingWasSent)
   old.decode(oit);
   EXPECT_FALSE(old.push_declined);
 }
+
+TEST(ECGather, AV5ReplySaysNothingWasDeclined)
+{
+  // a shard from before push_declined (v5) never returns a window clean:
+  // its reply decodes as possibly having written
+  const hobject_t hoid(sobject_t("obj", CEPH_NOSNAP));
+  std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
+  pushed[hoid].emplace_back(0, 4096);
+  ceph::buffer::list p;
+  ENCODE_START(5, 2, p);
+  encode(pg_shard_t(1, shard_id_t(1)), p);
+  encode(ceph_tid_t(9), p);
+  encode(__u32(0), p);  // buffers_read, encoded by hand from v2
+  encode(std::map<hobject_t,
+		  std::map<std::string, ceph::buffer::list, std::less<>>>(),
+	 p);  // attrs_read
+  encode(std::map<hobject_t, int>(), p);  // errors
+  encode(std::map<hobject_t, ceph::buffer::list>(), p);  // omap headers
+  encode(std::map<hobject_t, std::map<std::string, ceph::buffer::list>>(),
+	 p);  // omap entries
+  encode(std::map<hobject_t, bool>(), p);  // omaps_complete
+  encode(pushed, p);
+  encode(std::optional<uint32_t>(0xfeedu), p);  // pushed_crc
+  ENCODE_FINISH(p);
+
+  ECSubReadReply got;
+  got.push_declined = true;
+  ceph::buffer::list d;
+  auto pit = std::as_const(p).begin();
+  auto dit = std::as_const(d).begin();
+  got.decode(pit, dit);
+  EXPECT_EQ(9u, got.tid);
+  EXPECT_EQ(pushed, got.pushed);
+  ASSERT_TRUE(got.pushed_crc);
+  EXPECT_EQ(0xfeedu, *got.pushed_crc);
+  EXPECT_FALSE(got.push_declined);
+}

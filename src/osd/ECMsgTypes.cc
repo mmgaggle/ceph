@@ -553,7 +553,17 @@ std::ostream &operator<<(
     }
   }
 
-  lhs << "])";
+  lhs << "]";
+  if (!rhs.pushed.empty() || rhs.push_declined) {
+    lhs << ", pushed=" << rhs.pushed.size();
+    if (rhs.pushed_crc) {
+      lhs << ", pushed_crc=0x" << std::hex << *rhs.pushed_crc << std::dec;
+    }
+    if (rhs.push_declined) {
+      lhs << ", push_declined";
+    }
+  }
+  lhs << ")";
   return lhs;
 }
 
@@ -633,6 +643,14 @@ void ECSubReadReply::dump(Formatter* f) const
 	f.dump_stream("oid") << oid;
         f.dump_unsigned("omap_complete", complete);
       });
+
+  // what a gather shard placed in the primary's window, or that it
+  // placed nothing
+  f->dump_unsigned("pushed_objects", pushed.size());
+  if (pushed_crc) {
+    f->dump_unsigned("pushed_crc", *pushed_crc);
+  }
+  f->dump_bool("push_declined", push_declined);
 }
 
 list<ECSubReadReply> ECSubReadReply::generate_test_instances()

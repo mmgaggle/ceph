@@ -791,6 +791,9 @@ void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
   const double bound = pool.get_rdma_delivery_lease() +
     pool.get_rdma_delivery_drain() - age;
   auto plan = ceph::osd::oob::linear_plan(0, all.length());
+  // from here only the executor's word returns the window clean: until
+  // it says it started nothing, a write may have gone out
+  reply->push_declined = false;
   // an executor that cannot say counts as having started
   bool started = true;
   ssize_t r = exec->execute_plan(

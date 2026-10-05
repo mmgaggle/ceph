@@ -342,12 +342,15 @@ How an OSD cuts off a write depends on the transport:
   posts no write after that point. It does not start a transfer when
   less than that is left; ``cuobj status`` counts those reads in
   ``budget_refused``. The writes of a transfer that stopped waiting
-  still complete on the cuObject channel of its op worker thread, and
-  the next transfers of that thread take their completions. Each
-  counts only its own writes toward its result. The one that takes the
-  last write of the earlier transfer gives that transfer's staging
+  stay posted on the cuObject channel of its op worker thread until
+  they complete or the DC transport gives up on them. A write posted
+  behind them would wait for them, and could land after its own
+  transfer's drain. So until then the thread starts no transfer: it
+  delivers its reads inline, with nothing staged, and ``cuobj status``
+  counts them in ``channel_busy``. The first read on the thread that
+  finds the earlier writes done gives the earlier transfer's staging
   buffer back. Until then the buffer stays held, also when no further
-  transfer runs on the thread.
+  read comes to the thread.
 * The ``tcp`` provider cannot cut off a write. Closing a socket does not
   discard the bytes that the kernel already queued on it, and the
   kernel delivers them later. The OSD logs a warning at startup. Use
@@ -1238,13 +1241,15 @@ match its shard's checksum, whichever executor lent the window. See
 writes in flight, ``buffers_leaked``, the staging buffers that plans
 which timed out with writes outstanding kept, ``buffers_reclaimed``,
 those that came back since, ``stale_completions``, the completions of
-those writes that a later plan took, and ``budget_refused``, the reads
-delivered inline, with nothing staged, because less than the DC retry
-budget was left. A kept buffer comes back when a later plan on the
-same op worker thread finds its writes completed, or when the
-transport resets the channel. A thread that runs no further plan keeps
-it, so ``buffers_leaked`` can stay above ``buffers_reclaimed`` on an
-idle OSD. ``ofi status``
+those writes that a later read took, ``channel_busy``, the reads
+delivered inline, with nothing staged, because writes of a plan that
+timed out were still posted on the thread's channel, and
+``budget_refused``, the reads delivered inline, with nothing staged,
+because less than the DC retry budget was left. A kept buffer comes
+back when a later cuObject read on the same op worker thread finds its
+writes completed, or when the transport resets the channel. A thread
+that serves no further cuObject read keeps it, so ``buffers_leaked``
+can stay above ``buffers_reclaimed`` on an idle OSD. ``ofi status``
 shows the windows lent and exhausted, ``staging_busy``, the reads
 delivered inline because no staging buffer was free, the provider and
 how the endpoint cuts off writes (``transport``), and the endpoint's
@@ -1346,12 +1351,10 @@ Limitations
 
 * An OSD writes on the op worker thread and waits for the writes to
   complete before the next operation on that thread.
-* The cuObject executor keeps one channel per op worker thread. The
-  writes of a transfer that timed out stay posted on it, and the next
-  transfers of that thread queue behind them until they complete or
-  the DC transport gives up on them. When it gives up, it flushes the
-  writes queued behind them as well: those transfers fail, and their
-  reads are delivered inline.
+* The cuObject executor keeps one channel per op worker thread. After
+  a transfer on it times out, the thread delivers its reads inline
+  until the transfer's writes complete or the DC transport gives up on
+  them, for up to the DC retry budget.
 * An OSD copies each read into a staging buffer. It does not register
   the read's own buffers.
 * Every call into one libfabric endpoint is serialized, except the

@@ -489,10 +489,21 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   if (channel == invalid_channel) {
     return -EIO;
   }
-  // writes that earlier plans on this channel left posted when they
-  // timed out may have completed since: their buffers can serve this
-  // plan
+  // A write that an earlier plan on this channel left posted when it
+  // timed out may still be retrying. One posted behind it waits for it
+  // on the DC initiator, and can still be retrying when this plan's
+  // budget runs out; this plan would hold the op worker until its
+  // deadline meanwhile. Take what completed of those writes, which also
+  // frees their buffers for this plan, and deliver this read inline
+  // while any is left.
   reap_abandoned(channel);
+  if (!tls_abandoned.empty()) {
+    dout(10) << "channel " << channel << " still has writes of "
+	     << tls_abandoned.size() << " timed-out plans posted; nothing "
+	     << "staged for " << key << dendl;
+    m_channel_busy++;
+    return -EBUSY;
+  }
   bool transient = false;
   BufEntry* buf = acquire_buffer(data.length(), &transient);
   if (!buf) {
@@ -506,9 +517,9 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   }
 
   m_plans_started++;
-  // the channel can still hold writes of those earlier plans: a
-  // completion counts toward this plan only when it carries one of the
-  // handles that this plan reserves here, write i carrying first + i
+  // no earlier plan's write is left on the channel, but a completion
+  // counts toward this plan only when it carries one of the handles
+  // that this plan reserves here, write i carrying first + i
   const uint64_t first =
     m_next_handle.fetch_add(items.size(), std::memory_order_relaxed);
   auto mine = [&](const void* handle) {
@@ -599,10 +610,6 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       m_writes_inflight -= outstanding;
       completed += outstanding;
       outstanding = 0;
-      if (n == -EIO) {
-	// the reset flushed the writes of timed-out plans too
-	drop_abandoned();
-      }
       break;
     }
     for (int i = 0; i < n; i++) {
@@ -610,12 +617,13 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
 	continue;
       }
       if (!mine(events[i].async_handle)) {
-	// a write that an earlier plan left posted when it timed out
-	dout(10) << "plan " << first << " for " << key << " took the "
-		 << "completion of write "
-		 << handle_value(events[i].async_handle)
-		 << " of a timed-out plan: wc_status=" << events[i].status
-		 << dendl;
+	// not this plan's write, nor one of a timed-out plan that is
+	// still posted: none of those is left when a plan starts
+	dout(5) << "plan " << first << " for " << key << " took the "
+		<< "completion of write "
+		<< handle_value(events[i].async_handle)
+		<< ", which it did not post: wc_status=" << events[i].status
+		<< dendl;
 	credit_abandoned(handle_value(events[i].async_handle));
 	continue;
       }
@@ -630,8 +638,8 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
     }
     if (outstanding > 0 && ceph_clock_now() > deadline) {
       // wedged transport: we cannot release the staged buffer while
-      // writes may still reference it - keep it until a later plan on
-      // this channel takes their completions. With none outstanding
+      // writes may still reference it - keep it until a later read on
+      // this thread finds them completed. With none outstanding
       // nothing reads it: the loop completes the plan or, posting
       // nothing more, fails it, and gives the buffer back.
       derr << "ERROR: plan " << first << " for " << key << " timed out with "
@@ -667,6 +675,7 @@ void OSDCuObj::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("buffers_leaked", m_buffers_leaked.load());
   f->dump_unsigned("buffers_reclaimed", m_buffers_reclaimed.load());
   f->dump_unsigned("stale_completions", m_stale_completions.load());
+  f->dump_unsigned("channel_busy", m_channel_busy.load());
   f->dump_unsigned("budget_refused", m_budget_refused.load());
   f->dump_unsigned("gather_crc_mismatch", get_gather_crc_mismatch());
 }

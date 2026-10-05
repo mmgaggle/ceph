@@ -108,14 +108,14 @@ private:
   static constexpr uint16_t invalid_channel = UINT16_MAX;
 
   /// the staging buffer of a plan that timed out with writes still
-  /// posted on this thread's channel: they complete later, during this
-  /// thread's next plans, and the buffer goes back with the last of them
+  /// posted on this thread's channel: the thread posts no other plan
+  /// until they complete, and the buffer goes back with the last of them
   struct held_t {
     BufEntry* buf = nullptr;
     bool transient = false;
   };
-  /// a completion on this thread's channel that the plan polling it
-  /// did not post: credit it to the timed-out plan that did
+  /// a completion on this thread's channel that no plan in progress
+  /// posted: credit it to the timed-out plan that did
   void credit_abandoned(uint64_t handle);
   /// the library reset this thread's channel, flushing what the
   /// timed-out plans left posted: give their buffers back
@@ -147,6 +147,7 @@ private:
   std::atomic<uint64_t> m_buffers_leaked{0};
   std::atomic<uint64_t> m_buffers_reclaimed{0};
   std::atomic<uint64_t> m_stale_completions{0};
+  std::atomic<uint64_t> m_channel_busy{0};
   std::atomic<uint64_t> m_budget_refused{0};
   /// the async handle of the next write a plan posts: unique in the
   /// process, and never 0, which reads as no event

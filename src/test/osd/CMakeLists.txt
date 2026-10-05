@@ -75,6 +75,12 @@ add_executable(unittest_oob_placement
 add_ceph_unittest(unittest_oob_placement)
 target_link_libraries(unittest_oob_placement osd global)
 
+# unittest_oob_abandoned
+add_executable(unittest_oob_abandoned
+  test_oob_abandoned.cc
+  )
+add_ceph_unittest(unittest_oob_abandoned)
+
 # unittest_ec_gather
 add_executable(unittest_ec_gather
   test_ec_gather.cc

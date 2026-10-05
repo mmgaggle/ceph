@@ -341,7 +341,13 @@ How an OSD cuts off a write depends on the transport:
   cuObject executor stops waiting that long before the deadline, and
   posts no write after that point. It does not start a transfer when
   less than that is left; ``cuobj status`` counts those reads in
-  ``budget_refused``.
+  ``budget_refused``. The writes of a transfer that stopped waiting
+  still complete on the cuObject channel of its op worker thread, and
+  the next transfers of that thread take their completions. Each
+  counts only its own writes toward its result. The one that takes the
+  last write of the earlier transfer gives that transfer's staging
+  buffer back. Until then the buffer stays held, also when no further
+  transfer runs on the thread.
 * The ``tcp`` provider cannot cut off a write. Closing a socket does not
   discard the bytes that the kernel already queued on it, and the
   kernel delivers them later. The OSD logs a warning at startup. Use
@@ -1230,9 +1236,15 @@ Both also show ``gather_crc_mismatch``: gathered shard data that did not
 match its shard's checksum, whichever executor lent the window. See
 `Gathering shard reads out of band`_. ``cuobj status`` also shows the
 writes in flight, ``buffers_leaked``, the staging buffers that plans
-which timed out with writes outstanding never gave back, and
-``budget_refused``, the reads delivered inline, with nothing staged,
-because less than the DC retry budget was left. ``ofi status``
+which timed out with writes outstanding kept, ``buffers_reclaimed``,
+those that came back since, ``stale_completions``, the completions of
+those writes that a later plan took, and ``budget_refused``, the reads
+delivered inline, with nothing staged, because less than the DC retry
+budget was left. A kept buffer comes back when a later plan on the
+same op worker thread finds its writes completed, or when the
+transport resets the channel. A thread that runs no further plan keeps
+it, so ``buffers_leaked`` can stay above ``buffers_reclaimed`` on an
+idle OSD. ``ofi status``
 shows the windows lent and exhausted, ``staging_busy``, the reads
 delivered inline because no staging buffer was free, the provider and
 how the endpoint cuts off writes (``transport``), and the endpoint's
@@ -1303,6 +1315,9 @@ Testing
 * ``unittest_ec_gather`` tests the check of gathered shard data against
   its shard's checksum.
 * ``unittest_oob_placement`` tests placement plans.
+* ``unittest_oob_abandoned`` tests how the cuObject executor counts a
+  completion against the plan that posted it, and when it gives the
+  staging buffer of a plan that timed out back.
 * ``unittest_rdma_token`` tests token parsing and transport lists.
 * ``unittest_crc64nvme`` tests CRC-64/NVME against the NVM Command Set
   test cases, and checks that its implementations agree.
@@ -1331,6 +1346,12 @@ Limitations
 
 * An OSD writes on the op worker thread and waits for the writes to
   complete before the next operation on that thread.
+* The cuObject executor keeps one channel per op worker thread. The
+  writes of a transfer that timed out stay posted on it, and the next
+  transfers of that thread queue behind them until they complete or
+  the DC transport gives up on them. When it gives up, it flushes the
+  writes queued behind them as well: those transfers fail, and their
+  reads are delivered inline.
 * An OSD copies each read into a staging buffer. It does not register
   the read's own buffers.
 * Every call into one libfabric endpoint is serialized, except the

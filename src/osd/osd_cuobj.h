@@ -13,6 +13,7 @@
 
 #include "include/buffer.h"
 #include "include/common_fwd.h"
+#include "osd/oob_abandoned.h"
 #include "osd/oob_executor.h"
 #include "osd/oob_placement.h"
 
@@ -33,8 +34,8 @@ class OSDDcTarget;
  *
  * Thread safety: rdma_write() may be called concurrently from any
  * number of op worker threads. Each thread lazily allocates its own
- * cuObject channel (DCI); buffer-pool slots are claimed with atomic
- * compare-exchange.
+ * cuObject channel (DCI), and only that thread posts to it and polls
+ * it; buffer-pool slots are claimed with atomic compare-exchange.
  */
 class OSDCuObj : public OSDOobExecutor {
 public:
@@ -106,6 +107,23 @@ private:
   uint16_t get_channel_id();
   static constexpr uint16_t invalid_channel = UINT16_MAX;
 
+  /// the staging buffer of a plan that timed out with writes still
+  /// posted on this thread's channel: they complete later, during this
+  /// thread's next plans, and the buffer goes back with the last of them
+  struct held_t {
+    BufEntry* buf = nullptr;
+    bool transient = false;
+  };
+  /// a completion on this thread's channel that the plan polling it
+  /// did not post: credit it to the timed-out plan that did
+  void credit_abandoned(uint64_t handle);
+  /// the library reset this thread's channel, flushing what the
+  /// timed-out plans left posted: give their buffers back
+  void drop_abandoned();
+  /// take, without waiting, the completions that timed-out plans left
+  /// on the channel, before posting on it again
+  void reap_abandoned(uint16_t channel);
+
   CephContext* m_cct;
   std::unique_ptr<cuObjServer> m_server;
 
@@ -127,8 +145,14 @@ private:
   std::atomic<uint64_t> m_bytes_pushed{0};
   std::atomic<uint32_t> m_writes_inflight{0};
   std::atomic<uint64_t> m_buffers_leaked{0};
+  std::atomic<uint64_t> m_buffers_reclaimed{0};
+  std::atomic<uint64_t> m_stale_completions{0};
   std::atomic<uint64_t> m_budget_refused{0};
+  /// the async handle of the next write a plan posts: unique in the
+  /// process, and never 0, which reads as no event
+  std::atomic<uint64_t> m_next_handle{1};
 
   static thread_local uint16_t tls_channel_id;
   static thread_local bool tls_channel_valid;
+  static thread_local ceph::osd::oob::abandoned_plans<held_t> tls_abandoned;
 };

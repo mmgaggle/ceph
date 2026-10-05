@@ -28,10 +28,33 @@ namespace {
 /// stops waiting for it: the RC/DC retry budget at the library's
 /// defaults
 constexpr std::chrono::milliseconds CUOBJ_RETRY_BUDGET{2000};
+
+/// writes posted at once, and events taken per poll() (the library
+/// caps poll() at 16 events and documents no larger per-channel bound)
+constexpr int POLL_BATCH = 16;
+
+/// A write's async handle is a number unique in the process, not a
+/// pointer into its plan: a write that a plan left posted when it timed
+/// out completes during a later plan on the channel, and its handle
+/// must still name the plan that posted it, not point at memory that
+/// may since be the later plan's own.
+static_assert(sizeof(uintptr_t) >= sizeof(uint64_t));
+
+void* as_handle(uint64_t h)
+{
+  return reinterpret_cast<void*>(static_cast<uintptr_t>(h));
+}
+
+uint64_t handle_value(const void* handle)
+{
+  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+}
 }
 
 thread_local uint16_t OSDCuObj::tls_channel_id = 0;
 thread_local bool OSDCuObj::tls_channel_valid = false;
+thread_local ceph::osd::oob::abandoned_plans<OSDCuObj::held_t>
+  OSDCuObj::tls_abandoned;
 
 // per-call limit of the cuObj API
 static constexpr size_t MAX_RDMA_OP_SIZE = 1ULL << 30;
@@ -260,6 +283,67 @@ void OSDCuObj::release_buffer(BufEntry* buf, bool transient)
   }
 }
 
+void OSDCuObj::credit_abandoned(uint64_t handle)
+{
+  using credit_t = ceph::osd::oob::abandoned_plans<held_t>::credit_t;
+  m_stale_completions++;
+  held_t held;
+  switch (tls_abandoned.credit(handle, &held)) {
+  case credit_t::unknown:
+    // its plan's buffer went back when the channel was reset, or the
+    // library returned a write that this channel did not post
+    dout(5) << "completion of write " << handle << " that no plan on "
+	    << "this channel waits for" << dendl;
+    break;
+  case credit_t::counted:
+    break;
+  case credit_t::last:
+    // the plan's last write is done with its buffer
+    dout(10) << "timed-out plan of write " << handle << " completed its "
+	     << "last write; staging buffer reclaimed" << dendl;
+    release_buffer(held.buf, held.transient);
+    m_buffers_reclaimed++;
+    break;
+  }
+}
+
+void OSDCuObj::drop_abandoned()
+{
+  for (const auto& held : tls_abandoned.drop()) {
+    release_buffer(held.buf, held.transient);
+    m_buffers_reclaimed++;
+  }
+}
+
+void OSDCuObj::reap_abandoned(uint16_t channel)
+{
+  if (tls_abandoned.empty()) {
+    return;
+  }
+  cuObjAsyncEvent_t events[POLL_BATCH];
+  for (auto& e : events) {
+    e.async_handle = nullptr;
+  }
+  int n = m_server->poll(events, POLL_BATCH, channel);
+  // a failed poll returns no completion count: scan for the events
+  // that were filled, as execute_plan does
+  for (const auto& e : events) {
+    if (e.async_handle) {
+      credit_abandoned(handle_value(e.async_handle));
+    }
+  }
+  if (n == -EIO) {
+    // a write that a timed-out plan left posted failed, and the library
+    // reset the QP: nothing more of those plans completes
+    dout(5) << "channel " << channel << " was reset with writes of "
+	    << tls_abandoned.size() << " timed-out plans posted; "
+	    << "reclaiming their staging buffers" << dendl;
+    drop_abandoned();
+  } else if (n < 0) {
+    dout(5) << "poll of channel " << channel << " failed: " << n << dendl;
+  }
+}
+
 ssize_t OSDCuObj::rdma_write(const std::string& key,
 			     const ceph::buffer::list& bl,
 			     const std::string& token,
@@ -286,6 +370,15 @@ ssize_t OSDCuObj::rdma_write(const std::string& key,
   uint16_t channel = get_channel_id();
   if (channel == invalid_channel) {
     return -EIO;
+  }
+  // the library does not document whether a synchronous call tells its
+  // own completion from one of a write that a timed-out plan left
+  // posted on the channel: do not post behind such a write
+  reap_abandoned(channel);
+  if (!tls_abandoned.empty()) {
+    dout(10) << "channel " << channel << " still has writes of timed-out "
+	     << "plans posted; not writing " << key << dendl;
+    return -EBUSY;
   }
   bool transient = false;
   BufEntry* buf = acquire_buffer(len, &transient);
@@ -396,6 +489,10 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   if (channel == invalid_channel) {
     return -EIO;
   }
+  // writes that earlier plans on this channel left posted when they
+  // timed out may have completed since: their buffers can serve this
+  // plan
+  reap_abandoned(channel);
   bool transient = false;
   BufEntry* buf = acquire_buffer(data.length(), &transient);
   if (!buf) {
@@ -409,13 +506,21 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
   }
 
   m_plans_started++;
-  dout(20) << "executing plan for " << key << ": " << items.size()
-	   << " writes, " << total << " bytes, channel " << channel << dendl;
+  // the channel can still hold writes of those earlier plans: a
+  // completion counts toward this plan only when it carries one of the
+  // handles that this plan reserves here, write i carrying first + i
+  const uint64_t first =
+    m_next_handle.fetch_add(items.size(), std::memory_order_relaxed);
+  auto mine = [&](const void* handle) {
+    return ceph::osd::oob::owns_handle(first, items.size(),
+				       handle_value(handle));
+  };
+  dout(20) << "executing plan " << first << " for " << key << ": "
+	   << items.size() << " writes, " << total << " bytes, channel "
+	   << channel << dendl;
 
   // batched async submission: at most POLL_BATCH outstanding, polled
-  // to completion on the same channel (the library caps poll() at 16
-  // events and documents no larger per-channel bound)
-  constexpr int POLL_BATCH = 16;
+  // to completion on the same channel
   size_t next = 0;
   size_t outstanding = 0;
   size_t completed = 0;
@@ -436,7 +541,7 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       }
       ssize_t r = m_server->handleGetObject(
 	key, buf->handle, window->addr + w.remote_ofs, w.len, token, channel,
-	w.local_ofs, nullptr, /*async_handle=*/&items[next]);
+	w.local_ofs, nullptr, /*async_handle=*/as_handle(first + next));
       if (r < 0) {
 	derr << "ERROR: async handleGetObject submission failed for " << key
 	     << ": " << r << dendl;
@@ -459,11 +564,14 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       // nothing completed yet; don't hot-spin the op worker
       std::this_thread::sleep_for(std::chrono::microseconds(5));
       if (ceph_clock_now() > deadline) {
-	derr << "ERROR: plan for " << key << " timed out with " << outstanding
-	     << " writes outstanding; leaking the staging buffer" << dendl;
+	derr << "ERROR: plan " << first << " for " << key << " timed out with "
+	     << outstanding << " writes outstanding; keeping the staging "
+	     << "buffer until they complete" << dendl;
 	m_writes_inflight -= outstanding;
 	m_buffers_leaked++;
 	m_plans_failed++;
+	tls_abandoned.abandon(first, items.size(), outstanding,
+			      {buf, transient});
 	return -ETIMEDOUT;
       }
       continue;
@@ -473,11 +581,16 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       // has reset the QP, flushing the remaining writes; scan for the
       // events that were filled, then abandon the plan
       for (const auto& e : events) {
-	if (e.async_handle) {
-	  outstanding--;
-	  m_writes_inflight--;
-	  completed++;
+	if (!e.async_handle) {
+	  continue;
 	}
+	if (!mine(e.async_handle)) {
+	  credit_abandoned(handle_value(e.async_handle));
+	  continue;
+	}
+	outstanding--;
+	m_writes_inflight--;
+	completed++;
       }
       derr << "ERROR: poll failed for " << key << ": " << n << dendl;
       err = err ? err : -EIO;
@@ -486,10 +599,24 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       m_writes_inflight -= outstanding;
       completed += outstanding;
       outstanding = 0;
+      if (n == -EIO) {
+	// the reset flushed the writes of timed-out plans too
+	drop_abandoned();
+      }
       break;
     }
     for (int i = 0; i < n; i++) {
       if (!events[i].async_handle) {
+	continue;
+      }
+      if (!mine(events[i].async_handle)) {
+	// a write that an earlier plan left posted when it timed out
+	dout(10) << "plan " << first << " for " << key << " took the "
+		 << "completion of write "
+		 << handle_value(events[i].async_handle)
+		 << " of a timed-out plan: wc_status=" << events[i].status
+		 << dendl;
+	credit_abandoned(handle_value(events[i].async_handle));
 	continue;
       }
       outstanding--;
@@ -503,14 +630,18 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
     }
     if (outstanding > 0 && ceph_clock_now() > deadline) {
       // wedged transport: we cannot release the staged buffer while
-      // writes may still reference it - leak it deliberately. With none
-      // outstanding nothing reads it: the loop completes the plan or,
-      // posting nothing more, fails it, and gives the buffer back.
-      derr << "ERROR: plan for " << key << " timed out with " << outstanding
-	   << " writes outstanding; leaking the staging buffer" << dendl;
+      // writes may still reference it - keep it until a later plan on
+      // this channel takes their completions. With none outstanding
+      // nothing reads it: the loop completes the plan or, posting
+      // nothing more, fails it, and gives the buffer back.
+      derr << "ERROR: plan " << first << " for " << key << " timed out with "
+	   << outstanding << " writes outstanding; keeping the staging "
+	   << "buffer until they complete" << dendl;
       m_writes_inflight -= outstanding;
       m_buffers_leaked++;
       m_plans_failed++;
+      tls_abandoned.abandon(first, items.size(), outstanding,
+			    {buf, transient});
       return -ETIMEDOUT;
     }
   }
@@ -534,6 +665,8 @@ void OSDCuObj::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("bytes_pushed", m_bytes_pushed.load());
   f->dump_unsigned("writes_inflight", m_writes_inflight.load());
   f->dump_unsigned("buffers_leaked", m_buffers_leaked.load());
+  f->dump_unsigned("buffers_reclaimed", m_buffers_reclaimed.load());
+  f->dump_unsigned("stale_completions", m_stale_completions.load());
   f->dump_unsigned("budget_refused", m_budget_refused.load());
   f->dump_unsigned("gather_crc_mismatch", get_gather_crc_mismatch());
 }

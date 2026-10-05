@@ -70,7 +70,9 @@ public:
   // one's included, is delivered inline meanwhile, and declined, a
   // shard's push is delivered inline, a gather lends no window, so that
   // its shards reply inline, and a returned window gets its new key from
-  // a later gather.
+  // a later gather. The insert first lets the shards' pushes into
+  // windows lent before it land, so that they do not wait for it
+  // (ceph::ofi::config_t::lent_wait).
   ssize_t execute_plan(const std::string& key,
 		       const std::string& token,
 		       const ceph::buffer::list& data,

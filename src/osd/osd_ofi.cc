@@ -12,6 +12,7 @@
 #include "common/errno.h"
 #include "common/Formatter.h"
 #include "common/ofi_rma.h"
+#include "osd/osd_types.h"
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_osd
@@ -44,6 +45,14 @@ int OSDOfi::init(bool lend_windows)
   cfg.late_tolerance =
     conf.get_val<std::chrono::milliseconds>("osd_oob_cutoff_late_tolerance");
   cfg.late_fail_closed = conf.get_val<bool>("osd_oob_cutoff_late_fail_closed");
+  // A FI_THREAD_DOMAIN provider polls nothing while it adds a client:
+  // the shards' pushes into gather windows lent before land first, so
+  // that none waits for the insert. A shard starts its push within the
+  // pool's lease and ends it within its drain; a pool that sets them
+  // longer than the defaults may still have one wait.
+  cfg.lent_wait = std::chrono::milliseconds(static_cast<int64_t>(
+    (pg_pool_t::DEFAULT_RDMA_DELIVERY_LEASE +
+     pg_pool_t::DEFAULT_RDMA_DELIVERY_DRAIN) * 1000.0));
   cfg.cutoff_close_hook = [cct = cct] {
     return cct->_conf.get_val<bool>("osd_ofi_inject_cutoff_failure") ?
       -EIO : 0;

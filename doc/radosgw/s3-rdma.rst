@@ -904,7 +904,8 @@ inserts`` or ``peer inserts pause writes``.
 A provider that offers only ``FI_THREAD_DOMAIN`` allows no other call
 during an insert, and adds one peer at a time. The insert first waits
 until the writes in flight are done, so that none of them misses its
-cut-off, and then holds the endpoint until the provider returns. The
+cut-off, and until the gather windows lent before it are back (see
+below), and then holds the endpoint until the provider returns. The
 endpoint is quiet from when the insert starts to wait until it is
 done. An op thread waits for a quiet endpoint at most 10 ms, also when
 the insert is for its own read's client, and not at all once the
@@ -922,11 +923,18 @@ endpoint, so that the operations queued behind it do not wait too:
   it.
 
 A quiet spell shorter than 10 ms, as when ``tcp`` adds a peer while no
-write is in flight, refuses nothing. Inserts queued back to back quiet
-the endpoint one after another. The progress thread that places data
-in gather windows waits for the insert, so a shard pushing into a
-window lent before it waits too, within its budget, holding its op
-thread: a push that runs out of budget is cut off, and the shard
+write is in flight and no gather window is lent, refuses nothing.
+Inserts queued back to back quiet the endpoint one after another.
+
+The progress thread that places data in gather windows cannot poll
+during the insert, so a shard pushing into a window then would wait
+for the insert, holding its op thread. The insert therefore first
+waits for the windows lent before it, polling meanwhile, so that the
+shards' pushes into them land: until the gathers return them, which
+takes about as long as a gather, or until 8 s, the default lease plus
+drain, after a window was lent. A shard whose push comes later still,
+in a pool with a longer lease or drain, waits for the insert within
+its budget: a push that runs out of budget is cut off, and the shard
 replies inline.
 
 Clients choose their endpoint names, so the executor bounds what they
@@ -1366,7 +1374,8 @@ Testing
   the ``tcp`` and ``shm`` providers, slow and refused first contacts,
   that slow first contacts on a ``FI_THREAD_DOMAIN`` endpoint hold no
   op thread longer than the insert wait, whether it lends, returns or
-  reads a window or writes to a known or a new peer, eviction,
+  reads a window or writes to a known or a new peer, that their inserts
+  let pushes into windows lent before them land first, eviction,
   cut-offs that fail or end late, within and beyond the tolerance,
   writers left idle near their deadlines, late writes cancelled alone
   (over ``tcp``, with a test hook that stands in for a provider whose

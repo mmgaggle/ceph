@@ -282,7 +282,9 @@ The gateway tries these modes in order, for each request:
    defines this value as the signal to fall back to HTTP.
 
 When the data went out of band, the response carries
-``x-amz-rdma-reply: 200`` and ``x-amz-rdma-bytes-transferred``.
+``x-amz-rdma-reply`` and ``x-amz-rdma-bytes-transferred``. The reply
+has the status of the response itself: ``206`` for a range request, and
+``200`` otherwise.
 
 The gateway limits how much data the OSDs aim at one client at a time
 with ``rgw_get_obj_window_size`` (default 16 MiB).

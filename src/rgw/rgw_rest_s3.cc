@@ -524,7 +524,10 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
 
   if (rdma_mode != RdmaMode::NONE) {
     dump_content_length(s, 0);
-    dump_header(s, "x-amz-rdma-reply", "200");
+    // the status of the response: 206 for a range request, so that a
+    // client finds the same status in the reply and in the status line
+    dump_header(s, "x-amz-rdma-reply",
+                (partial_content && !custom_http_ret) ? "206" : "200");
     dump_header(s, "x-amz-rdma-bytes-transferred", total_len);
   } else {
     if (!rdma_token.empty()) {

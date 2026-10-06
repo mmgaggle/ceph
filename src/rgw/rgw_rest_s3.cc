@@ -19,6 +19,7 @@
 #include "common/errno.h"
 #include "auth/Crypto.h"
 #include "rgw_cksum.h"
+#include "rgw_crc_digest.h"
 #include "rgw_common.h"
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/replace.hpp>
@@ -418,6 +419,16 @@ static std::string content_encoding_without_aws_chunked(std::string_view value)
   return result;
 }
 
+// S3's rendering of a CRC-64/NVME: the base64 of its big-endian bytes
+static std::string armor_crc64nvme(uint64_t canonical)
+{
+  uint64_t swapped = rgw::digest::byteswap(canonical);
+  rgw::cksum::Cksum c(rgw::cksum::Type::crc64nvme,
+                      reinterpret_cast<char*>(&swapped),
+                      rgw::cksum::Cksum::CtorStyle::raw);
+  return c.to_armor();
+}
+
 int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
 					      off_t bl_len)
 {
@@ -526,6 +537,15 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
     dump_content_length(s, 0);
     dump_header(s, "x-amz-rdma-reply", "200");
     dump_header(s, "x-amz-rdma-bytes-transferred", total_len);
+    if (rdma_crc64) {
+      // the CRC-64/NVME of exactly the bytes delivered, folded from the
+      // OSDs' own values (rgw_rdma_crc64nvme), as RC clients get it in
+      // their FINAL answer. Unlike S3's checksum headers it also covers a
+      // ranged GET, and the client can check it against its own buffer,
+      // which covers the last write into client memory too.
+      dump_header(s, "x-amz-rdma-checksum",
+                  "CRC64NVME " + armor_crc64nvme(*rdma_crc64));
+    }
   } else {
     if (!rdma_token.empty()) {
       // token sent but RDMA is unavailable: valid fallback per the

@@ -1091,10 +1091,14 @@ protection. Ranges with gaps between them do not fold into a
 whole-object checksum, so a sparse read with several extents is not
 compared.
 
-RC clients get a checksum of the delivered bytes in the READY answer
-(``X-Amz-Rdma-Checksum``), when ``rgw_rdma_crc64nvme`` is on. An RC
-client can compare that value with the bytes in its own buffer, which
-also covers the final write.
+Clients get a checksum of the delivered bytes when
+``rgw_rdma_crc64nvme`` is on. An OSD-direct GET answers with
+``x-amz-rdma-checksum: CRC64NVME <base64>``, the folded value of the
+OSDs. RC clients get the same header in the READY answer. The value
+covers exactly the bytes delivered, so it also covers a ranged GET,
+which the S3 checksum headers do not. A client can compare it with the
+bytes in its own buffer, which also covers the final write. A GET that
+falls back to the HTTP body carries no such header.
 
 Configuration reference
 =======================

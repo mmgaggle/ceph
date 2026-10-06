@@ -88,3 +88,6 @@
 [submodule "src/librdkafka"]
 	path = src/librdkafka
 	url = https://github.com/confluentinc/librdkafka.git
+[submodule "src/ofi-rma"]
+	path = src/ofi-rma
+	url = https://github.com/mmgaggle/ofi-rma.git

@@ -587,6 +587,28 @@ if(WITH_JAEGER)
 endif()
 
 CHECK_C_COMPILER_FLAG("-fvar-tracking-assignments" HAS_VTA)
+# ofi-rma: libfabric RMA for out-of-band delivery, in a library of its
+# own so that clients can lend windows without building Ceph. Its header
+# is always on the include path, since common's token code reads the
+# libfabric token tag from it; the library itself is built only
+# WITH_OOB_OFI.
+option(WITH_SYSTEM_OFI_RMA "build against an installed ofi-rma" OFF)
+if(WITH_SYSTEM_OFI_RMA)
+  find_package(ofi_rma 0.1 REQUIRED)
+  get_target_property(OFI_RMA_INCLUDE_DIRS ofi_rma::ofi_rma
+    INTERFACE_INCLUDE_DIRECTORIES)
+  include_directories(SYSTEM ${OFI_RMA_INCLUDE_DIRS})
+  if(WITH_OOB_OFI)
+    add_library(ofi_rma INTERFACE)
+    target_link_libraries(ofi_rma INTERFACE ofi_rma::ofi_rma)
+  endif()
+else()
+  include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/src/ofi-rma/include")
+  if(WITH_OOB_OFI)
+    add_subdirectory(ofi-rma)
+  endif()
+endif()
+
 add_subdirectory(auth)
 add_subdirectory(common)
 add_subdirectory(crush)

@@ -15,7 +15,7 @@
 #include "include/common_fwd.h"
 #include "osd/oob_executor.h"
 
-namespace ceph::ofi { class Endpoint; class WindowPool; }
+#include "common/ofi_rma_fwd.h"
 
 /**
  * Out-of-band delivery over libfabric.

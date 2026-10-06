@@ -865,6 +865,12 @@ agree.
 libfabric
 ---------
 
+The libfabric code is the ofi-rma library, in ``src/ofi-rma``. It
+depends only on libfabric, so a client can link it to lend windows
+without building Ceph. It can also lend windows in GPU memory, through
+libfabric's ``FI_HMEM``. Set ``WITH_SYSTEM_OFI_RMA`` to build against an
+installed ofi-rma instead of the submodule.
+
 The owner of a window sends this token::
 
   <base hex>:<size hex>:ofi1:<provider>:<endpoint name hex>:<memory key hex>

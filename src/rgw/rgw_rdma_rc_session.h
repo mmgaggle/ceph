@@ -30,7 +30,7 @@
 #include "rgw_rdma_rc_wire.h"
 
 namespace rgw::rdma::dc { class Target; }
-namespace ceph::ofi { class Endpoint; }
+#include "common/ofi_rma_fwd.h"
 
 /**
  * hipobj-rc-v2 session service.

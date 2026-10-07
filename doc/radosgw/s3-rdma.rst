@@ -1081,6 +1081,16 @@ The gateway's relay windows need ``ofi`` in ``rgw_rdma_transports``,
 ``rgw_ofi_provider`` set to ``uet``, an interface in
 ``rgw_ofi_domain``, and ``CAP_NET_RAW``.
 
+An OSD-direct PUT (see `OSD-direct PUT`_) needs RMA reads. The OSD asks
+for them with ``osd_oob_pull``, and the wrapper must offer
+``FI_READ`` and ``FI_REMOTE_READ``. Under RUDI, a read is idempotent at
+the client, so it goes over RUDI too: each request packet asks for one
+packet of data, which the client sends back in its answer, keeping no
+state for the OSD. When the wrapper offers ``FI_HMEM``, the client can
+lend a GPU buffer, for GETs and PUTs alike. The reference provider
+copies each packet with the CPU, so it can do that only for GPU memory
+that the CPU can address, such as an APU's.
+
 Give every UET interface the same MTU, and use jumbo frames where the
 network allows them. The provider sizes each packet's payload from the
 interface MTU: about 8 KiB at an MTU of 9000, against 1 KiB at 1500. UET

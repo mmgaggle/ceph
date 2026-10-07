@@ -58,12 +58,10 @@ std::vector<std::string> parse_transport_list(std::string_view list);
  * Per-op out-of-band delivery descriptor carried on a MOSDOp.
  *
  * The descriptor names a client memory window and an offset into it.
- * It does not name a direction: the fields say where the client's
- * bytes live, not who moves them, and the encoding is versioned so a
- * direction that needs more can add it. Today the only implemented
- * direction is read delivery, described below; an OSD pulling its
- * share of a write payload out of client memory would address it the
- * same way.
+ * The fields say where the client's bytes live; FLAG_PULL says who
+ * moves them. Without it a descriptor asks for read delivery,
+ * described below. With it, on a WRITE or WRITEFULL op, the primary
+ * pulls the op's payload out of the window instead (see FLAG_PULL).
  *
  * The MOSDOp carries one descriptor per op (a vector aligned with the
  * ops, mirroring the reply's per-op oob results); an entry with an
@@ -109,6 +107,31 @@ struct delivery_t {
   static constexpr uint32_t FLAG_PRIOR_SETTLED = 1u << 1;
   /// flag bits the OSD understands; unknown bits deliver inline
   static constexpr uint32_t KNOWN_FLAGS = FLAG_CRC64NVME | FLAG_PRIOR_SETTLED;
+  /**
+   * The op is a WRITE or WRITEFULL that carries no data: its extent's
+   * length bytes are in the client window, starting at the token's
+   * base plus base_offset, and the primary RDMA-reads them before it
+   * runs the op, as an OSD-direct PUT does. The op then runs as if the
+   * client had sent the bytes: the primary encodes an erasure-coded
+   * write and sends each shard to its OSD, or a replicated write to the
+   * replicas, as usual. With FLAG_CRC64NVME the reply's oob result
+   * carries the CRC-64/NVME of the pulled bytes.
+   *
+   * A pull is not advisory: the op has no other data. An OSD that
+   * cannot pull fails the op (-EOPNOTSUPP when it has no way to read
+   * the window, -EIO when the read failed), and an OSD that predates
+   * pulls fails it for its missing data (-EINVAL). Either way nothing
+   * is written. The window must stay valid, and unchanged, until the
+   * op's reply arrives.
+   */
+  static constexpr uint32_t FLAG_PULL = 1u << 2;
+  /// flag bits an OSD that pulls understands on a pull; others fail it
+  static constexpr uint32_t PULL_KNOWN_FLAGS = FLAG_CRC64NVME | FLAG_PULL |
+    FLAG_PRIOR_SETTLED;
+
+  bool is_pull() const {
+    return flags & FLAG_PULL;
+  }
 
   std::string token;      ///< opaque cuObject RDMA descriptor
   uint64_t base_offset = 0; ///< client-window offset for the op's first byte

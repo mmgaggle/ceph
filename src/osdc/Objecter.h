@@ -650,6 +650,19 @@ struct ObjectOperation {
   void write_full(ceph::buffer::list&& bl) {
     add_data(CEPH_OSD_OP_WRITEFULL, 0, bl.length(), bl);
   }
+  /// a write of len bytes that the primary pulls out of a client window
+  /// rather than takes from the op: follow it with set_rdma_delivery()
+  /// and delivery_t::FLAG_PULL (see common/rdma_token.h)
+  void write_pulled(uint64_t off, uint64_t len) {
+    OSDOp& o = add_op(CEPH_OSD_OP_WRITE);
+    o.op.extent.offset = off;
+    o.op.extent.length = len;
+  }
+  void write_full_pulled(uint64_t len) {
+    OSDOp& o = add_op(CEPH_OSD_OP_WRITEFULL);
+    o.op.extent.offset = 0;
+    o.op.extent.length = len;
+  }
   void writesame(uint64_t off, uint64_t write_len, ceph::buffer::list& bl) {
     add_writesame(CEPH_OSD_OP_WRITESAME, off, write_len, bl);
   }
@@ -3177,6 +3190,15 @@ public:
       }, consigned);
   }
 
+  /// move op's out-of-band descriptors, result slots and result handlers
+  /// into o, for every op builder: a read's delivery and a write's pull
+  /// alike
+  static void take_rdma(Op* o, ObjectOperation& op) {
+    o->rdma_delivery.swap(op.rdma_delivery);
+    o->rdma_oob_result.swap(op.rdma_oob_result);
+    o->rdma_oob_handler.swap(op.rdma_oob_handler);
+  }
+
   // mid-level helpers
   Op *prepare_mutate_op(
     const object_t& oid, const object_locator_t& oloc,
@@ -3196,6 +3218,9 @@ public:
     o->out_bl.swap(op.out_bl);
     o->out_handler.swap(op.out_handler);
     o->out_ec.swap(op.out_ec);
+    // a write whose payload the primary pulls out of client memory
+    // carries its descriptor, and takes the primary's report
+    take_rdma(o, op);
     o->reqid = reqid;
     op.clear();
     return o;
@@ -3229,6 +3254,7 @@ public:
     o->out_handler.swap(op.out_handler);
     o->out_rval.swap(op.out_rval);
     o->out_ec.swap(op.out_ec);
+    take_rdma(o, op);
     o->reqid = reqid;
     op.clear();
     op_submit(o);
@@ -3254,9 +3280,7 @@ public:
     o->out_handler.swap(op.out_handler);
     o->out_rval.swap(op.out_rval);
     o->out_ec.swap(op.out_ec);
-    o->rdma_delivery.swap(op.rdma_delivery);
-    o->rdma_oob_result.swap(op.rdma_oob_result);
-    o->rdma_oob_handler.swap(op.rdma_oob_handler);
+    take_rdma(o, op);
     op.clear();
     return o;
   }
@@ -3296,9 +3320,7 @@ public:
     o->out_handler.swap(op.out_handler);
     o->out_rval.swap(op.out_rval);
     o->out_ec.swap(op.out_ec);
-    o->rdma_delivery.swap(op.rdma_delivery);
-    o->rdma_oob_result.swap(op.rdma_oob_result);
-    o->rdma_oob_handler.swap(op.rdma_oob_handler);
+    take_rdma(o, op);
     if (features)
       o->features = features;
     op.clear();

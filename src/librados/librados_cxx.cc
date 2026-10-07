@@ -517,6 +517,54 @@ void librados::ObjectWriteOperation::write_full(const bufferlist& bl)
   o->write_full(c);
 }
 
+namespace {
+/// the wire result, as a librados caller sees it
+void copy_rdma_result(const ceph::rdma::oob_result_t& r,
+		      librados::ObjectOperation::rdma_delivery_result* out)
+{
+  out->bytes = r.bytes;
+  out->crc64 = r.crc64;
+  out->flags = r.flags;
+  out->ranges.clear();
+  out->ranges.reserve(r.ranges.size());
+  for (const auto& x : r.ranges) {
+    out->ranges.push_back({x.ofs, x.len, x.crc64});
+  }
+}
+} // anonymous namespace
+
+void librados::ObjectWriteOperation::write_full_pulled(
+    uint64_t len, const std::string& token, uint64_t base_offset,
+    uint32_t flags, rdma_delivery_result *result)
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  o->write_full_pulled(len);
+  o->set_rdma_delivery(token, base_offset,
+		       flags | ceph::rdma::delivery_t::FLAG_PULL,
+		       [result](const ceph::rdma::oob_result_t& r) {
+			 if (result) {
+			   copy_rdma_result(r, result);
+			 }
+		       });
+}
+
+void librados::ObjectWriteOperation::write_pulled(
+    uint64_t off, uint64_t len, const std::string& token,
+    uint64_t base_offset, uint32_t flags, rdma_delivery_result *result)
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  o->write_pulled(off, len);
+  o->set_rdma_delivery(token, base_offset,
+		       flags | ceph::rdma::delivery_t::FLAG_PULL,
+		       [result](const ceph::rdma::oob_result_t& r) {
+			 if (result) {
+			   copy_rdma_result(r, result);
+			 }
+		       });
+}
+
 void librados::ObjectWriteOperation::writesame(uint64_t off, uint64_t write_len,
 					       const bufferlist& bl)
 {

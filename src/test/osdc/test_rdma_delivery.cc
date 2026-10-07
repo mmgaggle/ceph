@@ -317,6 +317,50 @@ TEST(RdmaDelivery, ResultReachesEitherForm)
   o->put();
 }
 
+// A write whose payload the primary pulls out of client memory carries no
+// data, only its length and a pull descriptor, and the builders of write
+// ops hand its descriptor and result handler to the Op as read builders
+// do. They once did not: the OSD then saw a write without data, and
+// failed it.
+TEST(RdmaDelivery, PulledWriteCarriesItsDescriptor)
+{
+  ::ObjectOperation op;
+  op.create(false);
+  op.write_full_pulled(4 << 20);
+  std::optional<ceph::rdma::oob_result_t> got;
+  op.set_rdma_delivery("t", 8 << 20,
+                       ceph::rdma::delivery_t::FLAG_PULL |
+                       ceph::rdma::delivery_t::FLAG_CRC64NVME,
+                       [&](const ceph::rdma::oob_result_t& r) { got = r; });
+  ASSERT_EQ(2u, op.ops.size());
+  EXPECT_EQ(CEPH_OSD_OP_WRITEFULL, op.ops[1].op.op);
+  EXPECT_EQ(uint64_t(4 << 20), op.ops[1].op.extent.length);
+  EXPECT_EQ(0u, op.ops[1].indata.length());
+
+  auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                             std::move(op.ops), CEPH_OSD_FLAG_WRITE,
+                             (Context*)nullptr, nullptr);
+  Objecter::take_rdma(o, op);
+  ASSERT_TRUE(o->has_rdma_delivery());
+  EXPECT_TRUE(o->rdma_delivery[0].empty());
+  EXPECT_TRUE(o->rdma_delivery[1].is_pull());
+  EXPECT_EQ(uint64_t(8 << 20), o->rdma_delivery[1].base_offset);
+  EXPECT_FALSE(op.has_rdma_delivery());
+
+  // the pulled bytes and their checksum reach the caller
+  EXPECT_TRUE(Objecter::rdma_oob_wanted(o, 1));
+  ceph::rdma::oob_result_t r;
+  r.bytes = 4 << 20;
+  r.crc64 = 0xabcdef;
+  r.flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME |
+            ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE;
+  Objecter::deliver_rdma_oob_result(o, 1, r);
+  ASSERT_TRUE(got.has_value());
+  EXPECT_EQ(uint64_t(4 << 20), got->bytes);
+  EXPECT_EQ(0xabcdefu, got->crc64);
+  o->put();
+}
+
 // A result for an op sent more than once is marked resent: an earlier
 // attempt may have started a transfer the reply knows nothing of, and a
 // caller must then fence its window. One sent once is not.

@@ -429,6 +429,39 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
 			       std::chrono::milliseconds budget,
 			       bool* started)
 {
+  return run_plan(false, key, token, &data, data.length(), plan, nullptr,
+		  budget, started);
+}
+
+bool OSDCuObj::pulls(const std::string& token) const
+{
+  return m_cct->_conf.get_val<bool>("osd_oob_pull") && handles(token);
+}
+
+ssize_t OSDCuObj::execute_pull(const std::string& key,
+			       const std::string& token,
+			       const ceph::osd::oob::placement_plan& plan,
+			       uint64_t total,
+			       ceph::buffer::list* out,
+			       std::chrono::milliseconds budget,
+			       bool* started)
+{
+  return run_plan(true, key, token, nullptr, total, plan, out, budget,
+		  started);
+}
+
+ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
+			   const std::string& token,
+			   const ceph::buffer::list* data, uint64_t local_len,
+			   const ceph::osd::oob::placement_plan& plan,
+			   ceph::buffer::list* out,
+			   std::chrono::milliseconds budget, bool* started)
+{
+  // a push stages data and writes it to the client; a pull reads from the
+  // client into the staging buffer, and hands it to *out once every read
+  // completed. Either way the buffer is the NIC's until its last
+  // operation completes.
+  const char* what = pull ? "read" : "write";
   if (started) {
     *started = false;
   }
@@ -453,11 +486,11 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       continue;
     }
     if (t.client_ofs > window->size || t.len > window->size - t.client_ofs ||
-	t.local_ofs > data.length() ||
-	t.len > data.length() - t.local_ofs) {
+	t.local_ofs > local_len ||
+	t.len > local_len - t.local_ofs) {
       dout(5) << "placement triple " << t.local_ofs << "/" << t.client_ofs
 	      << "~" << t.len << " outside window (" << window->size
-	      << ") or data (" << data.length() << ") for " << key << dendl;
+	      << ") or data (" << local_len << ") for " << key << dendl;
       return -EINVAL;
     }
     for (uint64_t done = 0; done < t.len; ) {
@@ -467,7 +500,17 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
     }
     total += t.len;
   }
+  if (pull && total != local_len) {
+    // every byte handed out must come from a read: the buffer still
+    // holds an earlier plan's bytes, maybe another client's
+    dout(5) << "pull plan for " << key << " covers " << total << " of "
+	    << local_len << " bytes" << dendl;
+    return -EINVAL;
+  }
   if (items.empty()) {
+    if (pull) {
+      out->clear();
+    }
     return 0;
   }
   // cuObject cannot cancel a write it posted: one still in flight when
@@ -506,15 +549,15 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
     return -EBUSY;
   }
   bool transient = false;
-  BufEntry* buf = acquire_buffer(data.length(), &transient);
+  BufEntry* buf = acquire_buffer(local_len, &transient);
   if (!buf) {
-    derr << "ERROR: no RDMA buffer available for " << data.length()
+    derr << "ERROR: no RDMA buffer available for " << local_len
 	 << " bytes" << dendl;
     return -ENOMEM;
   }
-  {
-    auto it = data.begin();
-    it.copy(data.length(), static_cast<char*>(buf->ptr));
+  if (!pull) {
+    auto it = data->begin();
+    it.copy(local_len, static_cast<char*>(buf->ptr));
   }
 
   m_plans_started++;
@@ -528,8 +571,8 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
 				       handle_value(handle));
   };
   dout(20) << "executing plan " << first << " for " << key << ": "
-	   << items.size() << " writes, " << total << " bytes, channel "
-	   << channel << dendl;
+	   << items.size() << " " << what << "s, " << total
+	   << " bytes, channel " << channel << dendl;
 
   // batched async submission: at most POLL_BATCH outstanding, polled
   // to completion on the same channel
@@ -551,12 +594,18 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       if (started) {
 	*started = true;
       }
-      ssize_t r = m_server->handleGetObject(
-	key, buf->handle, window->addr + w.remote_ofs, w.len, token, channel,
-	w.local_ofs, nullptr, /*async_handle=*/as_handle(first + next));
+      // handlePutObject reads the client's bytes into the buffer, as the
+      // gateway's staged PUT does; handleGetObject writes them out
+      ssize_t r = pull ?
+	m_server->handlePutObject(
+	  key, buf->handle, window->addr + w.remote_ofs, w.len, token, channel,
+	  w.local_ofs, nullptr, /*async_handle=*/as_handle(first + next)) :
+	m_server->handleGetObject(
+	  key, buf->handle, window->addr + w.remote_ofs, w.len, token, channel,
+	  w.local_ofs, nullptr, /*async_handle=*/as_handle(first + next));
       if (r < 0) {
-	derr << "ERROR: async handleGetObject submission failed for " << key
-	     << ": " << r << dendl;
+	derr << "ERROR: async " << (pull ? "handlePutObject" : "handleGetObject")
+	     << " submission failed for " << key << ": " << r << dendl;
 	err = r;
 	break;
       }
@@ -646,7 +695,7 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       m_writes_inflight--;
       completed++;
       if (events[i].status != 0 /* IBV_WC_SUCCESS */) {
-	derr << "ERROR: RDMA write completion failed for " << key
+	derr << "ERROR: RDMA " << what << " completion failed for " << key
 	     << ": wc_status=" << events[i].status << dendl;
 	err = err ? err : -EIO;
       }
@@ -668,14 +717,20 @@ ssize_t OSDCuObj::execute_plan(const std::string& key,
       return -ETIMEDOUT;
     }
   }
+  if (err == 0 && pull) {
+    // every read completed: the buffer holds the payload
+    out->clear();
+    out->append(static_cast<const char*>(buf->ptr), local_len);
+  }
   release_buffer(buf, transient);
   if (err < 0) {
     m_plans_failed++;
     return err == -EOPNOTSUPP ? -EIO : err;
   }
   m_plans_completed++;
-  m_bytes_pushed += total;
-  dout(20) << "plan for " << key << " pushed " << total << " bytes" << dendl;
+  (pull ? m_bytes_pulled : m_bytes_pushed) += total;
+  dout(20) << "plan for " << key << (pull ? " pulled " : " pushed ") << total
+	   << " bytes" << dendl;
   return static_cast<ssize_t>(total);
 }
 
@@ -687,6 +742,7 @@ void OSDCuObj::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("plans_failed", m_plans_failed.load());
   f->dump_unsigned("bytes_pushed", m_bytes_pushed.load());
   f->dump_unsigned("writes_inflight", m_writes_inflight.load());
+  f->dump_unsigned("bytes_pulled", m_bytes_pulled.load());
   f->dump_unsigned("buffers_leaked", m_buffers_leaked.load());
   f->dump_unsigned("buffers_reclaimed", m_buffers_reclaimed.load());
   f->dump_unsigned("stale_completions", m_stale_completions.load());

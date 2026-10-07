@@ -1336,6 +1336,16 @@ protected:
   bool deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
 		      const ceph::rdma::delivery_t& d,
 		      ceph::rdma::oob_result_t& res, bool* started);
+  /**
+   * Take the payload of each write that carries a pull descriptor
+   * (delivery_t::FLAG_PULL) out of the client's window, into the op's
+   * indata, before the request runs. The write then runs as if the
+   * client had sent the bytes: an erasure-coded one is encoded, and its
+   * shards go to their OSDs. Records what was pulled in the request
+   * (OpRequest::oob_pulled), for the reply. Returns 0, or a negative
+   * errno that fails the whole request, with nothing written.
+   */
+  int pull_oob_payloads(OpContext *ctx);
 #endif
 
   // pg on-disk content

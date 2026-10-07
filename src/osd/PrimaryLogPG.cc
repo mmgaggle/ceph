@@ -2570,6 +2570,17 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op)
 
   op->mark_started();
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+  if (m->has_rdma_delivery() && op->may_write()) {
+    // a write whose payload is in client memory: take it now, holding
+    // the object's lock, so that the request runs with its data
+    if (int r = pull_oob_payloads(ctx); r < 0) {
+      reply_ctx(ctx, r);
+      return;
+    }
+  }
+#endif
+
   execute_ctx(ctx);
   utime_t prepare_latency = ceph_clock_now();
   prepare_latency -= op->get_dequeued_time();
@@ -4414,6 +4425,13 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
 			       ignore_out_data);
   dout(20) << __func__ << " alloc reply " << ctx->reply
 	   << " result " << result << dendl;
+#ifdef HAVE_OSD_OOB_DELIVERY
+  if (result >= 0 && !op->oob_pulled.empty()) {
+    // what the primary pulled for the writes: byte counts and checksums
+    auto pulled = op->oob_pulled;
+    ctx->reply->set_oob_results(std::move(pulled));
+  }
+#endif
 
   // read or error?
   if ((ctx->op_t->empty() || result < 0) && !ctx->update_log_only) {
@@ -9618,6 +9636,98 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
     }
   }
   return true;
+}
+#endif // HAVE_OSD_OOB_DELIVERY
+
+#ifdef HAVE_OSD_OOB_DELIVERY
+int PrimaryLogPG::pull_oob_payloads(OpContext *ctx)
+{
+  OpRequestRef op = ctx->op;
+  auto m = op->get_req<MOSDOp>();
+  const auto& deliveries = m->get_rdma_deliveries();
+  auto& ops = *ctx->ops;
+  if (deliveries.size() != ops.size()) {
+    // the descriptor vector must mirror the ops; a write that needed a
+    // pull then fails for its missing data
+    return 0;
+  }
+  if (op->oob_pulled.size() != ops.size()) {
+    op->oob_pulled.assign(ops.size(), {});
+  }
+  for (size_t i = 0; i < ops.size(); i++) {
+    const auto& d = deliveries[i];
+    if (d.empty() || !d.is_pull()) {
+      continue;
+    }
+    OSDOp& osd_op = ops[i];
+    const uint64_t len = osd_op.op.extent.length;
+    if (osd_op.op.op != CEPH_OSD_OP_WRITE &&
+	osd_op.op.op != CEPH_OSD_OP_WRITEFULL) {
+      dout(5) << __func__ << " op " << i << " " << osd_op
+	      << " carries a pull descriptor, which only writes take" << dendl;
+      return -EINVAL;
+    }
+    if (d.flags & ~ceph::rdma::delivery_t::PULL_KNOWN_FLAGS) {
+      return -EOPNOTSUPP;
+    }
+    if (len && osd_op.indata.length() == len &&
+	op->oob_pulled[i].bytes == len) {
+      continue;  // pulled before the request waited and ran again
+    }
+    if (osd_op.indata.length() != 0) {
+      return -EINVAL;
+    }
+    if (len == 0) {
+      continue;
+    }
+    if (len > (cct->_conf->osd_max_write_size << 20)) {
+      return -EFBIG;
+    }
+    OSDOobExecutor* exec = osd->oob_puller_for(d.token);
+    if (!exec) {
+      dout(10) << __func__ << " op " << i << ": no transport pulls from "
+	       << "this token" << dendl;
+      return -EOPNOTSUPP;
+    }
+    // A pull places nothing in client memory, so the lease that bounds
+    // read delivery does not protect anything here. The same bound keeps
+    // an op thread from waiting on a client that gave its request up.
+    const double bound = pool.info.get_rdma_delivery_lease() +
+      pool.info.get_rdma_delivery_drain() -
+      (ceph_clock_now() - m->get_recv_stamp());
+    if (bound <= 0) {
+      return -ETIMEDOUT;
+    }
+    const auto plan = ceph::osd::oob::linear_plan(d.base_offset, len);
+    bufferlist bl;
+    bool started = false;
+    const ssize_t r = exec->execute_pull(
+      m->get_hobj().oid.name, d.token, plan, len, &bl,
+      std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)),
+      &started);
+    if (r < 0) {
+      dout(5) << __func__ << " op " << i << ": pulling " << len
+	      << " bytes failed: " << cpp_strerror(r) << dendl;
+      // a payload larger than the transport stages is not one it can pull
+      return r == -E2BIG ? -EOPNOTSUPP : static_cast<int>(r);
+    }
+    ceph_assert(bl.length() == len);
+    ceph::rdma::oob_result_t res;
+    res.bytes = len;
+    if (d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME) {
+      // the bytes as they arrived here, before the write encodes them
+      res.crc64 = ceph::crc64nvme(bl);
+      res.ranges.push_back({d.base_offset, len, res.crc64});
+      res.flags |= ceph::rdma::oob_result_t::FLAG_CRC64NVME |
+	ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE |
+	ceph::rdma::oob_result_t::FLAG_CRC64_RANGES;
+    }
+    dout(20) << __func__ << " op " << i << ": pulled " << len << " bytes"
+	     << dendl;
+    osd_op.indata = std::move(bl);
+    op->oob_pulled[i] = std::move(res);
+  }
+  return 0;
 }
 #endif // HAVE_OSD_OOB_DELIVERY
 

@@ -1716,6 +1716,29 @@ options:
   see_also:
   - osd_oob_window_size
   - osd_oob_window_count
+- name: osd_oob_pull
+  type: bool
+  level: advanced
+  desc: Let this OSD pull the payload of a write out of client memory over
+    its out-of-band transport, as an OSD-direct PUT asks
+  long_desc: A write whose descriptor carries the pull flag has no data of
+    its own. When this OSD is its primary, it RDMA-reads the payload out of
+    the client window that the descriptor's token names, through a staging
+    buffer (osd_oob_buffer_size), and then runs the write as usual. It
+    encodes an erasure-coded write and sends each shard to its OSD. The
+    libfabric executor asks its provider for RMA reads only when this is
+    on, and a provider without them still starts, for delivery only.
+    Without a transport that pulls, such a write fails with EOPNOTSUPP and
+    nothing is written. The gateway sends these writes only with
+    rgw_rdma_osd_put.
+  default: true
+  services:
+  - osd
+  flags:
+  - startup
+  see_also:
+  - rgw_rdma_osd_put
+  - osd_oob_buffer_size
 - name: osd_oob_cutoff_failure
   type: str
   level: advanced

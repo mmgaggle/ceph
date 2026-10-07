@@ -569,6 +569,16 @@ OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
   return nullptr;
 }
 
+OSDOobExecutor* OSDService::oob_puller_for(const std::string& token) const
+{
+  for (auto* e : oob_executors) {
+    if (e->pulls(token)) {
+      return e;
+    }
+  }
+  return nullptr;
+}
+
 bool OSDService::oob_next_lends() const
 {
   // the preferred transport that starts lends the windows; peers need

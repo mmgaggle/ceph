@@ -81,6 +81,18 @@ public:
 		       std::chrono::milliseconds budget,
 		       bool* started) override;
 
+  /// with osd_oob_pull: the payload of a write, read out of the client
+  /// window with handlePutObject, as the gateway's staged PUT reads it,
+  /// through the same staging buffers and channel as execute_plan()
+  bool pulls(const std::string& token) const override;
+  ssize_t execute_pull(const std::string& key,
+		       const std::string& token,
+		       const ceph::osd::oob::placement_plan& plan,
+		       uint64_t total,
+		       ceph::buffer::list* out,
+		       std::chrono::milliseconds budget,
+		       bool* started) override;
+
   /// asok/debug counters
   void dump_stats(ceph::Formatter* f) const override;
 
@@ -91,6 +103,15 @@ public:
   void release_window(uint64_t id, uint64_t quarantine_ms) override;
 
 private:
+  /// execute_plan() and execute_pull(): local_len bytes of staging, from
+  /// data when pushing, into *out when pulling
+  ssize_t run_plan(bool pull, const std::string& key,
+		   const std::string& token,
+		   const ceph::buffer::list* data, uint64_t local_len,
+		   const ceph::osd::oob::placement_plan& plan,
+		   ceph::buffer::list* out,
+		   std::chrono::milliseconds budget, bool* started);
+
   struct BufEntry {
     void* ptr = nullptr;
     size_t size = 0;
@@ -149,6 +170,7 @@ private:
   std::atomic<uint64_t> m_plans_completed{0};
   std::atomic<uint64_t> m_plans_failed{0};
   std::atomic<uint64_t> m_bytes_pushed{0};
+  std::atomic<uint64_t> m_bytes_pulled{0};
   std::atomic<uint32_t> m_writes_inflight{0};
   std::atomic<uint64_t> m_buffers_leaked{0};
   std::atomic<uint64_t> m_buffers_reclaimed{0};

@@ -146,6 +146,9 @@ public:
   void add_oob_executor(OSDOobExecutor* e, bool lends);
   /// the executor that serves a delivery token's transport, or null
   OSDOobExecutor* oob_executor_for(const std::string& token) const;
+  /// the executor that can pull a write's payload out of a token's
+  /// window (delivery_t::FLAG_PULL), or null
+  OSDOobExecutor* oob_puller_for(const std::string& token) const;
   /// true when any out-of-band transport is up
   bool has_oob_executor() const;
   /// the executor lending windows for EC gathers (osd_oob_gather), or null

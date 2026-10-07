@@ -1837,6 +1837,15 @@ protected:
  * like compression and encryption on async writes.  This is the base abstraction for
  * those filters.
  */
+/** One stripe of an OSD-direct PUT, and what its OSD reported pulling */
+struct PulledStripe {
+  uint64_t ofs = 0;    ///< offset of the stripe in the object
+  uint64_t len = 0;
+  uint64_t bytes = 0;  ///< bytes the OSD pulled, as it reported them
+  uint64_t crc64 = 0;  ///< CRC-64/NVME of those bytes, with crc64_valid
+  bool crc64_valid = false;
+};
+
 class Writer : public ObjectProcessor {
 public:
   Writer() {}
@@ -1863,6 +1872,26 @@ public:
                        rgw_zone_set *zones_trace, bool *canceled,
                        const req_context& rctx,
                        uint32_t flags) = 0;
+
+  /**
+   * OSD-direct PUT (S3 over RDMA): before prepare(), ask for an object
+   * whose bytes never pass through the gateway. The storage pulls them
+   * out of client memory, and the object's head holds none of them, so
+   * that it can be written last, with the checksum and ETag that only
+   * the pulls produce. False when this writer cannot.
+   */
+  virtual bool set_pulled() { return false; }
+  /**
+   * After set_pulled() and prepare(), instead of process(): write the
+   * object's len bytes as stripes, which the storage pulls out of the
+   * client window that token names, from its start. Returns once every
+   * stripe is written, with one entry per stripe, in order, in *stripes;
+   * or a negative errno, with nothing of the object visible.
+   */
+  virtual int process_pulled(uint64_t len, const std::string& token,
+                             std::vector<PulledStripe>* stripes) {
+    return -EOPNOTSUPP;
+  }
 };
 
 

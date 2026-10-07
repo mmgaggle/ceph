@@ -13,6 +13,8 @@
  *
  */
 
+#include <deque>
+
 #include "include/rados/librados.hpp"
 #include "rgw_aio.h"
 #include "rgw_putobj_processor.h"
@@ -186,6 +188,29 @@ int RadosWriter::process(bufferlist&& bl, uint64_t offset)
   return process_completed(c, &written);
 }
 
+int RadosWriter::process_pulled(
+  uint64_t len, const std::string& token, uint64_t client_ofs,
+  librados::ObjectOperation::rdma_delivery_result* result)
+{
+  if (len == 0) {
+    return 0;
+  }
+  librados::ObjectWriteOperation op;
+  add_write_hint(op);
+  // the primary pulls the stripe, and reports its CRC-64/NVME, from
+  // which the gateway builds the object's checksum and ETag
+  op.write_full_pulled(len, token, client_ofs,
+                       librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC64,
+                       result);
+  constexpr uint64_t id = 0; // unused
+  // the stripe's bytes count against the throttle window as if they
+  // passed through: pulls in flight are bounded the same way
+  auto c = aio->get(stripe_obj.obj, Aio::librados_op(stripe_obj.ioctx,
+                                                     std::move(op), y, &trace),
+                    len, id);
+  return process_completed(c, &written);
+}
+
 int RadosWriter::write_exclusive(const bufferlist& data)
 {
   const uint64_t cost = data.length();
@@ -338,6 +363,11 @@ int AtomicObjectProcessor::prepare(optional_yield y)
     }
     chunk_size = max_head_chunk_size;
   }
+  if (pulled) {
+    // the head is written last, with the checksum and ETag of bytes the
+    // gateway never saw: it can hold none of them
+    head_max_size = 0;
+  }
 
   uint64_t stripe_size;
   const uint64_t default_stripe_size = store->ctx()->_conf->rgw_obj_stripe_size;
@@ -444,6 +474,60 @@ int AtomicObjectProcessor::complete(
   return 0;
 }
 
+
+int AtomicObjectProcessor::process_pulled(
+  uint64_t len, const std::string& token,
+  std::vector<rgw::sal::PulledStripe>* stripes)
+{
+  ceph_assert(pulled);
+  // the OSDs' reports land here as the writes complete: a deque keeps
+  // each in place while later ones are added
+  std::deque<librados::ObjectOperation::rdma_delivery_result> results;
+  std::vector<std::pair<uint64_t, uint64_t>> extents;
+  int r = 0;
+  for (uint64_t ofs = 0; ofs < len; ) {
+    // with no head data the first stripe starts at offset 0, as it does
+    // when process() sends the first bytes on
+    uint64_t stripe_size = 0;
+    r = next(ofs, &stripe_size);
+    if (r < 0) {
+      break;
+    }
+    const uint64_t n = std::min(stripe_size, len - ofs);
+    auto& res = results.emplace_back();
+    extents.emplace_back(ofs, n);
+    r = writer.process_pulled(n, token, ofs, &res);
+    if (r < 0) {
+      break;
+    }
+    ofs += n;
+  }
+  // every report must be in before it is read, and before results goes
+  const int dr = writer.drain();
+  if (r == 0) {
+    r = dr;
+  }
+  if (r < 0) {
+    return r;
+  }
+  set_actual_size(len);
+  stripes->clear();
+  stripes->reserve(extents.size());
+  for (size_t i = 0; i < extents.size(); i++) {
+    const auto& res = results[i];
+    rgw::sal::PulledStripe st;
+    st.ofs = extents[i].first;
+    st.len = extents[i].second;
+    st.bytes = res.bytes;
+    st.crc64 = res.crc64;
+    // one contiguous extent, so its CRC folds with its neighbours'
+    st.crc64_valid =
+      (res.flags & librados::ObjectOperation::RDMA_DELIVERY_CRC64_VALID) &&
+      (res.flags & librados::ObjectOperation::RDMA_DELIVERY_CRC64_COMBINABLE);
+    stripes->push_back(st);
+  }
+  return 0;
+}
 
 int MultipartObjectProcessor::process_first_chunk(bufferlist&& data,
                                                   DataProcessor **processor)

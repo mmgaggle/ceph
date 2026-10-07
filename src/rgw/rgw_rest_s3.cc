@@ -3090,6 +3090,11 @@ void RGWPutObj_ObjStore_S3::send_response()
   if (op_ret) {
     set_req_state_err(s, op_ret);
     dump_errno(s);
+    if (rdma_put_declined) {
+      // the object was not taken out of the client's memory, and nothing
+      // was stored: the client sends the body instead
+      dump_header(s, "x-amz-rdma-reply", "501");
+    }
   } else {
     if (s->cct->_conf->rgw_s3_success_create_obj_status) {
       op_ret = get_success_retcode(
@@ -3114,6 +3119,16 @@ void RGWPutObj_ObjStore_S3::send_response()
         dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
       }
 #endif
+      if (rdma_pulled) {
+        // the OSDs pulled every byte out of the client's memory; the
+        // checksum is theirs, folded, and also in x-amz-checksum-crc64nvme
+        dump_header(s, "x-amz-rdma-reply", "200");
+        dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
+        if (cksum) {
+          dump_header(s, "x-amz-rdma-checksum",
+                      "CRC64NVME " + cksum->to_armor());
+        }
+      }
       dump_header_if_nonempty(s, "x-amz-version-id", version_id);
       dump_header_if_nonempty(s, "x-amz-expiration", expires);
       if (cksum && cksum->aws()) {

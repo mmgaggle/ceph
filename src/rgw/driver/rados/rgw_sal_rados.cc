@@ -5228,6 +5228,18 @@ int RadosAtomicWriter::process(bufferlist&& data, uint64_t offset)
   return processor.process(std::move(data), offset);
 }
 
+bool RadosAtomicWriter::set_pulled()
+{
+  processor.set_pulled();
+  return true;
+}
+
+int RadosAtomicWriter::process_pulled(uint64_t len, const std::string& token,
+                                      std::vector<PulledStripe>* stripes)
+{
+  return processor.process_pulled(len, token, stripes);
+}
+
 int RadosAtomicWriter::complete(size_t accounted_size, const std::string& etag,
                        ceph::real_time *mtime, ceph::real_time set_mtime,
                        std::map<std::string, bufferlist>& attrs,

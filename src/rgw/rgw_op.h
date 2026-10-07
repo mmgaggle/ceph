@@ -1419,6 +1419,14 @@ protected:
   /// from the client's memory (a gateway-staged PUT), which the reply
   /// reports
   bool rdma_staged = false;
+  /// S3-over-RDMA: after execute(), whether the OSDs pulled the object
+  /// out of the client's memory (an OSD-direct PUT, rgw_rdma_osd_put),
+  /// which the reply reports
+  bool rdma_pulled = false;
+  /// S3-over-RDMA: the PUT carried x-amz-rdma-token and no body, and the
+  /// gateway could not have the OSDs pull it; the reply says so
+  /// (x-amz-rdma-reply: 501), and the client sends the body instead
+  bool rdma_put_declined = false;
 
 public:
   RGWPutObj() : ofs(0),

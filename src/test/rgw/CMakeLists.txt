@@ -125,6 +125,9 @@ if(WITH_OOB_OFI)
   # client for OSD-direct delivery over libfabric
   add_executable(ceph_test_rgw_ofi_get ofi/ofi_s3_get.cc)
   target_link_libraries(ceph_test_rgw_ofi_get ofi_rma ${CURL_LIBRARIES})
+  # client for OSD-direct PUTs over libfabric
+  add_executable(ceph_test_rgw_ofi_put ofi/ofi_s3_put.cc)
+  target_link_libraries(ceph_test_rgw_ofi_put ofi_rma ${CURL_LIBRARIES})
 endif()
 
 # unittest_rgw_rdma_rc_wire

@@ -4708,6 +4708,30 @@ options:
   see_also:
   - rgw_rdma_transports
   - osd_oob_transports
+- name: rgw_rdma_osd_put
+  type: bool
+  level: advanced
+  desc: Have the OSDs pull a PUT's object out of the requester's memory
+  long_desc: A PUT that carries x-amz-rdma-token and no body names the
+    object in client memory. The gateway writes the object as stripes that
+    carry no data. The primary OSD of each stripe RDMA-reads the stripe out
+    of the client window, then writes it as usual, and an erasure-coded
+    pool encodes it and sends each shard to its OSD. The object's head
+    holds no data, and the gateway writes it last, with the object's
+    CRC-64/NVME, folded from the OSDs' checksums of what they pulled, and an
+    ETag built from those checksums. A client checksum in
+    x-amz-checksum-crc64nvme must match. Only plain objects qualify, not
+    compressed or encrypted ones, appends, multipart parts or PUTs with
+    Content-MD5. The OSDs need an executor that pulls from the token's
+    transport (osd_oob_pull). A body-less PUT that the gateway cannot serve
+    this way, or whose pulls fail, is declined with 501 and
+    x-amz-rdma-reply 501, and nothing is stored.
+  default: false
+  services:
+  - rgw
+  see_also:
+  - osd_oob_pull
+  - rgw_rdma_osd_passthrough
 - name: rgw_rdma_crc64nvme
   type: bool
   level: advanced

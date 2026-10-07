@@ -82,6 +82,72 @@ Gateway-staged
 
 The gateway uses OSD-direct when it can, and gateway-staged otherwise.
 
+OSD-direct PUT
+--------------
+
+With ``rgw_rdma_osd_put``, a PUT can leave the object in client memory.
+The client registers the object's bytes as a window that peers can
+read. It then sends a PUT with ``x-amz-rdma-token`` and an empty body.
+The window's size is the object's size. Both token types work: a
+libfabric token whose window allows remote reads, and a cuObject
+descriptor.
+
+The gateway writes the object as stripes of ``rgw_obj_stripe_size``
+that carry no data. Each stripe write carries a delivery descriptor
+with the pull flag. The primary OSD of the stripe RDMA-reads the stripe
+out of the window into a staging buffer, and then runs the write as
+usual. In an erasure-coded pool, the primary encodes the stripe and
+sends each shard to its OSD. In a replicated pool, it sends the stripe
+to the replicas. The object's bytes never pass through the gateway.
+
+Each OSD reports the CRC-64/NVME of the bytes that it pulled. The
+gateway folds the values in object order, with the math of `Integrity`_,
+and stores the result as the object's full-object ``crc64nvme``
+checksum. If the client sends ``x-amz-checksum-crc64nvme``, the two
+values must match. Otherwise the PUT fails with ``400 BadDigest``, and
+nothing is stored. A later passthrough GET of the whole object compares
+the stored checksum with what the OSDs deliver.
+
+The object's head holds no data. The gateway writes the head last, in
+one operation with the checksum and the ETag, so a reader sees the old
+object or the new one, never part of the new one. The gateway has no
+MD5 of the object. The ETag has the form of a multipart upload's ETag:
+the MD5 of the stripes' CRC-64/NVME values in big-endian order, then
+``-`` and the number of stripes. The suffix tells S3 clients that the
+ETag is not the MD5 of the object. The same bytes in the same stripes
+always get the same ETag.
+
+A successful PUT answers ``200`` with ``x-amz-rdma-reply: 200``,
+``x-amz-rdma-bytes-transferred``, ``x-amz-checksum-crc64nvme`` and
+``x-amz-rdma-checksum``.
+
+The gateway never stores a body-less PUT with a token as an empty
+object. If the gateway cannot serve such a PUT out of band, it answers
+``501`` with ``x-amz-rdma-reply: 501``, and the client sends the body
+instead. The gateway declines these PUTs:
+
+* PUTs that arrive while ``rgw_rdma_osd_put`` is off, unless a cuObject
+  gateway-staged PUT serves the token.
+* Appends, parts of multipart uploads, and PUTs with ``Content-MD5``.
+* Objects that the placement compresses or that the gateway encrypts,
+  torrents, and PUTs that a Lua data filter reads.
+* PUTs with a client checksum other than ``CRC64NVME``.
+* PUTs with a stripe that an OSD could not pull. The gateway removes
+  the stripes that it wrote, and the old object stays.
+
+``osd_oob_pull`` lets an OSD pull. The libfabric executor then asks its
+provider for RMA reads, and pulls through its staging buffers
+(``osd_oob_buffer_size``). The cuObject executor reads with
+``handlePutObject``, as the gateway's staged PUT does. A pull holds the
+object's lock and the op thread until it completes, at most for the
+pool's lease plus drain. An OSD that cannot pull fails the write with
+``EOPNOTSUPP``. An OSD of an earlier release fails it with ``EINVAL``,
+because the write has no data. In both cases nothing is written.
+
+The window must stay registered and unchanged until the reply arrives.
+A token for a readable window lets any holder read that memory. When
+the PUT is complete, re-key the window.
+
 Transports
 ----------
 
@@ -1155,6 +1221,8 @@ Transports and out-of-band behavior:
   windows. The default is empty.
 * ``rgw_rdma_osd_passthrough``: have the OSDs write GET data directly,
   into client windows and into RC relay windows. The default is false.
+* ``rgw_rdma_osd_put``: have the OSDs pull the object of a body-less PUT
+  out of client memory. The default is false. See `OSD-direct PUT`_.
 * ``rgw_rdma_crc64nvme``: compute checksums of out-of-band transfers.
   The gateway compares whole-object passthrough GETs with the stored
   checksum, and reports a checksum to RC clients. The default is true.
@@ -1221,6 +1289,11 @@ Executors and out-of-band behavior:
   finds no free buffer. The cuObject executor registers a one-time
   buffer for it instead, of up to four times ``osd_oob_buffer_size``,
   which is slower. A larger read is delivered inline.
+* ``osd_oob_pull``: let the executors pull the payload of a write out of
+  client memory, for an OSD-direct PUT. The default is true. The
+  libfabric executor asks its provider for RMA reads only when this is
+  on. A provider without them still starts, for delivery only. See
+  `OSD-direct PUT`_.
 * ``osd_oob_gather``: lend windows when this OSD is the primary of an
   erasure-coded read. The default is false. The first transport in
   ``osd_oob_transports`` that started lends them, and its executor
@@ -1442,17 +1515,23 @@ Limitations
   family. Mixed IPv4 and IPv6 endpoints are not tested.
 * A split read, erasure-coded shard-direct or replicated balanced,
   delivers a sparse read inline.
-* Only cuObject clients can PUT with ``x-amz-rdma-token``, in
+* Only cuObject clients can PUT with ``x-amz-rdma-token`` in
   gateway-staged mode. The object must fit one of the gateway's staging
   buffers (``rgw_cuobj_buffer_size``), and a PUT that finds no free
   buffer large enough fails with ``503``. Libfabric clients have no
   gateway-staged mode, so a libfabric GET that cannot use passthrough
-  gets the HTTP body. The gateway reads the body of a PUT with a
-  libfabric token over HTTP, as a gateway that does not run its
-  cuObject server does with any token, and the response has no
+  gets the HTTP body. A PUT with a body and a libfabric token is read
+  over HTTP, as a gateway that does not run its cuObject server reads
+  a PUT with a body and any token, and the response has no
   ``x-amz-rdma-reply`` header. A gateway that runs its cuObject server
   takes any other token on a PUT for a cuObject descriptor, and a token
   whose address and size do not parse fails the PUT with ``400``.
+* An OSD-direct PUT does not serve appends, multipart parts, compressed
+  or encrypted objects. The pulled payload does not count against the
+  OSD's client message throttle. If a stripe write was resent after its
+  OSD committed it, the stripe has no checksum, and the gateway declines
+  the PUT. The cuObject pull is compiled against a header stub only and
+  is not tested on hardware.
 * The gateway does not serve encrypted objects, or objects with a DLO
   or SLO manifest, to RC clients. PREPARE answers ``501`` with the
   unsupported marker, and the client reads the object over HTTP.

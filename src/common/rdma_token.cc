@@ -3,6 +3,7 @@
 
 #include "common/rdma_token.h"
 #include "common/crc64nvme.h"
+#include "include/crc32c.h"
 
 #include <algorithm>
 #include <cctype>
@@ -75,7 +76,13 @@ bool is_cuobj_descriptor(std::string_view token)
   return !is_ofi_token(token) && parse_rdma_token(token).has_value();
 }
 
-std::optional<uint64_t> fold_crc64_ranges(std::vector<crc_range_t> ranges)
+namespace {
+
+/// fold the values that get() picks out of ranges sorted by ofs, with
+/// combine(crc_a, crc_b, len_b); nullopt for a gap, an overlap or none
+template <typename T, typename Get, typename Combine>
+std::optional<T> fold_ranges(std::vector<crc_range_t> ranges, Get get,
+			     Combine combine)
 {
   if (ranges.empty()) {
     return std::nullopt;
@@ -84,17 +91,57 @@ std::optional<uint64_t> fold_crc64_ranges(std::vector<crc_range_t> ranges)
 	    [](const crc_range_t& a, const crc_range_t& b) {
 	      return a.ofs < b.ofs;
 	    });
-  uint64_t crc = ranges.front().crc64;
+  T crc = get(ranges.front());
   uint64_t next = ranges.front().ofs + ranges.front().len;
   for (size_t i = 1; i < ranges.size(); ++i) {
     const auto& r = ranges[i];
     if (r.ofs != next) {
       return std::nullopt;  // gap or overlap
     }
-    crc = crc64nvme_combine(crc, r.crc64, r.len);
+    crc = combine(crc, get(r), r.len);
     next += r.len;
   }
   return crc;
+}
+
+} // anonymous namespace
+
+std::optional<uint64_t> fold_crc64_ranges(std::vector<crc_range_t> ranges)
+{
+  return fold_ranges<uint64_t>(
+    std::move(ranges), [](const crc_range_t& r) { return r.crc64; },
+    [](uint64_t a, uint64_t b, uint64_t len) {
+      return crc64nvme_combine(a, b, len);
+    });
+}
+
+std::optional<uint32_t> fold_crc32c_ranges(std::vector<crc_range_t> ranges)
+{
+  return fold_ranges<uint32_t>(
+    std::move(ranges), [](const crc_range_t& r) { return r.crc32c; },
+    crc32c_combine);
+}
+
+uint32_t crc32c_canonical(const ceph::buffer::list& bl)
+{
+  // ceph_crc32c() leaves out the final inversion: S3 has both
+  return bl.crc32c(0xffffffff) ^ 0xffffffff;
+}
+
+uint32_t crc32c_combine(uint32_t crc_a, uint32_t crc_b, uint64_t len_b)
+{
+  // The register update is linear in the register and the data, so
+  // with canonical values (init and xorout all ones) the inversions
+  // cancel: crc(A B) = crc(B) ^ raw(crc(A), len_b zero bytes).
+  // ceph_crc32c_zeros() runs over the zeros in O(log n).
+  uint32_t shifted = crc_a;
+  while (len_b > 0) {
+    const unsigned n = static_cast<unsigned>(
+      std::min<uint64_t>(len_b, 1u << 30));
+    shifted = ceph_crc32c_zeros(shifted, n);
+    len_b -= n;
+  }
+  return crc_b ^ shifted;
 }
 
 std::vector<std::string> parse_transport_list(std::string_view list)

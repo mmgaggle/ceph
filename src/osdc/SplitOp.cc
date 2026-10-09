@@ -571,8 +571,9 @@ void SplitOp::complete() {
     // sub-read's crc ranges gathered. The sub-reads tile the op's
     // logical range between them - replica sub-reads by disjoint
     // extents, EC-direct ones by interleaved chunks - so when every
-    // pushing sub-read reported ranges, they fold into the crc64 of
-    // the op as one contiguous extent.
+    // pushing sub-read reported ranges, they fold into the crc64 and
+    // crc32c of the op as one contiguous extent, each when every
+    // sub-read reported it.
     //
     // The result goes to the caller in whichever form it asked for:
     // librados takes the callback form, which a pointer-only copy here
@@ -585,6 +586,7 @@ void SplitOp::complete() {
       ceph::rdma::oob_result_t agg;
       agg.bytes = i < oob_total.size() ? oob_total[i] : 0;
       bool all_ranged = agg.bytes > 0;
+      bool all_crc64 = true, all_crc32c = true;
       uint64_t ranged_bytes = 0;
       for (auto& [index, sub_read] : sub_reads) {
         for (unsigned j = 0; j < sub_read.parent_ops.size(); ++j) {
@@ -595,10 +597,14 @@ void SplitOp::complete() {
           if (r.bytes == 0) {
             continue;
           }
-          if (!(r.flags & ceph::rdma::oob_result_t::FLAG_CRC64_RANGES)) {
+          if (!(r.flags & ceph::rdma::oob_result_t::FLAG_RANGES)) {
             all_ranged = false;
             continue;
           }
+          all_crc64 = all_crc64 &&
+            (r.flags & ceph::rdma::oob_result_t::FLAG_CRC64NVME);
+          all_crc32c = all_crc32c &&
+            (r.flags & ceph::rdma::oob_result_t::FLAG_CRC32C);
           for (const auto& range : r.ranges) {
             ranged_bytes += range.len;
           }
@@ -618,12 +624,28 @@ void SplitOp::complete() {
         }
       }
       agg.flags |= ceph::rdma::fold_transfer_flags(part_flags, agg.bytes);
-      if (all_ranged && ranged_bytes == agg.bytes) {
-        agg.flags |= ceph::rdma::oob_result_t::FLAG_CRC64_RANGES;
-        if (auto crc = ceph::rdma::fold_crc64_ranges(agg.ranges)) {
-          agg.crc64 = *crc;
-          agg.flags |= ceph::rdma::oob_result_t::FLAG_CRC64NVME |
-                       ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE;
+      if (all_ranged && ranged_bytes == agg.bytes &&
+          (all_crc64 || all_crc32c)) {
+        agg.flags |= ceph::rdma::oob_result_t::FLAG_RANGES;
+        std::optional<uint64_t> crc64;
+        std::optional<uint32_t> crc32c;
+        if (all_crc64) {
+          crc64 = ceph::rdma::fold_crc64_ranges(agg.ranges);
+        }
+        if (all_crc32c) {
+          crc32c = ceph::rdma::fold_crc32c_ranges(agg.ranges);
+        }
+        if (crc64) {
+          agg.crc64 = *crc64;
+          agg.flags |= ceph::rdma::oob_result_t::FLAG_CRC64NVME;
+        }
+        if (crc32c) {
+          agg.crc32c = *crc32c;
+          agg.flags |= ceph::rdma::oob_result_t::FLAG_CRC32C;
+        }
+        if (crc64 || crc32c) {
+          // the ranges tile the op without gaps: one contiguous extent
+          agg.flags |= ceph::rdma::oob_result_t::FLAG_COMBINABLE;
         }
       } else {
         agg.ranges.clear();

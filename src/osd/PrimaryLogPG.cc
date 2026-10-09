@@ -9606,7 +9606,9 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
   // with delivery-complete writes every byte is in the window: nothing of
   // this op lands after the reply, which follows
   res.flags |= ceph::rdma::attempt_flags(true, true, exec->delivery_complete());
-  if (d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME) {
+  const bool want64 = d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME;
+  const bool want32c = d.flags & ceph::rdma::delivery_t::FLAG_CRC32C;
+  if (want64 || want32c) {
     // checksum each placed range at the storage node, after it
     // crossed the fabric. Every triple is one contiguous logical
     // extent, so a caller holding all of a window's ranges can fold
@@ -9615,24 +9617,35 @@ bool PrimaryLogPG::deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
     // the builders emit triples contiguous and ascending in payload
     // order.
     res.ranges.reserve(plan.size());
-    uint64_t whole = 0;
+    uint64_t whole64 = 0;
+    uint32_t whole32c = 0;
     for (const auto& t : plan) {
       bufferlist part;
       part.substr_of(payload, t.local_ofs, t.len);
-      const uint64_t crc = ceph::crc64nvme(part);
-      res.ranges.push_back({t.client_ofs, t.len, crc});
-      whole = res.ranges.size() == 1 ? crc
-	    : ceph::crc64nvme_combine(whole, crc, t.len);
+      ceph::rdma::crc_range_t r{t.client_ofs, t.len};
+      if (want64) {
+	r.crc64 = ceph::crc64nvme(part);
+	whole64 = res.ranges.empty() ? r.crc64
+		: ceph::crc64nvme_combine(whole64, r.crc64, t.len);
+      }
+      if (want32c) {
+	r.crc32c = ceph::rdma::crc32c_canonical(part);
+	whole32c = res.ranges.empty() ? r.crc32c
+		 : ceph::rdma::crc32c_combine(whole32c, r.crc32c, t.len);
+      }
+      res.ranges.push_back(r);
     }
-    res.crc64 = whole;
-    res.flags |= ceph::rdma::oob_result_t::FLAG_CRC64NVME |
-		 ceph::rdma::oob_result_t::FLAG_CRC64_RANGES;
+    res.crc64 = whole64;
+    res.crc32c = whole32c;
+    res.flags |= ceph::rdma::oob_result_t::FLAG_RANGES |
+      (want64 ? ceph::rdma::oob_result_t::FLAG_CRC64NVME : 0) |
+      (want32c ? ceph::rdma::oob_result_t::FLAG_CRC32C : 0);
     if (plan.size() == 1) {
-      // one contiguous logical extent: crc64 itself folds with
-      // adjacent stripes, so a caller needs no ranges. This is the
+      // one contiguous logical extent: crc64 and crc32c themselves fold
+      // with adjacent stripes, so a caller needs no ranges. This is the
       // plain read, and also the EC-direct read whose range fits in
       // one chunk of this shard.
-      res.flags |= ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE;
+      res.flags |= ceph::rdma::oob_result_t::FLAG_COMBINABLE;
     }
   }
   return true;
@@ -9714,13 +9727,21 @@ int PrimaryLogPG::pull_oob_payloads(OpContext *ctx)
     ceph_assert(bl.length() == len);
     ceph::rdma::oob_result_t res;
     res.bytes = len;
-    if (d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME) {
+    const bool want64 = d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME;
+    const bool want32c = d.flags & ceph::rdma::delivery_t::FLAG_CRC32C;
+    if (want64 || want32c) {
       // the bytes as they arrived here, before the write encodes them
-      res.crc64 = ceph::crc64nvme(bl);
-      res.ranges.push_back({d.base_offset, len, res.crc64});
-      res.flags |= ceph::rdma::oob_result_t::FLAG_CRC64NVME |
-	ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE |
-	ceph::rdma::oob_result_t::FLAG_CRC64_RANGES;
+      if (want64) {
+	res.crc64 = ceph::crc64nvme(bl);
+      }
+      if (want32c) {
+	res.crc32c = ceph::rdma::crc32c_canonical(bl);
+      }
+      res.ranges.push_back({d.base_offset, len, res.crc64, res.crc32c});
+      res.flags |= ceph::rdma::oob_result_t::FLAG_COMBINABLE |
+	ceph::rdma::oob_result_t::FLAG_RANGES |
+	(want64 ? ceph::rdma::oob_result_t::FLAG_CRC64NVME : 0) |
+	(want32c ? ceph::rdma::oob_result_t::FLAG_CRC32C : 0);
     }
     dout(20) << __func__ << " op " << i << ": pulled " << len << " bytes"
 	     << dendl;

@@ -58,16 +58,20 @@ TEST(RdmaDelivery, OobResultWireFormat)
   r.crc64 = 0xae8b14860a799888ull;
   r.flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME;
 
+  r.crc32c = 0xe3069283u;
+
   bufferlist bl;
   encode(r, bl);
-  // ENCODE_START(2,1) header, le64 bytes, le64 crc64, le32 flags,
-  // then the v2 ranges vector (le32 count, empty here)
+  // ENCODE_START(3,1) header, le64 bytes, le64 crc64, le32 flags,
+  // then the v2 ranges vector (le32 count, empty here), then the v3
+  // crc32c (le32)
   static const unsigned char expected_bytes[] = {
-    0x02, 0x01, 0x18, 0x00, 0x00, 0x00,              // v2, compat 1, len 24
+    0x03, 0x01, 0x1c, 0x00, 0x00, 0x00,              // v3, compat 1, len 28
     0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // bytes (le64)
     0x88, 0x98, 0x79, 0x0a, 0x86, 0x14, 0x8b, 0xae,  // crc64 (le64)
     0x01, 0x00, 0x00, 0x00,                          // flags (le32)
     0x00, 0x00, 0x00, 0x00,                          // ranges: 0 entries
+    0x83, 0x92, 0x06, 0xe3,                          // crc32c (le32)
   };
   bufferlist expected;
   expected.append(reinterpret_cast<const char*>(expected_bytes),
@@ -81,7 +85,104 @@ TEST(RdmaDelivery, OobResultWireFormat)
   EXPECT_EQ(r.bytes, out.bytes);
   EXPECT_EQ(r.crc64, out.crc64);
   EXPECT_EQ(r.flags, out.flags);
+  EXPECT_EQ(r.crc32c, out.crc32c);
   EXPECT_TRUE(p.end());
+}
+
+// What an OSD of the previous release sends: a v2 result whose ranges
+// are v1, without CRC-32C values. It decodes with none.
+TEST(RdmaDelivery, OobResultFromOlderOsd)
+{
+  bufferlist bl;
+  ENCODE_START(2, 1, bl);
+  encode(uint64_t(4096), bl);                 // bytes
+  encode(uint64_t(0x1234), bl);               // crc64
+  encode(ceph::rdma::oob_result_t::FLAG_CRC64NVME |
+         ceph::rdma::oob_result_t::FLAG_RANGES, bl);
+  encode(uint32_t(1), bl);                    // one range, v1
+  {
+    ENCODE_START(1, 1, bl);
+    encode(uint64_t(0), bl);
+    encode(uint64_t(4096), bl);
+    encode(uint64_t(0x1234), bl);
+    ENCODE_FINISH(bl);
+  }
+  ENCODE_FINISH(bl);
+
+  ceph::rdma::oob_result_t out;
+  auto p = bl.cbegin();
+  decode(out, p);
+  EXPECT_TRUE(p.end());
+  EXPECT_EQ(4096u, out.bytes);
+  EXPECT_EQ(0x1234u, out.crc64);
+  EXPECT_EQ(0u, out.crc32c);
+  EXPECT_FALSE(out.flags & ceph::rdma::oob_result_t::FLAG_CRC32C);
+  ASSERT_EQ(1u, out.ranges.size());
+  EXPECT_EQ(0x1234u, out.ranges[0].crc64);
+  EXPECT_EQ(0u, out.ranges[0].crc32c);
+}
+
+// The canonical CRC-32C is S3's, and two of them combine into the CRC of
+// the concatenation, whatever the lengths and the buffer boundaries.
+TEST(RdmaDelivery, Crc32cCanonicalAndCombine)
+{
+  bufferlist check;
+  check.append("123456789");
+  EXPECT_EQ(0xe3069283u, ceph::rdma::crc32c_canonical(check));
+  EXPECT_EQ(0u, ceph::rdma::crc32c_canonical(bufferlist()));
+
+  std::string data;
+  for (int i = 0; i < 100000; ++i) {
+    data += static_cast<char>((i * 131 + i / 7) & 0xff);
+  }
+  bufferlist whole;
+  // several buffers, so that bufferlist's per-buffer CRC caching is used
+  for (size_t o = 0; o < data.size(); o += 30001) {
+    whole.append(data.data() + o, std::min<size_t>(30001, data.size() - o));
+  }
+  const uint32_t expect = ceph::rdma::crc32c_canonical(whole);
+  for (size_t cut : {size_t(0), size_t(1), size_t(4095), size_t(4096),
+                     size_t(65537), data.size() - 1, data.size()}) {
+    bufferlist a, b;
+    a.append(data.data(), cut);
+    b.append(data.data() + cut, data.size() - cut);
+    EXPECT_EQ(expect, ceph::rdma::crc32c_combine(
+                ceph::rdma::crc32c_canonical(a),
+                ceph::rdma::crc32c_canonical(b), b.length()))
+      << "cut at " << cut;
+  }
+}
+
+TEST(RdmaDelivery, FoldCrc32cRanges)
+{
+  // as FoldCrc64Ranges: interleaved chunks of two EC shards, out of order
+  std::string data;
+  for (int c = 0; c < 6; ++c) {
+    data += std::string(1000, static_cast<char>('a' + c));
+  }
+  bufferlist whole;
+  whole.append(data);
+  const uint32_t expect = ceph::rdma::crc32c_canonical(whole);
+
+  std::vector<ceph::rdma::crc_range_t> ranges;
+  for (int c : {4, 0, 2, 5, 1, 3}) {
+    bufferlist part;
+    part.append(data.data() + c * 1000, 1000);
+    ranges.push_back({uint64_t(c) * 1000, 1000, ceph::crc64nvme(part),
+                      ceph::rdma::crc32c_canonical(part)});
+  }
+  auto folded = ceph::rdma::fold_crc32c_ranges(ranges);
+  ASSERT_TRUE(folded.has_value());
+  EXPECT_EQ(expect, *folded);
+  // the same ranges still fold the CRC-64/NVME too
+  auto folded64 = ceph::rdma::fold_crc64_ranges(ranges);
+  ASSERT_TRUE(folded64.has_value());
+  EXPECT_EQ(ceph::crc64nvme(whole), *folded64);
+
+  auto gapped = ranges;
+  gapped.erase(gapped.begin() + 2);
+  EXPECT_FALSE(ceph::rdma::fold_crc32c_ranges(gapped).has_value());
+  EXPECT_FALSE(ceph::rdma::fold_crc32c_ranges({}).has_value());
 }
 
 TEST(RdmaDelivery, PerOpVectorRoundTrip)

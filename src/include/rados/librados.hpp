@@ -354,22 +354,33 @@ inline namespace v14_2_0 {
       uint64_t ofs = 0;     ///< client-window offset (token base relative)
       uint64_t len = 0;
       uint64_t crc64 = 0;   ///< canonical CRC-64/NVME of that range
+      uint32_t crc32c = 0;  ///< canonical CRC-32C of that range
     };
     struct rdma_delivery_result {
       uint64_t bytes = 0;   ///< bytes delivered out of band
       uint64_t crc64 = 0;   ///< canonical CRC-64/NVME of those bytes
-      uint32_t flags = 0;   ///< RDMA_DELIVERY_CRC64_* below
-      /// one entry per contiguous placed range, with
-      /// RDMA_DELIVERY_CRC64_RANGES
+      uint32_t flags = 0;   ///< RDMA_DELIVERY_* result flags below
+      /// one entry per contiguous placed range, with RDMA_DELIVERY_RANGES
       std::vector<rdma_delivery_range> ranges;
+      uint32_t crc32c = 0;  ///< canonical CRC-32C of those bytes
     };
-    static constexpr uint32_t RDMA_DELIVERY_WANT_CRC64 = 1;  // request flag
-    static constexpr uint32_t RDMA_DELIVERY_CRC64_VALID = 1; // result flag
-    /// result flag: crc64 covers one contiguous logical extent and so
-    /// may be concatenate-combined with adjacent results
-    static constexpr uint32_t RDMA_DELIVERY_CRC64_COMBINABLE = 2;
+    /// request flags: the CRC-64/NVME, the CRC-32C (Castagnoli, as S3's
+    /// CRC32C), or both, of the bytes moved out of band
+    static constexpr uint32_t RDMA_DELIVERY_WANT_CRC64 = 1;
+    static constexpr uint32_t RDMA_DELIVERY_WANT_CRC32C = 8;
+    /// result flags: crc64 and the ranges' crc64 are valid; crc32c and
+    /// the ranges' crc32c are valid
+    static constexpr uint32_t RDMA_DELIVERY_CRC64_VALID = 1;
+    static constexpr uint32_t RDMA_DELIVERY_CRC32C_VALID = 64;
+    /// result flag: the bytes are one contiguous logical extent, so crc64
+    /// and crc32c may be concatenate-combined with adjacent results
+    static constexpr uint32_t RDMA_DELIVERY_COMBINABLE = 2;
+    static constexpr uint32_t RDMA_DELIVERY_CRC64_COMBINABLE =
+      RDMA_DELIVERY_COMBINABLE;
     /// result flag: ranges is populated
-    static constexpr uint32_t RDMA_DELIVERY_CRC64_RANGES = 4;
+    static constexpr uint32_t RDMA_DELIVERY_RANGES = 4;
+    static constexpr uint32_t RDMA_DELIVERY_CRC64_RANGES =
+      RDMA_DELIVERY_RANGES;
     /// result flag: the OSD started no transfer for this read, so nothing
     /// of it reached the window; its data came back inline. An older OSD
     /// never sets it.

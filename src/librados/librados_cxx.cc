@@ -234,6 +234,10 @@ void librados::ObjectReadOperation::set_rdma_delivery(
   // copied field by field when the reply is processed
   static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC64 ==
 		ceph::rdma::delivery_t::FLAG_CRC64NVME);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC32C ==
+		ceph::rdma::delivery_t::FLAG_CRC32C);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC32C_VALID ==
+		ceph::rdma::oob_result_t::FLAG_CRC32C);
   static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_VALID ==
 		ceph::rdma::oob_result_t::FLAG_CRC64NVME);
   static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_COMBINABLE ==
@@ -250,11 +254,13 @@ void librados::ObjectReadOperation::set_rdma_delivery(
 		       [result](const ceph::rdma::oob_result_t& r) {
 			 result->bytes = r.bytes;
 			 result->crc64 = r.crc64;
+			 result->crc32c = r.crc32c;
 			 result->flags = r.flags;
 			 result->ranges.clear();
 			 result->ranges.reserve(r.ranges.size());
 			 for (const auto& x : r.ranges) {
-			   result->ranges.push_back({x.ofs, x.len, x.crc64});
+			   result->ranges.push_back(
+			     {x.ofs, x.len, x.crc64, x.crc32c});
 			 }
 		       });
 }
@@ -524,11 +530,12 @@ void copy_rdma_result(const ceph::rdma::oob_result_t& r,
 {
   out->bytes = r.bytes;
   out->crc64 = r.crc64;
+  out->crc32c = r.crc32c;
   out->flags = r.flags;
   out->ranges.clear();
   out->ranges.reserve(r.ranges.size());
   for (const auto& x : r.ranges) {
-    out->ranges.push_back({x.ofs, x.len, x.crc64});
+    out->ranges.push_back({x.ofs, x.len, x.crc64, x.crc32c});
   }
 }
 } // anonymous namespace

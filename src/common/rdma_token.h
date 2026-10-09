@@ -98,8 +98,8 @@ struct delivery_t {
   /// request the canonical CRC-64/NVME of the delivered bytes in the
   /// reply's oob result (best effort - check
   /// oob_result_t::FLAG_CRC64NVME; fold crc64 only under
-  /// FLAG_CRC64_COMBINABLE, else fold the per-range values under
-  /// FLAG_CRC64_RANGES)
+  /// FLAG_COMBINABLE, else fold the per-range values under
+  /// FLAG_RANGES)
   static constexpr uint32_t FLAG_CRC64NVME = 1u << 0;
   /// set by the client library on a resent op: every earlier attempt
   /// got a reply whose result for this op was declined or landed, so
@@ -107,8 +107,14 @@ struct delivery_t {
   /// this attempt out of band as it would a first one. An OSD that
   /// does not know the bit delivers inline, as it does any resend.
   static constexpr uint32_t FLAG_PRIOR_SETTLED = 1u << 1;
+  /// request the canonical CRC-32C (Castagnoli, S3's CRC32C) of the
+  /// delivered bytes, as FLAG_CRC64NVME requests the CRC-64/NVME; the two
+  /// may be asked for together. An OSD that predates it delivers inline,
+  /// and fails a pull that asks for it.
+  static constexpr uint32_t FLAG_CRC32C = 1u << 3;
   /// flag bits the OSD understands; unknown bits deliver inline
-  static constexpr uint32_t KNOWN_FLAGS = FLAG_CRC64NVME | FLAG_PRIOR_SETTLED;
+  static constexpr uint32_t KNOWN_FLAGS = FLAG_CRC64NVME | FLAG_PRIOR_SETTLED |
+    FLAG_CRC32C;
   /**
    * The op is a WRITE or WRITEFULL that carries no data: its extent's
    * length bytes are in the client window, starting at the token's
@@ -116,8 +122,8 @@ struct delivery_t {
    * runs the op, as an OSD-direct PUT does. The op then runs as if the
    * client had sent the bytes: the primary encodes an erasure-coded
    * write and sends each shard to its OSD, or a replicated write to the
-   * replicas, as usual. With FLAG_CRC64NVME the reply's oob result
-   * carries the CRC-64/NVME of the pulled bytes.
+   * replicas, as usual. With FLAG_CRC64NVME, FLAG_CRC32C or both, the
+   * reply's oob result carries those CRCs of the pulled bytes.
    *
    * A pull is not advisory: the op has no other data. An OSD that
    * cannot pull fails the op (-EOPNOTSUPP when it has no way to read
@@ -129,7 +135,7 @@ struct delivery_t {
   static constexpr uint32_t FLAG_PULL = 1u << 2;
   /// flag bits an OSD that pulls understands on a pull; others fail it
   static constexpr uint32_t PULL_KNOWN_FLAGS = FLAG_CRC64NVME | FLAG_PULL |
-    FLAG_PRIOR_SETTLED;
+    FLAG_PRIOR_SETTLED | FLAG_CRC32C;
 
   bool is_pull() const {
     return flags & FLAG_PULL;
@@ -164,30 +170,39 @@ WRITE_CLASS_ENCODER(delivery_t)
 /**
  * One contiguous range of an out-of-band transfer: the bytes that
  * landed at client-window offset [ofs, ofs+len), and their canonical
- * CRC-64/NVME. A placement plan is a list of such ranges by
- * construction, so an executor can report one of these per plan
- * triple, and any set of them covering a window range without gaps
- * concatenate-combines in ofs order (see fold_crc64_ranges()).
+ * CRC-64/NVME and CRC-32C, each valid when the result that carries the
+ * range says so (oob_result_t::FLAG_CRC64NVME, FLAG_CRC32C). A
+ * placement plan is a list of such ranges by construction, so an
+ * executor can report one of these per plan triple, and any set of them
+ * covering a window range without gaps concatenate-combines in ofs order
+ * (see fold_crc64_ranges() and fold_crc32c_ranges()).
  */
 struct crc_range_t {
   uint64_t ofs = 0;    ///< client-window offset (token base relative)
   uint64_t len = 0;
   uint64_t crc64 = 0;
+  uint32_t crc32c = 0;
 
   bool operator==(const crc_range_t&) const = default;
 
   void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     ceph::encode(ofs, bl);
     ceph::encode(len, bl);
     ceph::encode(crc64, bl);
+    ceph::encode(crc32c, bl);  // v2
     ENCODE_FINISH(bl);
   }
   void decode(ceph::buffer::list::const_iterator& p) {
-    DECODE_START(1, p);
+    DECODE_START(2, p);
     ceph::decode(ofs, p);
     ceph::decode(len, p);
     ceph::decode(crc64, p);
+    if (struct_v >= 2) {
+      ceph::decode(crc32c, p);
+    } else {
+      crc32c = 0;
+    }
     DECODE_FINISH(p);
   }
 };
@@ -213,15 +228,22 @@ WRITE_CLASS_ENCODER(crc_range_t)
  * placement triple instead, and a caller that has every range of a
  * window can fold them in ofs order regardless of which OSD moved
  * which chunk. crc64 alone is the N=1 special case of that.
+ *
+ * The CRC-32C works the same way: FLAG_CRC32C says crc32c, and each
+ * range's crc32c, are valid. FLAG_COMBINABLE and FLAG_RANGES describe
+ * the shape of the placement, so they hold for every CRC the result
+ * carries.
  */
 struct oob_result_t {
   /// crc64 covers exactly the bytes that went out of band
   static constexpr uint32_t FLAG_CRC64NVME = 1u << 0;
-  /// ...and those bytes are one contiguous logical extent, so crc64
-  /// may be concatenate-combined in logical order
-  static constexpr uint32_t FLAG_CRC64_COMBINABLE = 1u << 1;
+  /// ...and those bytes are one contiguous logical extent, so crc64 and
+  /// crc32c may be concatenate-combined in logical order
+  static constexpr uint32_t FLAG_COMBINABLE = 1u << 1;
+  static constexpr uint32_t FLAG_CRC64_COMBINABLE = FLAG_COMBINABLE;
   /// ranges holds one crc_range_t per contiguous placed extent
-  static constexpr uint32_t FLAG_CRC64_RANGES = 1u << 2;
+  static constexpr uint32_t FLAG_RANGES = 1u << 2;
+  static constexpr uint32_t FLAG_CRC64_RANGES = FLAG_RANGES;
   /// set by the OSD: no transfer was started for this op, so nothing of
   /// it reached the window, and its data is inline. Older OSDs never set
   /// it, and a reader that does not know it treats the op as inline.
@@ -235,22 +257,27 @@ struct oob_result_t {
   /// more than once, and an earlier attempt may have started a transfer
   /// this result knows nothing of
   static constexpr uint32_t FLAG_RESENT = 1u << 5;
+  /// crc32c, and each range's crc32c, cover the bytes that went out of
+  /// band, as FLAG_CRC64NVME says of the CRC-64/NVME
+  static constexpr uint32_t FLAG_CRC32C = 1u << 6;
 
   uint64_t bytes = 0;
   uint64_t crc64 = 0;
   uint32_t flags = 0;  ///< FLAG_* above
-  std::vector<crc_range_t> ranges;  ///< valid with FLAG_CRC64_RANGES
+  std::vector<crc_range_t> ranges;  ///< valid with FLAG_RANGES
+  uint32_t crc32c = 0;  ///< valid with FLAG_CRC32C
 
   void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(2, 1, bl);
+    ENCODE_START(3, 1, bl);
     ceph::encode(bytes, bl);
     ceph::encode(crc64, bl);
     ceph::encode(flags, bl);
     ceph::encode(ranges, bl);  // v2
+    ceph::encode(crc32c, bl);  // v3
     ENCODE_FINISH(bl);
   }
   void decode(ceph::buffer::list::const_iterator& p) {
-    DECODE_START(2, p);
+    DECODE_START(3, p);
     ceph::decode(bytes, p);
     ceph::decode(crc64, p);
     ceph::decode(flags, p);
@@ -258,6 +285,12 @@ struct oob_result_t {
       ceph::decode(ranges, p);
     } else {
       ranges.clear();
+    }
+    if (struct_v >= 3) {
+      ceph::decode(crc32c, p);
+    } else {
+      crc32c = 0;
+      flags &= ~FLAG_CRC32C;
     }
     DECODE_FINISH(p);
   }
@@ -354,5 +387,19 @@ inline bool prior_attempts_settled(const std::vector<delivery_t>& deliveries)
  * without gaps or overlaps; returns nullopt otherwise, or when empty.
  */
 std::optional<uint64_t> fold_crc64_ranges(std::vector<crc_range_t> ranges);
+
+/// fold_crc64_ranges() for the ranges' CRC-32C values
+std::optional<uint32_t> fold_crc32c_ranges(std::vector<crc_range_t> ranges);
+
+/**
+ * The canonical CRC-32C (Castagnoli: init and xorout all ones,
+ * reflected) of bl: the value that S3's x-amz-checksum-crc32c renders as
+ * base64 of its big-endian bytes.
+ */
+uint32_t crc32c_canonical(const ceph::buffer::list& bl);
+
+/// the canonical CRC-32C of A followed by B, from those of A and of B,
+/// where len_b is the length of B
+uint32_t crc32c_combine(uint32_t crc_a, uint32_t crc_b, uint64_t len_b);
 
 } // namespace ceph::rdma

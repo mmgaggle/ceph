@@ -2817,6 +2817,30 @@ void RGWGetObj::select_rdma_mode(bool plain_chain)
   // otherwise NONE: data goes over HTTP with x-amz-rdma-reply: 501
 }
 
+/// the object's stored checksum, when it is a full-object CRC-64/NVME
+/// or CRC-32C, which an out-of-band GET of the whole object compares
+/// with what the OSDs deliver
+static std::optional<rgw::cksum::Cksum> stored_full_crc(
+  const rgw::sal::Attrs& attrs)
+{
+  auto it = attrs.find(RGW_ATTR_CKSUM);
+  if (it == attrs.end()) {
+    return std::nullopt;
+  }
+  try {
+    rgw::cksum::Cksum stored;
+    auto bp = it->second.cbegin();
+    decode(stored, bp);
+    if ((stored.type == rgw::cksum::Type::crc64nvme ||
+         stored.type == rgw::cksum::Type::crc32c) && !stored.composite()) {
+      return stored;
+    }
+  } catch (const buffer::error&) {
+    // an undecodable attr verifies nothing
+  }
+  return std::nullopt;
+}
+
 void RGWGetObj::execute(optional_yield y)
 {
   bufferlist bl;
@@ -3092,7 +3116,23 @@ void RGWGetObj::execute(optional_yield y)
   if (rdma_oob_mode()) {
     read_op->params.rdma_token = rdma_token;
     read_op->params.rdma_bytes = &rdma_bytes;
-    read_op->params.rdma_crc64 = &rdma_crc64;
+    // the CRCs to ask the OSDs for: those the client asked for, and the
+    // type of the object's stored full-object checksum, with which a
+    // whole-object GET compares what the OSDs deliver
+    rgw::rdma::cksum_want want;
+    if (s->cct->_conf.get_val<bool>("rgw_rdma_checksum")) {
+      want = rdma_cksum_asked;
+      if (ofs == 0 && total_len == s->obj_size) {
+        if (auto stored = stored_full_crc(attrs); stored) {
+          want.crc64nvme |= stored->type == rgw::cksum::Type::crc64nvme;
+          want.crc32c |= stored->type == rgw::cksum::Type::crc32c;
+        }
+      }
+    }
+    rdma_crc64.reset();
+    rdma_crc32c.reset();
+    read_op->params.rdma_crc64 = want.crc64nvme ? &rdma_crc64 : nullptr;
+    read_op->params.rdma_crc32c = want.crc32c ? &rdma_crc32c : nullptr;
   }
 
   op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
@@ -3115,8 +3155,10 @@ void RGWGetObj::execute(optional_yield y)
     read_op->params.rdma_token.clear();
     read_op->params.rdma_bytes = nullptr;
     read_op->params.rdma_crc64 = nullptr;
+    read_op->params.rdma_crc32c = nullptr;
     rdma_bytes = 0;
     rdma_crc64.reset();
+    rdma_crc32c.reset();
     select_rdma_mode(false);
     // send_response_data() emits the response header from op_ret on the
     // first handle_data() of the retry, and skips the body when it is
@@ -3155,35 +3197,30 @@ void RGWGetObj::execute(optional_yield y)
 
     // end-to-end integrity: the OSDs checksummed each stripe after the
     // RDMA write; for a whole-object GET the combined value must match
-    // the object's stored full-object checksum. No HTTP bytes are
-    // committed yet, so a mismatch can still fail the request cleanly.
-    if (rdma_crc64 && ofs == 0 && total_len == s->obj_size) {
-      if (auto it = attrs.find(RGW_ATTR_CKSUM); it != attrs.end()) {
-        try {
-          rgw::cksum::Cksum stored;
-          auto bp = it->second.cbegin();
-          decode(stored, bp);
-          if (stored.type == rgw::cksum::Type::crc64nvme &&
-              !stored.composite()) {
-            // mirror combine_crc_cksum's at-rest byte order handling
-            uint64_t swapped = rgw::digest::byteswap(*rdma_crc64);
-            rgw::cksum::Cksum computed(rgw::cksum::Type::crc64nvme,
-                                       reinterpret_cast<char*>(&swapped),
-                                       rgw::cksum::Cksum::CtorStyle::raw);
-            if (computed.to_armor() != stored.to_armor()) {
-              ldpp_dout(this, 0) << "ERROR: rdma passthrough crc64nvme "
-                                 << "mismatch: delivered " << computed.to_armor()
-                                 << " != stored " << stored.to_armor() << dendl;
-              op_ret = -EIO;
-              rdma_failed_at = "the delivered checksum";
-              goto done_err;
-            }
-            ldpp_dout(this, 20) << "rdma passthrough crc64nvme verified: "
-                                << computed.to_armor() << dendl;
-          }
-        } catch (const buffer::error&) {
-          ldpp_dout(this, 5) << "WARNING: undecodable cksum attr, skipping "
-                             << "rdma crc verification" << dendl;
+    // the object's stored full-object checksum, CRC-64/NVME or CRC-32C.
+    // No HTTP bytes are committed yet, so a mismatch can still fail the
+    // request cleanly.
+    if (ofs == 0 && total_len == s->obj_size) {
+      if (auto stored = stored_full_crc(attrs); stored) {
+        std::optional<rgw::cksum::Cksum> computed;
+        if (stored->type == rgw::cksum::Type::crc64nvme && rdma_crc64) {
+          computed = rgw::rdma::cksum_crc64nvme(*rdma_crc64);
+        } else if (stored->type == rgw::cksum::Type::crc32c && rdma_crc32c) {
+          computed = rgw::rdma::cksum_crc32c(*rdma_crc32c);
+        }
+        if (computed && computed->to_armor() != stored->to_armor()) {
+          ldpp_dout(this, 0) << "ERROR: rdma passthrough "
+                             << rgw::cksum::to_string(stored->type)
+                             << " mismatch: delivered " << computed->to_armor()
+                             << " != stored " << stored->to_armor() << dendl;
+          op_ret = -EIO;
+          rdma_failed_at = "the delivered checksum";
+          goto done_err;
+        }
+        if (computed) {
+          ldpp_dout(this, 20) << "rdma passthrough "
+                              << rgw::cksum::to_string(stored->type)
+                              << " verified: " << computed->to_armor() << dendl;
         }
       }
     }
@@ -5311,8 +5348,9 @@ void RGWPutObj::execute(optional_yield y)
     } else if (run_lua) {
       osd_put_refusal = "a Lua data filter";
     } else if (cksum_filter &&
-               cksum_filter->type() != rgw::cksum::Type::crc64nvme) {
-      osd_put_refusal = "a checksum other than CRC64NVME";
+               cksum_filter->type() != rgw::cksum::Type::crc64nvme &&
+               cksum_filter->type() != rgw::cksum::Type::crc32c) {
+      osd_put_refusal = "a checksum other than CRC64NVME or CRC32C";
     }
     if (osd_put_refusal) {
       osd_put = false;
@@ -5357,7 +5395,6 @@ void RGWPutObj::execute(optional_yield y)
   }
 
   std::string pulled_etag;
-  uint64_t pulled_crc64 = 0;
 #ifdef WITH_RADOSGW_CUOBJ
   if (rdma_put) {
     size_t total = RGWCuObjServer::parse_rdma_descriptor_size(rdma_descr);
@@ -5431,29 +5468,44 @@ void RGWPutObj::execute(optional_yield y)
       op_ret = -ERR_TOO_LARGE;
       return;
     }
+    // the ETag is built from every stripe's CRC-64/NVME; the object's
+    // checksum is the CRC-32C when the client chose that, else the
+    // CRC-64/NVME
+    const bool want32c = cksum_filter &&
+      cksum_filter->type() == rgw::cksum::Type::crc32c;
+    const uint32_t want =
+      librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC64 |
+      (want32c ? librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC32C : 0);
     std::vector<rgw::sal::PulledStripe> stripes;
     tracepoint(rgw_op, before_data_transfer, s->req_id.c_str());
-    op_ret = processor->process_pulled(total, *rdma_put_token, &stripes);
+    op_ret = processor->process_pulled(total, *rdma_put_token, want, &stripes);
     tracepoint(rgw_op, after_data_transfer, s->req_id.c_str(), total);
-    // every stripe must have arrived whole, with its checksum: the
+    // every stripe must have arrived whole, with its checksums: the
     // object's checksum and ETag are built from them
     std::optional<uint64_t> crc;
+    std::optional<uint32_t> crc32c;
     if (op_ret == 0) {
       for (const auto& st : stripes) {
-        if (st.bytes != st.len || !st.crc64_valid) {
+        const bool sums = st.crc64_valid && (!want32c || st.crc32c_valid);
+        if (st.bytes != st.len || !sums) {
           ldpp_dout(this, 1) << "OSD-direct PUT: the stripe at " << st.ofs
                              << " reported " << st.bytes << " of " << st.len
                              << " bytes"
-                             << (st.crc64_valid ? "" : ", and no checksum")
+                             << (sums ? "" : ", and not every checksum")
                              << dendl;
           op_ret = -EIO;
           break;
         }
         crc = crc ? ceph::crc64nvme_combine(*crc, st.crc64, st.len)
                   : st.crc64;
+        if (want32c) {
+          crc32c = crc32c ?
+            ceph::rdma::crc32c_combine(*crc32c, st.crc32c, st.len) :
+            st.crc32c;
+        }
       }
     }
-    if (op_ret < 0 || !crc) {
+    if (op_ret < 0 || !crc || (want32c && !crc32c)) {
       // nothing is visible: the head was not written, and the writer
       // removes the stripes it wrote
       ldpp_dout(this, 1) << "OSD-direct PUT of " << total << " bytes failed: "
@@ -5469,7 +5521,8 @@ void RGWPutObj::execute(optional_yield y)
     s->obj_size = total;
     s->object->set_obj_size(total);
     s->rdma_bytes_transferred = total;
-    pulled_crc64 = *crc;
+    rdma_pulled_crc64 = crc;
+    rdma_pulled_crc32c = crc32c;
     pulled_etag = osd_put_etag(stripes);
     rdma_pulled = true;
   }
@@ -5634,18 +5687,20 @@ void RGWPutObj::execute(optional_yield y)
 
   if (rdma_pulled) {
     // the OSDs' checksums of what they pulled, folded in object order:
-    // the object's full CRC-64/NVME, which the client's must match, and
-    // which a later passthrough GET compares with what the OSDs deliver
-    uint64_t swapped = rgw::digest::byteswap(pulled_crc64);
-    rgw::cksum::Cksum pulled(rgw::cksum::Type::crc64nvme,
-                             reinterpret_cast<char*>(&swapped),
-                             rgw::cksum::Cksum::CtorStyle::raw);
-    const auto expected =
-      s->info.env->get_optional("HTTP_X_AMZ_CHECKSUM_CRC64NVME");
+    // the object's full CRC-32C when the client chose it, else its full
+    // CRC-64/NVME. The client's must match, and a later passthrough GET
+    // compares it with what the OSDs deliver.
+    const bool is32c = rdma_pulled_crc32c.has_value();
+    const rgw::cksum::Cksum pulled = is32c ?
+      rgw::rdma::cksum_crc32c(*rdma_pulled_crc32c) :
+      rgw::rdma::cksum_crc64nvme(*rdma_pulled_crc64);
+    const auto expected = s->info.env->get_optional(
+      is32c ? "HTTP_X_AMZ_CHECKSUM_CRC32C" : "HTTP_X_AMZ_CHECKSUM_CRC64NVME");
     if (expected && *expected != pulled.to_armor()) {
-      ldpp_dout(this, 4) << "OSD-direct PUT: CRC64NVME mismatch: pulled "
-                         << pulled.to_armor() << " != expected " << *expected
-                         << dendl;
+      ldpp_dout(this, 4) << "OSD-direct PUT: "
+                         << (is32c ? "CRC32C" : "CRC64NVME")
+                         << " mismatch: pulled " << pulled.to_armor()
+                         << " != expected " << *expected << dendl;
       op_ret = -ERR_BAD_DIGEST;
       return;
     }

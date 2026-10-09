@@ -1184,8 +1184,11 @@ class Object {
         /// out: bytes delivered out of band by iterate()
         uint64_t* rdma_bytes{nullptr};
         /// out: canonical CRC64-NVME of the delivered bytes, combined in
-        /// logical order - set only when every stripe reported one
+        /// logical order - set only when every stripe reported one. A
+        /// null pointer asks the OSDs for none.
         std::optional<uint64_t>* rdma_crc64{nullptr};
+        /// out: the same for the canonical CRC-32C
+        std::optional<uint32_t>* rdma_crc32c{nullptr};
         /// out: true when iterate() sent at least one descriptor-bearing
         /// operation to the OSDs (fence-wait gating on fallback)
         bool rdma_submitted{false};
@@ -1844,6 +1847,8 @@ struct PulledStripe {
   uint64_t bytes = 0;  ///< bytes the OSD pulled, as it reported them
   uint64_t crc64 = 0;  ///< CRC-64/NVME of those bytes, with crc64_valid
   bool crc64_valid = false;
+  uint32_t crc32c = 0; ///< CRC-32C of those bytes, with crc32c_valid
+  bool crc32c_valid = false;
 };
 
 class Writer : public ObjectProcessor {
@@ -1884,11 +1889,14 @@ public:
   /**
    * After set_pulled() and prepare(), instead of process(): write the
    * object's len bytes as stripes, which the storage pulls out of the
-   * client window that token names, from its start. Returns once every
-   * stripe is written, with one entry per stripe, in order, in *stripes;
-   * or a negative errno, with nothing of the object visible.
+   * client window that token names, from its start. want is a mask of
+   * librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC64 and
+   * RDMA_DELIVERY_WANT_CRC32C, the CRCs each stripe reports. Returns once
+   * every stripe is written, with one entry per stripe, in order, in
+   * *stripes; or a negative errno, with nothing of the object visible.
    */
   virtual int process_pulled(uint64_t len, const std::string& token,
+                             uint32_t want,
                              std::vector<PulledStripe>* stripes) {
     return -EOPNOTSUPP;
   }

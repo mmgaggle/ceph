@@ -1118,6 +1118,7 @@ public:
 
   virtual bool set_pulled() override;
   virtual int process_pulled(uint64_t len, const std::string& token,
+                             uint32_t want,
                              std::vector<PulledStripe>* stripes) override;
 
   // complete the operation and make its result visible to clients

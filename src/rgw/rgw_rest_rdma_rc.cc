@@ -224,16 +224,6 @@ int parse_ready(req_state* s, ReadyRequest& out)
   return 0;
 }
 
-std::string armor_crc64nvme(uint64_t canonical)
-{
-  // the S3 rendering is the big-endian bytes, as combine_crc_cksum does
-  uint64_t swapped = rgw::digest::byteswap(canonical);
-  rgw::cksum::Cksum c(rgw::cksum::Type::crc64nvme,
-                      reinterpret_cast<char*>(&swapped),
-                      rgw::cksum::Cksum::CtorStyle::raw);
-  return c.to_armor();
-}
-
 /// status line, protocol echo and (for errors) the error body
 void send_status(req_state* s, RGWOp* op, int op_ret, const Status& st)
 {
@@ -276,7 +266,9 @@ class GetOp : public RGWGetObj {
   uint32_t depth = 1;
 
   uint64_t bytes_done = 0;
-  std::optional<uint64_t> final_crc;
+  /// the CRCs of the delivered bytes that the client asked for
+  std::optional<uint64_t> final_crc64;
+  std::optional<uint32_t> final_crc32c;
   std::string etag;
 
  public:
@@ -303,6 +295,14 @@ class GetOp : public RGWGetObj {
   }
 
   int get_params(optional_yield y) override {
+    // the CRC of the delivered bytes the READY answer reports
+    if (rgw::rdma::parse_checksum_algorithm(
+          s->info.env->get("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", nullptr),
+          &rdma_cksum_asked) < 0) {
+      s->err.message = "x-amz-rdma-checksum-algorithm must be CRC64NVME "
+                       "or CRC32C";
+      return -EINVAL;
+    }
     // the range is the session's, never a Range header
     range_str = nullptr;
     if_mod = if_unmod = if_match = if_nomatch = nullptr;
@@ -556,11 +556,18 @@ void GetOp::execute_ready(optional_yield y)
     outcome = push_outcome != Outcome::OK ? push_outcome : Outcome::BACKEND_FAIL;
   } else {
     bytes_done = total_len;
-    if (rdma_crc64 && rdma_mode == RdmaMode::RELAY) {
-      // the OSDs' own checksums of the bytes they placed
-      final_crc = *rdma_crc64;
-    } else if (s->cct->_conf.get_val<bool>("rgw_rdma_crc64nvme")) {
-      final_crc = ceph::crc64nvme(0, sess->buf->ptr, total_len);
+    if (s->cct->_conf.get_val<bool>("rgw_rdma_checksum")) {
+      // the OSDs' own checksums of the bytes they placed, when they
+      // relayed them; else the gateway's, of its buffer
+      const bool relay = rdma_mode == RdmaMode::RELAY;
+      if (rdma_cksum_asked.crc64nvme) {
+        final_crc64 = relay && rdma_crc64 ? *rdma_crc64 :
+          ceph::crc64nvme(0, sess->buf->ptr, total_len);
+      }
+      if (rdma_cksum_asked.crc32c) {
+        final_crc32c = relay && rdma_crc32c ? *rdma_crc32c :
+          rgw::rdma::crc32c_of(sess->buf->ptr, total_len);
+      }
     }
     if (auto it = attrs.find(RGW_ATTR_ETAG); it != attrs.end()) {
       etag = it->second.to_str();
@@ -610,10 +617,15 @@ void GetOp::send_response()
       dump_etag(s, etag);
     }
     dump_header_if_nonempty(s, "x-amz-rdma-version-id", version_id);
-    if (final_crc) {
-      const auto armored = armor_crc64nvme(*final_crc);
-      dump_header(s, "x-amz-rdma-checksum", format_checksum_crc64nvme(armored));
-      dump_header(s, "x-amz-checksum-crc64nvme", armored);
+    // the checksums of the delivered range, not of the object, so not
+    // in S3's x-amz-checksum-<algorithm>
+    if (final_crc64) {
+      dump_header(s, rgw::rdma::HDR_CRC64NVME,
+                  rgw::rdma::cksum_crc64nvme(*final_crc64).to_armor());
+    }
+    if (final_crc32c) {
+      dump_header(s, rgw::rdma::HDR_CRC32C,
+                  rgw::rdma::cksum_crc32c(*final_crc32c).to_armor());
     }
   }
   end_header(s, this, nullptr, 0);
@@ -634,7 +646,10 @@ class PutOp : public RGWPutObj_ObjStore_S3 {
   Session* sess = nullptr;
   uint64_t cursor = 0;
   uint64_t bytes_done = 0;
-  std::optional<uint64_t> final_crc;
+  /// the CRCs of the session buffer that the client asked for
+  rgw::rdma::cksum_want cksum_asked;
+  std::optional<uint64_t> final_crc64;
+  std::optional<uint32_t> final_crc32c;
 
  public:
   explicit PutOp(bool prepare) : prepare_phase(prepare) {}
@@ -660,6 +675,13 @@ class PutOp : public RGWPutObj_ObjStore_S3 {
     // control requests carry no body; a client may omit Content-Length
     if (!s->length) {
       s->length = "0";
+    }
+    if (rgw::rdma::parse_checksum_algorithm(
+          s->info.env->get("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", nullptr),
+          &cksum_asked) < 0) {
+      s->err.message = "x-amz-rdma-checksum-algorithm must be CRC64NVME "
+                       "or CRC32C";
+      return -EINVAL;
     }
     return RGWPutObj_ObjStore_S3::get_params(y);
   }
@@ -740,8 +762,13 @@ void PutOp::execute(optional_yield y)
     s->content_length = sess->size;
     // the body is the session buffer, whatever token READY carries
     rdma_staging_allowed = false;
-    if (s->cct->_conf.get_val<bool>("rgw_rdma_crc64nvme")) {
-      final_crc = ceph::crc64nvme(0, sess->buf->ptr, sess->size);
+    if (s->cct->_conf.get_val<bool>("rgw_rdma_checksum")) {
+      if (cksum_asked.crc64nvme) {
+        final_crc64 = ceph::crc64nvme(0, sess->buf->ptr, sess->size);
+      }
+      if (cksum_asked.crc32c) {
+        final_crc32c = rgw::rdma::crc32c_of(sess->buf->ptr, sess->size);
+      }
     }
     RGWPutObj_ObjStore_S3::execute(y);
     if (op_ret < 0) {
@@ -778,10 +805,18 @@ void PutOp::send_response()
       dump_etag(s, etag);
     }
     dump_header_if_nonempty(s, "x-amz-rdma-version-id", version_id);
-    if (final_crc) {
-      const auto armored = armor_crc64nvme(*final_crc);
-      dump_header(s, "x-amz-rdma-checksum", format_checksum_crc64nvme(armored));
-      dump_header(s, "x-amz-checksum-crc64nvme", armored);
+    // the checksums of the bytes the client wrote, and the object's
+    // stored one, as S3 reports it
+    if (final_crc64) {
+      dump_header(s, rgw::rdma::HDR_CRC64NVME,
+                  rgw::rdma::cksum_crc64nvme(*final_crc64).to_armor());
+    }
+    if (final_crc32c) {
+      dump_header(s, rgw::rdma::HDR_CRC32C,
+                  rgw::rdma::cksum_crc32c(*final_crc32c).to_armor());
+    }
+    if (cksum && cksum->aws()) {
+      dump_header(s, cksum->header_name(), cksum->to_armor());
     }
   }
   end_header(s, this, nullptr, 0);

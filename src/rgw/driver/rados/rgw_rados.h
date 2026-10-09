@@ -800,6 +800,7 @@ public:
         std::string rdma_token;
         uint64_t *rdma_bytes = nullptr;
         std::optional<uint64_t> *rdma_crc64 = nullptr;
+        std::optional<uint32_t> *rdma_crc32c = nullptr;
         bool rdma_submitted = false; // out: descriptor-bearing ops reached OSDs
         double rdma_fence = 0; // out: longest delivery lease plus drain
                                // (seconds) among the pools those ops

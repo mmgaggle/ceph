@@ -104,9 +104,10 @@ class RadosWriter : public rgw::sal::DataProcessor {
 
   /// write len bytes to the current stripe object, which its primary
   /// OSD pulls out of the client window token names, at client_ofs; the
-  /// OSD's report lands in *result once the write completed (drain())
+  /// OSD's report, with the CRCs that want asks for, lands in *result
+  /// once the write completed (drain())
   int process_pulled(uint64_t len, const std::string& token,
-                     uint64_t client_ofs,
+                     uint64_t client_ofs, uint32_t want,
                      librados::ObjectOperation::rdma_delivery_result* result);
 
   int drain();
@@ -204,7 +205,7 @@ class AtomicObjectProcessor : public ManifestObjectProcessor {
   void set_pulled() { pulled = true; }
   /// after prepare(): write len bytes, a stripe at a time, each pulled
   /// by its primary OSD; see rgw::sal::Writer::process_pulled()
-  int process_pulled(uint64_t len, const std::string& token,
+  int process_pulled(uint64_t len, const std::string& token, uint32_t want,
                      std::vector<rgw::sal::PulledStripe>* stripes);
 
   int prepare(optional_yield y) override;

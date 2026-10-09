@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 smarttab ft=cpp
 
 #include "rgw/rgw_rdma_rc_wire.h"
+#include "rgw/rgw_rdma_cksum.h"
 
 #include <gtest/gtest.h>
 
@@ -191,9 +192,25 @@ TEST(RdmaRcWire, BuildTargetRoundTrip)
   EXPECT_EQ("versionId=v1", t->query);
 }
 
-TEST(RdmaRcWire, ChecksumHeader)
+TEST(RdmaRcWire, ChecksumHeaders)
 {
-  EXPECT_EQ("CRC64NVME AAAAAAAAAAA=", format_checksum_crc64nvme("AAAAAAAAAAA="));
+  // the check values of "123456789", rendered as S3 renders them
+  EXPECT_EQ("rosUhgp5mIg=",
+            rgw::rdma::cksum_crc64nvme(0xae8b14860a799888ull).to_armor());
+  EXPECT_EQ("4waSgw==", rgw::rdma::cksum_crc32c(0xe3069283u).to_armor());
+  EXPECT_EQ(0xe3069283u, rgw::rdma::crc32c_of("123456789", 9));
+
+  rgw::rdma::cksum_want w;
+  ASSERT_EQ(0, rgw::rdma::parse_checksum_algorithm(nullptr, &w));
+  EXPECT_TRUE(w.crc64nvme);
+  EXPECT_FALSE(w.crc32c);
+  ASSERT_EQ(0, rgw::rdma::parse_checksum_algorithm("crc32c", &w));
+  EXPECT_FALSE(w.crc64nvme);
+  EXPECT_TRUE(w.crc32c);
+  ASSERT_EQ(0, rgw::rdma::parse_checksum_algorithm("CRC64NVME", &w));
+  EXPECT_TRUE(w.crc64nvme);
+  EXPECT_EQ(-EINVAL, rgw::rdma::parse_checksum_algorithm("SHA256", &w));
+  EXPECT_EQ(-EINVAL, rgw::rdma::parse_checksum_algorithm("", &w));
 }
 
 TEST(RdmaRcWire, SignedHeaders)

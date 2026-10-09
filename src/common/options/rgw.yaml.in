@@ -4732,18 +4732,19 @@ options:
   see_also:
   - osd_oob_pull
   - rgw_rdma_osd_passthrough
-- name: rgw_rdma_crc64nvme
+- name: rgw_rdma_checksum
   type: bool
   level: advanced
-  desc: Compute CRC-64/NVME checksums of out-of-band transfers
-  long_desc: For OSD passthrough, the gateway asks the OSDs to checksum each
-    stripe as they deliver it, combines the values, and compares whole-object
-    GETs with the object's stored full-object crc64nvme checksum before it
-    responds. This covers the storage node and the data's path inside the
-    cluster; the write into client memory relies on the transport's own
-    integrity checks. For hipobj-rc-v2 sessions, the gateway reports the
-    checksum of the delivered bytes in the READY answer
-    (X-Amz-Rdma-Checksum), which lets the client test its own buffer.
+  desc: Compute checksums of out-of-band transfers
+  long_desc: For OSD passthrough, the gateway asks the OSDs for the CRC-64/NVME
+    or the CRC-32C of each stripe they deliver, as the client asks with
+    x-amz-rdma-checksum-algorithm, and for the type of the object's stored
+    full-object checksum. It combines the values, reports them in
+    x-amz-rdma-checksum-crc64nvme or x-amz-rdma-checksum-crc32c, which lets
+    the client test its own buffer, and compares whole-object GETs with the
+    stored checksum before it responds. For hipobj-rc-v2 sessions, the READY
+    answer reports the same headers. An OSD-direct PUT always asks the OSDs
+    for checksums, whatever this option says.
   default: true
   services:
   - rgw

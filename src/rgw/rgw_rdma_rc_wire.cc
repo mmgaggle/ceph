@@ -379,9 +379,4 @@ std::optional<std::vector<push_t>> plan_pushes(uint64_t prefix, uint64_t pushed,
   return out;
 }
 
-std::string format_checksum_crc64nvme(std::string_view armored)
-{
-  return fmt::format("CRC64NVME {}", armored);
-}
-
 } // namespace rgw::rdma::rc

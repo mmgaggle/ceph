@@ -7,13 +7,16 @@
  * Registers the object's bytes as a window that peers may read, puts
  * its endpoint name and key in x-amz-rdma-token, and sends a SigV4 S3
  * PUT with no body, with the object's CRC-64/NVME in
- * x-amz-checksum-crc64nvme. With rgw_rdma_osd_put, the gateway writes
+ * x-amz-checksum-crc64nvme, or its CRC-32C in x-amz-checksum-crc32c when
+ * OFI_S3_CKSUM=CRC32C. With rgw_rdma_osd_put, the gateway writes
  * the object as stripes, and the primary OSD of each RDMA-reads its
  * stripe out of the window. A progress thread polls the provider, so
  * that a provider with manual progress serves the reads. The client then
  * reads the object back over plain HTTP and compares it with the file.
  * A 501 with x-amz-rdma-reply 501 means the gateway declined, and the
- * client sends the body instead, as a real client would.
+ * client sends the body instead, as a real client would. A pulled PUT
+ * must report the stored checksum, and the OSDs' CRCs of what they
+ * pulled in x-amz-rdma-checksum-<algorithm>, all equal to this client's.
  *
  * For tests of the failure paths: OFI_S3_PUT_CRC=<base64> sends that
  * checksum instead of the object's, which the gateway must refuse with
@@ -32,64 +35,24 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <vector>
 
 #include "common/ofi_rma.h"
+#include "ofi_s3_cksum.h"
 
 namespace {
-
-/// CRC-64/NVME (reflected 0xad93d23594c93659, init and xorout all ones),
-/// as S3's x-amz-checksum-crc64nvme
-uint64_t crc64nvme(const char* p, size_t n)
-{
-  static const auto table = [] {
-    std::array<uint64_t, 256> t{};
-    for (uint64_t i = 0; i < 256; i++) {
-      uint64_t c = i;
-      for (int k = 0; k < 8; k++) {
-	c = (c & 1) ? (c >> 1) ^ 0x9a6c9329ac4bc9b5ull : c >> 1;
-      }
-      t[i] = c;
-    }
-    return t;
-  }();
-  uint64_t crc = ~0ull;
-  for (size_t i = 0; i < n; i++) {
-    crc = table[(crc ^ static_cast<unsigned char>(p[i])) & 0xff] ^ (crc >> 8);
-  }
-  return ~crc;
-}
-
-/// S3's rendering of a CRC-64/NVME: base64 of its big-endian bytes
-std::string armor(uint64_t crc)
-{
-  static const char* b64 =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  unsigned char be[8];
-  for (int i = 0; i < 8; i++) {
-    be[i] = static_cast<unsigned char>(crc >> (56 - 8 * i));
-  }
-  std::string out;
-  for (int i = 0; i < 8; i += 3) {
-    const uint32_t v = (be[i] << 16) | ((i + 1 < 8 ? be[i + 1] : 0) << 8) |
-      (i + 2 < 8 ? be[i + 2] : 0);
-    out += b64[(v >> 18) & 63];
-    out += b64[(v >> 12) & 63];
-    out += i + 1 < 8 ? b64[(v >> 6) & 63] : '=';
-    out += i + 2 < 8 ? b64[v & 63] : '=';
-  }
-  return out;
-}
 
 struct http_result {
   long status = 0;
   std::string reply;      // x-amz-rdma-reply
   std::string bytes;      // x-amz-rdma-bytes-transferred
-  std::string rdma_cksum; // x-amz-rdma-checksum
-  std::string cksum;      // x-amz-checksum-crc64nvme
+  std::string rdma_crc64;  // x-amz-rdma-checksum-crc64nvme
+  std::string rdma_crc32c; // x-amz-rdma-checksum-crc32c
+  std::string cksum;       // x-amz-checksum-crc64nvme or -crc32c
   std::string etag;
   std::string body;
   std::string error;
@@ -109,8 +72,10 @@ size_t on_header(char* p, size_t size, size_t n, void* arg)
       value.pop_back();
     if (name == "x-amz-rdma-reply") r->reply = value;
     if (name == "x-amz-rdma-bytes-transferred") r->bytes = value;
-    if (name == "x-amz-rdma-checksum") r->rdma_cksum = value;
-    if (name == "x-amz-checksum-crc64nvme") r->cksum = value;
+    if (name == "x-amz-rdma-checksum-crc64nvme") r->rdma_crc64 = value;
+    if (name == "x-amz-rdma-checksum-crc32c") r->rdma_crc32c = value;
+    if (name == "x-amz-checksum-crc64nvme" || name == "x-amz-checksum-crc32c")
+      r->cksum = value;
     if (name == "etag") r->etag = value;
   }
   return size * n;
@@ -189,10 +154,14 @@ int main(int argc, char** argv)
 		 "<bucket> <key> <access> <secret> <file>\n", argv[0]);
     return 2;
   }
-  if (crc64nvme("123456789", 9) != 0xae8b14860a799888ull) {
-    std::fprintf(stderr, "CRC-64/NVME self-test failed\n");
+  if (!ofi_s3::self_test()) {
+    std::fprintf(stderr, "CRC self-test failed\n");
     return 2;
   }
+  const char* alg_env = std::getenv("OFI_S3_CKSUM");
+  const bool use32c = alg_env && strcasecmp(alg_env, "CRC32C") == 0;
+  const std::string cksum_hdr =
+    use32c ? "x-amz-checksum-crc32c: " : "x-amz-checksum-crc64nvme: ";
   ceph::ofi::config_t cfg;
   cfg.provider = argv[1];
   cfg.domain = arg_or_empty(argv[2]);
@@ -240,24 +209,29 @@ int main(int argc, char** argv)
     return 1;
   }
   const std::string token = ep->window_token(w, 0, size);
-  const std::string crc = armor(crc64nvme(window, size));
+  const std::string crc64 = ofi_s3::armor_crc64nvme(window, size);
+  const std::string crc32c = ofi_s3::armor_crc32c(window, size);
+  const std::string crc = use32c ? crc32c : crc64;
   const char* crc_env = std::getenv("OFI_S3_PUT_CRC");
   const std::string sent_crc = crc_env ? crc_env : crc;
-  std::printf("%s\nwindow %zu bytes, CRC64NVME %s, token %s\n",
-	      ep->describe().c_str(), size, crc.c_str(), token.c_str());
+  std::printf("%s\nwindow %zu bytes, CRC64NVME %s, CRC32C %s, token %s\n",
+	      ep->describe().c_str(), size, crc64.c_str(), crc32c.c_str(),
+	      token.c_str());
 
   const std::string url = endpoint + "/" + bucket + "/" + key;
   const auto t0 = std::chrono::steady_clock::now();
   http_result res = request(url, userpwd, "PUT",
 			    {"x-amz-rdma-token: " + token,
-			     "x-amz-checksum-crc64nvme: " + sent_crc},
+			     cksum_hdr + sent_crc},
 			    nullptr);
   const double ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - t0).count();
   std::printf("PUT: HTTP %ld, x-amz-rdma-reply %s, bytes %s, ETag %s, "
-	      "x-amz-checksum-crc64nvme %s, x-amz-rdma-checksum %s, %.1f ms\n",
+	      "%s%s, x-amz-rdma-checksum-crc64nvme %s, "
+	      "x-amz-rdma-checksum-crc32c %s, %.1f ms\n",
 	      res.status, res.reply.c_str(), res.bytes.c_str(),
-	      res.etag.c_str(), res.cksum.c_str(), res.rdma_cksum.c_str(), ms);
+	      res.etag.c_str(), cksum_hdr.c_str(), res.cksum.c_str(),
+	      res.rdma_crc64.c_str(), res.rdma_crc32c.c_str(), ms);
   bool pulled = true;
   if (!res.error.empty()) {
     std::printf("FAIL: PUT failed: %s\n", res.error.c_str());
@@ -267,7 +241,7 @@ int main(int argc, char** argv)
     // declined: nothing was stored; send the body, as a client would
     std::printf("declined: %s\n", res.body.c_str());
     pulled = false;
-    res = request(url, userpwd, "PUT", {"x-amz-checksum-crc64nvme: " + crc},
+    res = request(url, userpwd, "PUT", {cksum_hdr + crc},
 		  &data);
     std::printf("PUT with body: HTTP %ld\n", res.status);
   }
@@ -293,6 +267,15 @@ int main(int argc, char** argv)
     if (res.cksum != crc) {
       std::printf("FAIL: the stored checksum %s is not the client's %s\n",
 		  res.cksum.c_str(), crc.c_str());
+      return 1;
+    }
+    // the OSDs' CRCs of what they pulled: CRC-64/NVME always, for the
+    // ETag, and CRC-32C when the client chose it
+    if (res.rdma_crc64 != crc64 || (use32c && res.rdma_crc32c != crc32c) ||
+	(!use32c && !res.rdma_crc32c.empty())) {
+      std::printf("FAIL: the OSDs' checksums (%s, %s) are not this client's "
+		  "(%s, %s)\n", res.rdma_crc64.c_str(), res.rdma_crc32c.c_str(),
+		  crc64.c_str(), use32c ? crc32c.c_str() : "none");
       return 1;
     }
   }

@@ -197,9 +197,4 @@ std::optional<std::vector<push_t>> plan_pushes(uint64_t prefix, uint64_t pushed,
                                                uint64_t total, bool final,
                                                const push_policy& p = {});
 
-/// value of the FINAL response's X-Amz-Rdma-Checksum header for a
-/// CRC-64/NVME rendered the way S3 does (base64 of the 8 big-endian
-/// bytes, 12 characters)
-std::string format_checksum_crc64nvme(std::string_view armored);
-
 } // namespace rgw::rdma::rc

@@ -100,13 +100,17 @@ usual. In an erasure-coded pool, the primary encodes the stripe and
 sends each shard to its OSD. In a replicated pool, it sends the stripe
 to the replicas. The object's bytes never pass through the gateway.
 
-Each OSD reports the CRC-64/NVME of the bytes that it pulled. The
-gateway folds the values in object order, with the math of `Integrity`_,
-and stores the result as the object's full-object ``crc64nvme``
-checksum. If the client sends ``x-amz-checksum-crc64nvme``, the two
-values must match. Otherwise the PUT fails with ``400 BadDigest``, and
-nothing is stored. A later passthrough GET of the whole object compares
-the stored checksum with what the OSDs deliver.
+Each OSD reports the CRC-64/NVME of the bytes that it pulled. If the
+client chose CRC-32C, each OSD also reports the CRC-32C of those bytes.
+A client chooses CRC-32C with ``x-amz-checksum-crc32c`` or with
+``x-amz-checksum-algorithm: CRC32C``. The gateway folds each set of
+values in object order, with the math of `Integrity`_. It stores the
+checksum of the client's algorithm as the object's full-object checksum.
+If the client chose no algorithm, the gateway stores ``crc64nvme``. If
+the client sends the checksum, the two values must match. Otherwise
+the PUT fails with ``400 BadDigest``, and nothing is stored. A later
+passthrough GET of the whole object compares the stored checksum with
+what the OSDs deliver.
 
 The object's head holds no data. The gateway writes the head last, in
 one operation with the checksum and the ETag, so a reader sees the old
@@ -118,8 +122,11 @@ ETag is not the MD5 of the object. The same bytes in the same stripes
 always get the same ETag.
 
 A successful PUT answers ``200`` with ``x-amz-rdma-reply: 200``,
-``x-amz-rdma-bytes-transferred``, ``x-amz-checksum-crc64nvme`` and
-``x-amz-rdma-checksum``.
+``x-amz-rdma-bytes-transferred`` and the stored checksum in
+``x-amz-checksum-crc64nvme`` or ``x-amz-checksum-crc32c``. The answer
+also carries the folded values of the OSDs in
+``x-amz-rdma-checksum-crc64nvme``. If the client chose CRC32C, the answer
+also carries ``x-amz-rdma-checksum-crc32c``.
 
 The gateway never stores a body-less PUT with a token as an empty
 object. If the gateway cannot serve such a PUT out of band, it answers
@@ -131,7 +138,7 @@ instead. The gateway declines these PUTs:
 * Appends, parts of multipart uploads, and PUTs with ``Content-MD5``.
 * Objects that the placement compresses or that the gateway encrypts,
   torrents, and PUTs that a Lua data filter reads.
-* PUTs with a client checksum other than ``CRC64NVME``.
+* PUTs with a client checksum other than ``CRC64NVME`` or ``CRC32C``.
 * PUTs with a stripe that an OSD could not pull. The gateway removes
   the stripes that it wrote, and the old object stays.
 
@@ -1152,37 +1159,62 @@ Integrity
 =========
 
 The gateway does not touch passthrough data, so it cannot compute a
-checksum itself. When ``rgw_rdma_crc64nvme`` is on, the gateway asks
-each OSD for a CRC-64/NVME of the data that the OSD delivered. The OSD
-computes the values from the bytes that it writes. For an erasure-coded
-primary read, those are the bytes after reconstruction. The OSD reports
-one value for each range of its placement plan. When the plan has one
+checksum itself. When ``rgw_rdma_checksum`` is on, the gateway asks each
+OSD for checksums of the data that the OSD delivered. The OSD computes
+the values from the bytes that it writes. For an erasure-coded primary
+read, those are the bytes after reconstruction. The OSD reports one
+value for each range of its placement plan. When the plan has one
 range, that value also stands for the whole reply. The executor does
 not matter.
+
+The OSDs compute CRC-64/NVME, CRC-32C, or both. A client asks for one
+with the request header ``x-amz-rdma-checksum-algorithm``, which takes
+``CRC64NVME``, the default, or ``CRC32C``. For a GET of the whole object
+whose stored full-object checksum is CRC-64/NVME or CRC-32C, the gateway
+also asks for that algorithm. Any other value of the header
+fails the GET with ``400 InvalidArgument``.
 
 The gateway folds the values in logical order with the same combining
 math that S3 uses for multipart full-object checksums. For a
 shard-direct read, the RADOS client first folds the ranges of all
-shards, when they cover the operation's bytes without gaps. Some objects
-have a stored full-object ``crc64nvme`` checksum, the AWS
-``x-amz-checksum-crc64nvme`` type. For a whole-object GET of such an
+shards. The ranges must cover the operation's bytes without gaps. The
+fold
+works the same way for replicated and erasure-coded pools.
+
+The response reports each folded value in its own header,
+``x-amz-rdma-checksum-crc64nvme`` or ``x-amz-rdma-checksum-crc32c``,
+rendered as S3 renders ``x-amz-checksum-crc64nvme`` and
+``x-amz-checksum-crc32c``. Those S3 headers name the stored checksum of
+the whole object. These headers cover exactly the bytes of the
+transfer, so a ranged GET gets the checksum of its range.
+A client can compare the value with the bytes in its own buffer, which
+also covers the final write into its memory. A stripe from an OSD of an
+older release comes back without a value. The response then carries no
+header for that algorithm.
+
+Some objects have a stored full-object ``crc64nvme`` or ``crc32c``
+checksum, the AWS ``x-amz-checksum-crc64nvme`` and
+``x-amz-checksum-crc32c`` types. For a whole-object GET of such an
 object, the gateway compares the folded value with the stored checksum.
-It does so before it sends any response bytes. A mismatch fails the
-GET with ``500``, and the gateway logs both values. When a stripe comes
-back without a value, as from an OSD of an older release, the gateway
-does not compare.
+It does so before it sends any response bytes. A mismatch fails the GET
+with ``500``, and the gateway logs both values.
 
 This comparison covers the storage node, the reconstruction, and the
-shard transfers inside the cluster. It does not cover the final write
-into client memory. That write relies on the transport's own integrity
-protection. Ranges with gaps between them do not fold into a
-whole-object checksum, so a sparse read with several extents is not
-compared.
+shard transfers inside the cluster. Ranges with gaps between them do
+not fold into a whole-object checksum, so a sparse read with several
+extents is not compared.
 
-RC clients get a checksum of the delivered bytes in the READY answer
-(``X-Amz-Rdma-Checksum``), when ``rgw_rdma_crc64nvme`` is on. An RC
-client can compare that value with the bytes in its own buffer, which
-also covers the final write.
+An OSD of an older release does not know the CRC-32C request. It
+delivers such a read inline, so the GET falls back to HTTP. It fails
+such a pull, so the PUT falls back to the HTTP body. Before you ask for
+CRC-32C, make sure that every OSD runs this release.
+
+If ``rgw_rdma_checksum`` is on, RC clients get the same headers in the
+READY answer. The READY request asks for an algorithm with
+``x-amz-rdma-checksum-algorithm``. For a relayed GET, the gateway uses
+the OSDs' values. If a stripe reported no value, the gateway computes
+the values from its own buffer. A READY answer of a PUT also reports the object's stored
+checksum in ``x-amz-checksum-<algorithm>``.
 
 Configuration reference
 =======================
@@ -1239,9 +1271,11 @@ Transports and out-of-band behavior:
   into client windows and into RC relay windows. The default is false.
 * ``rgw_rdma_osd_put``: have the OSDs pull the object of a body-less PUT
   out of client memory. The default is false. See `OSD-direct PUT`_.
-* ``rgw_rdma_crc64nvme``: compute checksums of out-of-band transfers.
-  The gateway compares whole-object passthrough GETs with the stored
-  checksum, and reports a checksum to RC clients. The default is true.
+* ``rgw_rdma_checksum``: compute checksums of out-of-band transfers.
+  The gateway reports them in ``x-amz-rdma-checksum-<algorithm>``, and
+  compares whole-object passthrough GETs with the stored checksum. An
+  OSD-direct PUT computes them whatever this option says. The default is
+  true.
 
 libfabric endpoint (``ofi``):
 

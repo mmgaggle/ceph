@@ -189,7 +189,7 @@ int RadosWriter::process(bufferlist&& bl, uint64_t offset)
 }
 
 int RadosWriter::process_pulled(
-  uint64_t len, const std::string& token, uint64_t client_ofs,
+  uint64_t len, const std::string& token, uint64_t client_ofs, uint32_t want,
   librados::ObjectOperation::rdma_delivery_result* result)
 {
   if (len == 0) {
@@ -198,10 +198,9 @@ int RadosWriter::process_pulled(
   librados::ObjectWriteOperation op;
   add_write_hint(op);
   // the primary pulls the stripe, and reports its CRC-64/NVME, from
-  // which the gateway builds the object's checksum and ETag
-  op.write_full_pulled(len, token, client_ofs,
-                       librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC64,
-                       result);
+  // which the gateway builds the ETag, and the CRCs want asks for, from
+  // which it builds the object's checksum
+  op.write_full_pulled(len, token, client_ofs, want, result);
   constexpr uint64_t id = 0; // unused
   // the stripe's bytes count against the throttle window as if they
   // passed through: pulls in flight are bounded the same way
@@ -476,7 +475,7 @@ int AtomicObjectProcessor::complete(
 
 
 int AtomicObjectProcessor::process_pulled(
-  uint64_t len, const std::string& token,
+  uint64_t len, const std::string& token, uint32_t want,
   std::vector<rgw::sal::PulledStripe>* stripes)
 {
   ceph_assert(pulled);
@@ -496,7 +495,7 @@ int AtomicObjectProcessor::process_pulled(
     const uint64_t n = std::min(stripe_size, len - ofs);
     auto& res = results.emplace_back();
     extents.emplace_back(ofs, n);
-    r = writer.process_pulled(n, token, ofs, &res);
+    r = writer.process_pulled(n, token, ofs, want, &res);
     if (r < 0) {
       break;
     }
@@ -520,10 +519,14 @@ int AtomicObjectProcessor::process_pulled(
     st.len = extents[i].second;
     st.bytes = res.bytes;
     st.crc64 = res.crc64;
-    // one contiguous extent, so its CRC folds with its neighbours'
-    st.crc64_valid =
-      (res.flags & librados::ObjectOperation::RDMA_DELIVERY_CRC64_VALID) &&
-      (res.flags & librados::ObjectOperation::RDMA_DELIVERY_CRC64_COMBINABLE);
+    st.crc32c = res.crc32c;
+    // one contiguous extent, so its CRCs fold with their neighbours'
+    const bool combinable =
+      res.flags & librados::ObjectOperation::RDMA_DELIVERY_COMBINABLE;
+    st.crc64_valid = combinable &&
+      (res.flags & librados::ObjectOperation::RDMA_DELIVERY_CRC64_VALID);
+    st.crc32c_valid = combinable &&
+      (res.flags & librados::ObjectOperation::RDMA_DELIVERY_CRC32C_VALID);
     stripes->push_back(st);
   }
   return 0;

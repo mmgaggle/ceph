@@ -3834,6 +3834,7 @@ int RadosObject::RadosReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs
   parent_op.params.rdma_token = params.rdma_token;
   parent_op.params.rdma_bytes = params.rdma_bytes;
   parent_op.params.rdma_crc64 = params.rdma_crc64;
+  parent_op.params.rdma_crc32c = params.rdma_crc32c;
   int r = parent_op.iterate(dpp, ofs, end, cb, y);
   params.rdma_submitted = parent_op.params.rdma_submitted;
   params.rdma_fence = parent_op.params.rdma_fence;
@@ -5235,9 +5236,10 @@ bool RadosAtomicWriter::set_pulled()
 }
 
 int RadosAtomicWriter::process_pulled(uint64_t len, const std::string& token,
+                                      uint32_t want,
                                       std::vector<PulledStripe>* stripes)
 {
-  return processor.process_pulled(len, token, stripes);
+  return processor.process_pulled(len, token, want, stripes);
 }
 
 int RadosAtomicWriter::complete(size_t accounted_size, const std::string& etag,

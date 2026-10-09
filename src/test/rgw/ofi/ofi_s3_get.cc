@@ -12,12 +12,20 @@
  * gateway waits. Then the window is checked against a local copy of
  * the object.
  *
+ * The response must carry the OSDs' CRC of the delivered bytes,
+ * x-amz-rdma-checksum-crc64nvme, or x-amz-rdma-checksum-crc32c when
+ * OFI_S3_CKSUM=CRC32C asks for that one, equal to this client's CRC of
+ * its window. OFI_S3_RANGE=<first>-<last> GETs that byte range (a Range
+ * header, so a 206): the window holds the range only, and the checksum
+ * covers the range only.
+ *
  *   ceph_test_rgw_ofi_get <provider> <domain|-> <node|-> <endpoint> \
  *     <bucket> <key> <access> <secret> <expected-file>
  */
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -27,14 +35,19 @@
 #include <string>
 #include <vector>
 
+#include <strings.h>
+
 #include "common/ofi_rma.h"
+#include "ofi_s3_cksum.h"
 
 namespace {
 
 struct http_result {
   long status = 0;
-  std::string reply;      // x-amz-rdma-reply
-  std::string bytes;      // x-amz-rdma-bytes-transferred
+  std::string reply;       // x-amz-rdma-reply
+  std::string bytes;       // x-amz-rdma-bytes-transferred
+  std::string rdma_crc64;  // x-amz-rdma-checksum-crc64nvme
+  std::string rdma_crc32c; // x-amz-rdma-checksum-crc32c
   std::string body;
   std::string error;
 };
@@ -53,6 +66,8 @@ size_t on_header(char* p, size_t size, size_t n, void* arg)
       value.pop_back();
     if (name == "x-amz-rdma-reply") r->reply = value;
     if (name == "x-amz-rdma-bytes-transferred") r->bytes = value;
+    if (name == "x-amz-rdma-checksum-crc64nvme") r->rdma_crc64 = value;
+    if (name == "x-amz-rdma-checksum-crc32c") r->rdma_crc32c = value;
   }
   return size * n;
 }
@@ -77,6 +92,10 @@ int main(int argc, char** argv)
 		 "<bucket> <key> <access> <secret> <expected-file>\n", argv[0]);
     return 2;
   }
+  if (!ofi_s3::self_test()) {
+    std::fprintf(stderr, "CRC self-test failed\n");
+    return 2;
+  }
   ceph::ofi::config_t cfg;
   cfg.provider = argv[1];
   cfg.domain = arg_or_empty(argv[2]);
@@ -85,12 +104,28 @@ int main(int argc, char** argv)
   const std::string endpoint = argv[4], bucket = argv[5], key = argv[6];
   const std::string userpwd = std::string(argv[7]) + ":" + argv[8];
   std::ifstream in(argv[9], std::ios::binary);
-  const std::vector<char> expected{std::istreambuf_iterator<char>(in), {}};
-  const size_t size = expected.size();
-  if (size == 0) {
+  std::vector<char> expected{std::istreambuf_iterator<char>(in), {}};
+  if (expected.empty()) {
     std::fprintf(stderr, "empty expected file\n");
     return 2;
   }
+
+  // the bytes asked for: the object, or the range OFI_S3_RANGE names
+  std::string range;
+  if (const char* r = std::getenv("OFI_S3_RANGE"); r && *r) {
+    unsigned long long first = 0, last = 0;
+    if (std::sscanf(r, "%llu-%llu", &first, &last) != 2 || first > last ||
+	last >= expected.size()) {
+      std::fprintf(stderr, "OFI_S3_RANGE %s is not a range of the object\n", r);
+      return 2;
+    }
+    range = "bytes=" + std::to_string(first) + "-" + std::to_string(last);
+    expected = std::vector<char>(expected.begin() + first,
+				 expected.begin() + last + 1);
+  }
+  const size_t size = expected.size();
+  const char* alg_env = std::getenv("OFI_S3_CKSUM");
+  const bool want32c = alg_env && strcasecmp(alg_env, "CRC32C") == 0;
 
   std::string err;
   auto ep = ceph::ofi::Endpoint::open(cfg, &err);
@@ -110,7 +145,8 @@ int main(int argc, char** argv)
     return 1;
   }
   const std::string token = ep->window_token(w, 0, size);
-  std::printf("%s\nwindow %zu bytes, token %s\n", ep->describe().c_str(), size,
+  std::printf("%s\nwindow %zu bytes%s%s, token %s\n", ep->describe().c_str(),
+	      size, range.empty() ? "" : ", range ", range.c_str(),
 	      token.c_str());
 
   http_result res;
@@ -119,6 +155,13 @@ int main(int argc, char** argv)
   std::string url = endpoint + "/" + bucket + "/" + key;
   struct curl_slist* hdrs = nullptr;
   hdrs = curl_slist_append(hdrs, ("x-amz-rdma-token: " + token).c_str());
+  if (alg_env) {
+    hdrs = curl_slist_append(
+      hdrs, (std::string("x-amz-rdma-checksum-algorithm: ") + alg_env).c_str());
+  }
+  if (!range.empty()) {
+    hdrs = curl_slist_append(hdrs, ("Range: " + range).c_str());
+  }
   curl_easy_setopt(c, CURLOPT_URL, url.c_str());
   curl_easy_setopt(c, CURLOPT_AWS_SIGV4, "aws:amz:us-east-1:s3");
   curl_easy_setopt(c, CURLOPT_USERPWD, userpwd.c_str());
@@ -139,17 +182,22 @@ int main(int argc, char** argv)
   const double ms = std::chrono::duration<double, std::milli>(
     std::chrono::steady_clock::now() - t0).count();
 
-  std::printf("HTTP %ld, x-amz-rdma-reply %s, bytes %s, body %zu, %.1f ms\n",
-	      res.status, res.reply.c_str(), res.bytes.c_str(),
-	      res.body.size(), ms);
-  if (!res.error.empty() || res.status != 200) {
-    std::printf("FAIL: request failed %s\n", res.error.c_str());
+  std::printf("HTTP %ld, x-amz-rdma-reply %s, bytes %s, body %zu, "
+	      "x-amz-rdma-checksum-crc64nvme %s, x-amz-rdma-checksum-crc32c %s, "
+	      "%.1f ms\n", res.status, res.reply.c_str(), res.bytes.c_str(),
+	      res.body.size(), res.rdma_crc64.c_str(), res.rdma_crc32c.c_str(),
+	      ms);
+  const long ok_status = range.empty() ? 200 : 206;
+  if (!res.error.empty() || res.status != ok_status) {
+    std::printf("FAIL: request failed (expected HTTP %ld) %s\n", ok_status,
+		res.error.c_str());
     return 1;
   }
+  const bool placed = res.reply == std::to_string(ok_status);
   const char* got = window;
   size_t got_len = size;
-  if (res.reply != "200") {
-    // the gateway fell back to HTTP: the body is the object
+  if (!placed) {
+    // the gateway fell back to HTTP: the body is the object, or the range
     got = res.body.data();
     got_len = res.body.size();
     std::printf("fallback: object came back over HTTP\n");
@@ -160,8 +208,26 @@ int main(int argc, char** argv)
     std::printf("FAIL: mismatch at byte %zu\n", i);
     return 1;
   }
+  if (placed) {
+    // the OSDs' CRCs of what they placed, against this client's of what
+    // it found in its window: the one asked for must be there, and any
+    // other must match too
+    const std::string mine64 = ofi_s3::armor_crc64nvme(window, size);
+    const std::string mine32c = ofi_s3::armor_crc32c(window, size);
+    const std::string& asked = want32c ? res.rdma_crc32c : res.rdma_crc64;
+    if (asked.empty() ||
+	(!res.rdma_crc64.empty() && res.rdma_crc64 != mine64) ||
+	(!res.rdma_crc32c.empty() && res.rdma_crc32c != mine32c)) {
+      std::printf("FAIL: the delivered checksums (%s, %s) are not the "
+		  "window's (%s, %s)\n", res.rdma_crc64.c_str(),
+		  res.rdma_crc32c.c_str(), mine64.c_str(), mine32c.c_str());
+      return 1;
+    }
+  }
   std::printf("PASS: %zu bytes verified (%s)\n", size,
-	      res.reply == "200" ? "placed by the OSDs over libfabric"
-				 : "HTTP fallback");
+	      placed ? (want32c ?
+			"placed by the OSDs over libfabric, CRC32C checked" :
+			"placed by the OSDs over libfabric, CRC64NVME checked")
+		     : "HTTP fallback");
   return 0;
 }

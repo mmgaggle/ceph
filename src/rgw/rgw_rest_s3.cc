@@ -344,6 +344,14 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
     // opaque cuObject descriptor; RGWGetObj::execute() decides between
     // OSD passthrough, staged RDMA and plain-HTTP fallback
     rdma_token = *rdma_hdr;
+    // the CRC of the delivered bytes the response reports
+    if (rgw::rdma::parse_checksum_algorithm(
+          s->info.env->get("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", nullptr),
+          &rdma_cksum_asked) < 0) {
+      s->err.message = "x-amz-rdma-checksum-algorithm must be CRC64NVME "
+                       "or CRC32C";
+      return -EINVAL;
+    }
   }
 
   return RGWGetObj_ObjStore::get_params(y);
@@ -526,6 +534,16 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
     dump_content_length(s, 0);
     dump_header(s, "x-amz-rdma-reply", "200");
     dump_header(s, "x-amz-rdma-bytes-transferred", total_len);
+    // the OSDs' CRCs of exactly the delivered bytes, folded, a range's
+    // too: what the client can check its own buffer against
+    if (rdma_crc64) {
+      dump_header(s, rgw::rdma::HDR_CRC64NVME,
+                  rgw::rdma::cksum_crc64nvme(*rdma_crc64).to_armor());
+    }
+    if (rdma_crc32c) {
+      dump_header(s, rgw::rdma::HDR_CRC32C,
+                  rgw::rdma::cksum_crc32c(*rdma_crc32c).to_armor());
+    }
   } else {
     if (!rdma_token.empty()) {
       // token sent but RDMA is unavailable: valid fallback per the
@@ -3121,12 +3139,18 @@ void RGWPutObj_ObjStore_S3::send_response()
 #endif
       if (rdma_pulled) {
         // the OSDs pulled every byte out of the client's memory; the
-        // checksum is theirs, folded, and also in x-amz-checksum-crc64nvme
+        // checksums are theirs, folded, and the object's stored one is
+        // also in x-amz-checksum-<algorithm> below
         dump_header(s, "x-amz-rdma-reply", "200");
         dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
-        if (cksum) {
-          dump_header(s, "x-amz-rdma-checksum",
-                      "CRC64NVME " + cksum->to_armor());
+        if (rdma_pulled_crc64) {
+          dump_header(s, rgw::rdma::HDR_CRC64NVME,
+                      rgw::rdma::cksum_crc64nvme(*rdma_pulled_crc64)
+                        .to_armor());
+        }
+        if (rdma_pulled_crc32c) {
+          dump_header(s, rgw::rdma::HDR_CRC32C,
+                      rgw::rdma::cksum_crc32c(*rdma_pulled_crc32c).to_armor());
         }
       }
       dump_header_if_nonempty(s, "x-amz-version-id", version_id);

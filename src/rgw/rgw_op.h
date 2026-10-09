@@ -36,6 +36,7 @@
 #include "common/ceph_time.h"
 
 #include "rgw_cksum.h"
+#include "rgw_rdma_cksum.h"
 #include "rgw_common.h"
 #include "rgw_dmclock.h"
 
@@ -522,9 +523,14 @@ protected:
     return rdma_mode == RdmaMode::PASSTHROUGH || rdma_mode == RdmaMode::RELAY;
   }
   uint64_t rdma_bytes = 0; ///< bytes delivered out of band (passthrough)
-  /// combined CRC64-NVME of the delivered bytes, when every stripe
-  /// reported one (passthrough verification)
+  /// the CRCs of the delivered bytes that the client asked for
+  /// (x-amz-rdma-checksum-algorithm), which the response reports
+  rgw::rdma::cksum_want rdma_cksum_asked;
+  /// combined CRC64-NVME and CRC-32C of the delivered bytes, each when
+  /// every stripe reported it (the response's
+  /// x-amz-rdma-checksum-<algorithm>, and passthrough verification)
   std::optional<uint64_t> rdma_crc64;
+  std::optional<uint32_t> rdma_crc32c;
   /// staged-mode buffer (an RGWCuObjServer::RDMABufEntry*), reserved at
   /// mode-selection time because staging failures cannot be signalled
   /// once response headers are out
@@ -1423,6 +1429,11 @@ protected:
   /// out of the client's memory (an OSD-direct PUT, rgw_rdma_osd_put),
   /// which the reply reports
   bool rdma_pulled = false;
+  /// S3-over-RDMA: with rdma_pulled, the OSDs' CRCs of the bytes they
+  /// pulled, folded in object order, which the reply reports
+  /// (x-amz-rdma-checksum-<algorithm>)
+  std::optional<uint64_t> rdma_pulled_crc64;
+  std::optional<uint32_t> rdma_pulled_crc32c;
   /// S3-over-RDMA: the PUT carried x-amz-rdma-token and no body, and the
   /// gateway could not have the OSDs pull it; the reply says so
   /// (x-amz-rdma-reply: 501), and the client sends the body instead

@@ -8884,9 +8884,14 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
     data.rdma = true;
     data.rdma_token = params.rdma_token;
     data.rdma_range_start = ofs;
-    if (cct->_conf.get_val<bool>("rgw_rdma_crc64nvme")) {
+    // the CRCs the caller has room for: it decides which it wants
+    if (params.rdma_crc64) {
       data.rdma_flags |=
         librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC64;
+    }
+    if (params.rdma_crc32c) {
+      data.rdma_flags |=
+        librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC32C;
     }
   }
 
@@ -8940,45 +8945,74 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
     }
     *params.rdma_bytes = total;
   }
-  if (data.rdma && params.rdma_crc64) {
+  if (data.rdma && (params.rdma_crc64 || params.rdma_crc32c)) {
     // slots were pushed in logical stripe order, so folding them with
     // the concatenation combine yields the checksum of the whole
-    // delivered range. A slot contributes its crc64 directly when the
+    // delivered range. A slot contributes its value directly when the
     // OSD marked it combinable (one contiguous extent), or the fold
     // of its ranges when it was placed as several - a stripe served
     // by interleaved EC shards arrives that way. A slot offering
-    // neither ends verification: folding a non-contiguous crc would
-    // be wrong, and skipping a slot would verify the wrong bytes.
-    std::optional<uint64_t> combined;
+    // neither, or no valid value of a CRC, ends that CRC: folding a
+    // non-contiguous crc would be wrong, and skipping a slot would
+    // cover the wrong bytes.
+    using R = librados::ObjectReadOperation;
+    std::optional<uint64_t> combined64;
+    std::optional<uint32_t> combined32c;
+    bool ok64 = params.rdma_crc64 != nullptr;
+    bool ok32c = params.rdma_crc32c != nullptr;
     for (const auto& r : data.rdma_slots) {
-      std::optional<uint64_t> slot_crc;
-      if (r.flags &
-          librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_COMBINABLE) {
-        slot_crc = r.crc64;
-      } else if (r.flags &
-                 librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_RANGES) {
+      std::optional<uint64_t> slot64;
+      std::optional<uint32_t> slot32c;
+      if (r.flags & R::RDMA_DELIVERY_COMBINABLE) {
+        if (r.flags & R::RDMA_DELIVERY_CRC64_VALID) {
+          slot64 = r.crc64;
+        }
+        if (r.flags & R::RDMA_DELIVERY_CRC32C_VALID) {
+          slot32c = r.crc32c;
+        }
+      } else if (r.flags & R::RDMA_DELIVERY_RANGES) {
         std::vector<ceph::rdma::crc_range_t> ranges;
         ranges.reserve(r.ranges.size());
         uint64_t ranged = 0;
         for (const auto& x : r.ranges) {
-          ranges.push_back({x.ofs, x.len, x.crc64});
+          ranges.push_back({x.ofs, x.len, x.crc64, x.crc32c});
           ranged += x.len;
         }
         if (ranged == r.bytes) {
-          slot_crc = ceph::rdma::fold_crc64_ranges(std::move(ranges));
+          if (r.flags & R::RDMA_DELIVERY_CRC64_VALID) {
+            slot64 = ceph::rdma::fold_crc64_ranges(ranges);
+          }
+          if (r.flags & R::RDMA_DELIVERY_CRC32C_VALID) {
+            slot32c = ceph::rdma::fold_crc32c_ranges(std::move(ranges));
+          }
         }
       }
-      if (!slot_crc) {
-        combined.reset();
-        break;
+      if (ok64) {
+        if (!slot64) {
+          ok64 = false;
+          combined64.reset();
+        } else {
+          combined64 = combined64 ?
+            ceph::crc64nvme_combine(*combined64, *slot64, r.bytes) : *slot64;
+        }
       }
-      if (!combined) {
-        combined = *slot_crc;
-      } else {
-        combined = ceph::crc64nvme_combine(*combined, *slot_crc, r.bytes);
+      if (ok32c) {
+        if (!slot32c) {
+          ok32c = false;
+          combined32c.reset();
+        } else {
+          combined32c = combined32c ?
+            ceph::rdma::crc32c_combine(*combined32c, *slot32c, r.bytes) :
+            *slot32c;
+        }
       }
     }
-    *params.rdma_crc64 = combined;
+    if (params.rdma_crc64) {
+      *params.rdma_crc64 = combined64;
+    }
+    if (params.rdma_crc32c) {
+      *params.rdma_crc32c = combined32c;
+    }
   }
   return 0;
 }

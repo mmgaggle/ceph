@@ -267,11 +267,12 @@ Executors and tokens
 An OSD starts the executors that ``osd_oob_transports`` lists. It
 skips, with a warning, a transport that it was built without or that
 fails to start. It chooses an executor for each token by the shape of
-the token. A token whose third field is ``ofi1`` goes to the libfabric
-executor, but only when the token names the OSD's own provider
-(``osd_ofi_provider``). A token without that field goes to the cuObject
-executor. A libfabric token for another provider, and any token that no
-running executor serves, is delivered inline.
+the token. A token whose third field is ``ofi`` and a version, such as
+``ofi1``, goes to the libfabric executor. The executor serves it only
+when the token names the wire protocol of the OSD's own endpoint. A
+token whose third field is hex goes to the cuObject executor. A
+libfabric token of another wire or of an unknown version, and any token
+that no running executor serves, is delivered inline.
 
 Placement plans
 ---------------
@@ -939,7 +940,7 @@ installed ofi-rma instead of the submodule.
 
 The owner of a window sends this token::
 
-  <base hex>:<size hex>:ofi1:<provider>:<endpoint name hex>:<memory key hex>
+  <base hex>:<size hex>:ofi1:<wire>:<endpoint name hex>:<memory key hex>[:<auth hex>]
 
 The fields are:
 
@@ -948,14 +949,19 @@ The fields are:
   provider uses ``FI_MR_VIRT_ADDR``, and an offset into the region
   otherwise. A writer writes byte ``i`` of the window at ``base + i``.
 * ``size``: the length of the window.
-* ``provider``: the provider's name as ``fi_info`` reports it, for
-  example ``tcp`` or ``verbs;ofi_rxm``. Both ends must use the same
-  provider.
+* ``wire``: the wire protocol and its version, from the provider's
+  ``fi_ep_attr``, for example ``rxm.1`` for ``verbs;ofi_rxm`` or
+  ``xnet.1`` for ``tcp``. Both ends must speak the same wire. The token
+  names the protocol, not the provider, so the UET providers of two NIC
+  vendors take each other's tokens.
 * ``endpoint name``: the bytes that ``fi_getname()`` returns for the
   owner's endpoint, at most 192 bytes. A writer passes them to
   ``fi_av_insert()``.
 * ``memory key``: the key of the region behind the window. Providers
   with keys longer than 8 bytes are not supported.
+* ``auth``: optional. The authorization key that the region is bound
+  to, such as a UET JobID. ofi-rma 0.3 does not use it yet, and an OSD
+  delivers a token that has it inline.
 
 The token starts with the same ``addr:size`` fields as a cuObject
 descriptor, so the gateway forwards it in passthrough mode without

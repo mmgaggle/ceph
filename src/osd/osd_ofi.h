@@ -21,11 +21,12 @@
  * Out-of-band delivery over libfabric.
  *
  * Serves delivery tokens of the form ceph::ofi::token_t describes
- * ("<base>:<size>:ofi1:<provider>:<endpoint>:<key>") whose provider is
- * the one this OSD runs (osd_ofi_provider). The provider picks the
- * wire: tcp or shm need no special hardware, verbs runs RC under the
- * rxm utility provider, efa runs SRD, and a UET provider runs Ultra
- * Ethernet. The window owner never inserts this OSD into its address
+ * ("<base>:<size>:ofi1:<wire>:<endpoint>:<key>[:<auth>]") whose wire is
+ * the one this OSD's endpoint speaks. The provider (osd_ofi_provider)
+ * picks the wire: tcp or shm need no special hardware, verbs runs RC
+ * under the rxm utility provider ("rxm.1"), efa runs SRD, and any
+ * vendor's UET provider runs Ultra Ethernet ("uet.<version>"), so a
+ * token from one vendor's UET NIC is served on another's. The window owner never inserts this OSD into its address
  * vector, so any OSD holding the token can write, as with cuObject's DC
  * transport.
  *

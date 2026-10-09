@@ -172,8 +172,10 @@ bool OSDOfi::handles(const std::string& token) const
   if (!is_available()) {
     return false;
   }
+  // the wire, not the provider: two vendors' providers of one protocol
+  // take each other's tokens
   auto t = ceph::ofi::parse_token(token);
-  return t && t->provider == ep->provider();
+  return t && t->wire == ep->wire();
 }
 
 ssize_t OSDOfi::execute_plan(const std::string& key,

@@ -3,7 +3,6 @@
 
 #include "common/rdma_token.h"
 #include "common/crc64nvme.h"
-#include "common/ofi_rma.h"
 
 #include <algorithm>
 #include <cctype>
@@ -59,10 +58,16 @@ bool is_ofi_token(std::string_view token)
   if (second == std::string_view::npos) {
     return false;
   }
-  // the third field runs to the next colon, or to the end
+  // the third field runs to the next colon, or to the end: "ofi" and a
+  // version, which no cuObject memory key can be, since 'o' is not hex
   auto tag = token.substr(second + 1);
   tag = tag.substr(0, tag.find(':'));
-  return tag == ceph::ofi::TOKEN_TAG;
+  if (tag.size() < 4 || tag.substr(0, 3) != "ofi") {
+    return false;
+  }
+  return std::all_of(tag.begin() + 3, tag.end(), [](char c) {
+    return c >= '0' && c <= '9';
+  });
 }
 
 bool is_cuobj_descriptor(std::string_view token)

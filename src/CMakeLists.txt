@@ -594,7 +594,7 @@ CHECK_C_COMPILER_FLAG("-fvar-tracking-assignments" HAS_VTA)
 # WITH_OOB_OFI.
 option(WITH_SYSTEM_OFI_RMA "build against an installed ofi-rma" OFF)
 if(WITH_SYSTEM_OFI_RMA)
-  find_package(ofi_rma 0.2 REQUIRED)
+  find_package(ofi_rma 0.3 REQUIRED)
   get_target_property(OFI_RMA_INCLUDE_DIRS ofi_rma::ofi_rma
     INTERFACE_INCLUDE_DIRECTORIES)
   include_directories(SYSTEM ${OFI_RMA_INCLUDE_DIRS})

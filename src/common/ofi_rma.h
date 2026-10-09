@@ -6,6 +6,6 @@
 // The libfabric RMA code lives in the ofi-rma library (src/ofi-rma), so
 // that clients can lend windows without building Ceph. Ceph code keeps
 // including this header and naming the code ceph::ofi.
-#include <ofi_rma/ofi_rma.h>
+#include <ofi_rma/ofi_rma.hpp>
 
 #include "common/ofi_rma_fwd.h"

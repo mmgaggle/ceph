@@ -20,9 +20,9 @@ struct token_window {
 };
 
 /// Maximum token length accepted anywhere in ceph. The cuObject
-/// descriptor is 81 characters today; leave generous headroom for
-/// future revisions while still bounding untrusted input.
-inline constexpr size_t RDMA_TOKEN_MAX_LEN = 512;
+/// descriptor is 81 characters today, and an ofi1 token at most 618
+/// (OFI_RMA_TOKEN_MAX is 640); this bounds untrusted input.
+inline constexpr size_t RDMA_TOKEN_MAX_LEN = 640;
 
 /// Parse the addr and size fields of an RDMA descriptor token as
 /// produced by cuObject clients: colon-separated hex fields
@@ -33,10 +33,12 @@ inline constexpr size_t RDMA_TOKEN_MAX_LEN = 512;
 std::optional<token_window> parse_rdma_token(std::string_view token);
 
 /// Whether a token is a libfabric one (common/ofi_rma.h): its third
-/// field is the libfabric tag, where a cuObject descriptor has its
-/// memory key. The OSD's cuObject executor and the gateway's PUT take
-/// any other token for a cuObject descriptor. Only the shape is
-/// checked; a libfabric token can still fail to parse.
+/// field is "ofi<N>", the libfabric family at any version N, where a
+/// cuObject descriptor has its memory key in hex. The OSD's cuObject
+/// executor and the gateway's PUT take any other token for a cuObject
+/// descriptor, so a version this build does not know still counts here
+/// and is declined by the libfabric code. Only the shape is checked; a
+/// libfabric token can still fail to parse.
 bool is_ofi_token(std::string_view token);
 
 /// Whether a token is a cuObject descriptor that names a window: not a

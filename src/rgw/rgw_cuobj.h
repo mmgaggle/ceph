@@ -11,20 +11,25 @@
 #include "include/common_fwd.h"
 
 struct rdma_buffer;
+namespace ceph::oob { class Arena; }
 class cuObjServer;
 
 class RGWCuObjServer {
 public:
+  /// a staging buffer: a buffer of the arena, which the library knows
+  /// as offset in the arena's registration, handle
   struct RDMABufEntry {
     void* ptr = nullptr;
     size_t size = 0;
+    uint64_t offset = 0;
     struct rdma_buffer* handle = nullptr;
-    std::atomic<bool> in_use{false};
   };
 
   ~RGWCuObjServer();
 
-  static int init(CephContext* cct);
+  /// arena: the gateway's out-of-band memory, which the server registers
+  /// once and stages each transfer in; it must outlive the server
+  static int init(CephContext* cct, ceph::oob::Arena* arena);
   static void shutdown();
   static RGWCuObjServer* get_instance();
 
@@ -57,8 +62,9 @@ private:
   void do_shutdown();
 
   std::unique_ptr<cuObjServer> m_server;
-  size_t m_buf_count = 0;
-  std::unique_ptr<RDMABufEntry[]> m_buffer_pool;
+  ceph::oob::Arena* m_arena = nullptr;
+  /// the arena, registered with the library once
+  struct rdma_buffer* m_arena_handle = nullptr;
   CephContext* m_cct = nullptr;
 
   static std::unique_ptr<RGWCuObjServer> s_instance;

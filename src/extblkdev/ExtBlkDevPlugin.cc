@@ -22,9 +22,12 @@
 
 #include <errno.h>
 
+#include <algorithm>
+
 #include "ceph_ver.h"
 #include "ExtBlkDevPlugin.h"
 #include "common/errno.h"
+#include "common/rdma_token.h"
 #include "include/dlfcn_compat.h"
 #include "include/str_list.h"
 #include "include/ceph_assert.h"
@@ -177,6 +180,20 @@ namespace ceph {
       if (rc != 0) {
 	return rc;
       }
+#ifdef WITH_OOB_OFI
+      // the UEC reference provider ("uet") sends and receives on raw
+      // sockets it opens in OSD::init, after this trim; keep the one
+      // capability it needs
+      if (ceph::rdma::parse_oob_transports(
+	    cct->_conf.get_val<std::string>("oob_client_transports"),
+	    cct->_conf.get_val<std::string>("oob_cluster_transport"))
+	  .names_provider("uet")) {
+	cap_value_t raw[1] = {CAP_NET_RAW};
+	if (cap_set_flag(merge_caps, CAP_PERMITTED, 1, raw, CAP_SET) < 0) {
+	  return -errno;
+	}
+      }
+#endif
       return trim_caps(cct, merge_caps);
     }
 #endif

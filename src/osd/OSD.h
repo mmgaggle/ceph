@@ -74,6 +74,12 @@ class Message;
 class MonClient;
 class ObjectStore;
 class FuseStore;
+class OSDCuObj;
+class OSDOfi;
+class OSDOobExecutor;
+namespace ceph::oob {
+class Arena;
+}
 class OSDMap;
 class MLog;
 class Objecter;
@@ -117,6 +123,41 @@ public:
 
   md_config_cacher_t<Option::size_t> osd_max_object_size;
   md_config_cacher_t<bool> osd_skip_data_digest;
+
+#ifdef WITH_CUOBJ
+  /// cuObject out-of-band delivery endpoint; null unless an out-of-band
+  /// transport option names "cuobj" and the RDMA session came up
+  OSDCuObj* cuobj = nullptr;
+#endif
+#ifdef WITH_OOB_OFI
+  /// libfabric delivery endpoint; null unless an out-of-band transport
+  /// option names a libfabric provider and the endpoint came up
+  OSDOfi* ofi = nullptr;
+#endif
+#ifdef HAVE_OSD_OOB_DELIVERY
+  /// the memory every executor registers and takes its staging buffers
+  /// and gather windows from (oob_memory); null when none runs
+  std::unique_ptr<ceph::oob::Arena> oob_arena;
+  /// the executors that started (owned through cuobj and ofi above)
+  std::vector<OSDOobExecutor*> oob_executors;
+  /// the one of them that lends windows for EC gathers, and the only one
+  /// that registered any: the executor of oob_cluster_transport; null
+  /// when none does
+  OSDOobExecutor* oob_lender = nullptr;
+  /// an executor that started; lends when its transport is the cluster
+  /// transport
+  void add_oob_executor(OSDOobExecutor* e, bool lends);
+  /// the executor that serves a delivery token's transport, or null
+  OSDOobExecutor* oob_executor_for(const std::string& token) const;
+  /// the executor that can pull a write's payload out of a token's
+  /// window (delivery_t::FLAG_PULL), or null
+  OSDOobExecutor* oob_puller_for(const std::string& token) const;
+  /// true when any out-of-band transport is up
+  bool has_oob_executor() const;
+  /// the executor lending windows for EC gathers (oob_cluster_transport),
+  /// or null
+  OSDOobExecutor* oob_gather_executor() const;
+#endif
 
   void enqueue_back(OpSchedulerItem&& qi);
   void enqueue_front(OpSchedulerItem&& qi);

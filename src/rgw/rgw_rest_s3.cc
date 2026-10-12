@@ -79,7 +79,7 @@
 #endif
 #include "rgw_cksum_pipe.h"
 #include "rgw_s3select.h"
-#ifdef WITH_RADOSGW_CUOBJ
+#ifdef WITH_CUOBJ
 #include "rgw_cuobj.h"
 #endif
 
@@ -342,23 +342,27 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
     }
   }
 
-#ifdef WITH_RADOSGW_CUOBJ
-  if (auto* cuobj = RGWCuObjServer::get_instance();
-      cuobj && cuobj->is_available()) {
-    auto rdma_token = s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
-    if (rdma_token) {
-      rdma_descriptor = *rdma_token;
-      rdma_active = true;
+  if (auto rdma_hdr = s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
+      rdma_hdr) {
+    // opaque cuObject descriptor; RGWGetObj::execute() decides between
+    // OSD passthrough, staged RDMA and plain-HTTP fallback
+    rdma_token = *rdma_hdr;
+    // the CRC of the delivered bytes the response reports
+    if (rgw::rdma::parse_checksum_algorithm(
+          s->info.env->get("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", nullptr),
+          &rdma_cksum_asked) < 0) {
+      s->err.message = "x-amz-rdma-checksum-algorithm must be CRC64NVME "
+                       "or CRC32C";
+      return -EINVAL;
     }
   }
-#endif
 
   return RGWGetObj_ObjStore::get_params(y);
 }
 
 RGWGetObj_ObjStore_S3::~RGWGetObj_ObjStore_S3()
 {
-#ifdef WITH_RADOSGW_CUOBJ
+#ifdef WITH_CUOBJ
   if (rdma_buf) {
     auto* cuobj = RGWCuObjServer::get_instance();
     if (cuobj) {
@@ -529,14 +533,26 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
   for (auto &it : crypt_http_responses)
     dump_header(s, it.first, it.second);
 
-#ifdef WITH_RADOSGW_CUOBJ
-  if (rdma_active) {
+  if (rdma_mode != RdmaMode::NONE) {
     dump_content_length(s, 0);
     dump_header(s, "x-amz-rdma-reply", "200");
     dump_header(s, "x-amz-rdma-bytes-transferred", total_len);
-  } else
-#endif
-  {
+    // the OSDs' CRCs of exactly the delivered bytes, folded, a range's
+    // too: what the client can check its own buffer against
+    if (rdma_crc64) {
+      dump_header(s, rgw::rdma::HDR_CRC64NVME,
+                  rgw::rdma::cksum_crc64nvme(*rdma_crc64).to_armor());
+    }
+    if (rdma_crc32c) {
+      dump_header(s, rgw::rdma::HDR_CRC32C,
+                  rgw::rdma::cksum_crc32c(*rdma_crc32c).to_armor());
+    }
+  } else {
+    if (!rdma_token.empty()) {
+      // token sent but RDMA is unavailable: valid fallback per the
+      // cuObject protocol, the client reads the body instead
+      dump_header(s, "x-amz-rdma-reply", "501");
+    }
     dump_content_length(s, total_len);
   }
   dump_last_modified(s, lastmod);
@@ -824,25 +840,34 @@ done:
 
 send_data:
   if (get_data && !op_ret) {
-#ifdef WITH_RADOSGW_CUOBJ
-    if (rdma_active) {
+    if (rdma_mode == RdmaMode::PASSTHROUGH) {
+      // the OSDs deliver all data; a store streaming bytes here would
+      // violate the passthrough contract
       if (bl_len > 0) {
-        auto* cuobj = RGWCuObjServer::get_instance();
-        if (!rdma_buf && cuobj) {
-          rdma_buf = cuobj->acquire_buffer(s->obj_size);
-          rdma_buf_offset = 0;
+        ldpp_dout(this, 0) << "ERROR: unexpected inline data in RDMA "
+                           << "passthrough GET" << dendl;
+        return -EIO;
+      }
+      return 0;
+    }
+#ifdef WITH_CUOBJ
+    if (rdma_mode == RdmaMode::STAGED) {
+      // the staging buffer was reserved in select_rdma_mode(), before
+      // the response headers were committed
+      auto* entry = static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf);
+      if (bl_len > 0) {
+        if (!entry || rdma_buf_offset + bl_len > entry->size) {
+          ldpp_dout(this, 0) << "rgw_cuobj: ERROR: staging buffer overflow at "
+                             << rdma_buf_offset << "+" << bl_len << dendl;
+          return -EIO;
         }
-        if (rdma_buf) {
-          auto* entry = static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf);
-          memcpy(static_cast<char*>(entry->ptr) + rdma_buf_offset, bl.c_str() + bl_ofs, bl_len);
-          rdma_buf_offset += bl_len;
-        }
-      } else if (rdma_buf && rdma_buf_offset > 0) {
+        memcpy(static_cast<char*>(entry->ptr) + rdma_buf_offset, bl.c_str() + bl_ofs, bl_len);
+        rdma_buf_offset += bl_len;
+      } else if (entry && rdma_buf_offset > 0) {
         auto* cuobj = RGWCuObjServer::get_instance();
-        auto* entry = static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf);
         ssize_t ret = cuobj->rdma_write_to_client(
             s->object->get_name(), entry, 0,
-            rdma_buf_offset, rdma_descriptor);
+            rdma_buf_offset, rdma_token);
         cuobj->release_buffer(entry);
         rdma_buf = nullptr;
         if (ret < 0) {
@@ -2946,15 +2971,6 @@ static inline void map_qs_metadata(req_state* s, bool crypto_too)
 
 int RGWPutObj_ObjStore_S3::get_params(optional_yield y)
 {
-#ifdef WITH_RADOSGW_CUOBJ
-  if (auto* cuobj = RGWCuObjServer::get_instance();
-      cuobj && cuobj->is_available()) {
-    if (s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN")) {
-      rdma_active = true;
-    }
-  }
-#endif
-
   if (!s->length) {
     const char *encoding = s->info.env->get("HTTP_TRANSFER_ENCODING");
     if (!encoding || strcmp(encoding, "chunked") != 0) {
@@ -3095,6 +3111,11 @@ void RGWPutObj_ObjStore_S3::send_response()
   if (op_ret) {
     set_req_state_err(s, op_ret);
     dump_errno(s);
+    if (rdma_put_declined) {
+      // the object was not taken out of the client's memory, and nothing
+      // was stored: the client sends the body instead
+      dump_header(s, "x-amz-rdma-reply", "501");
+    }
   } else {
     if (s->cct->_conf->rgw_s3_success_create_obj_status) {
       op_ret = get_success_retcode(
@@ -3111,12 +3132,30 @@ void RGWPutObj_ObjStore_S3::send_response()
       dump_errno(s);
       dump_etag(s, etag);
       dump_content_length(s, 0);
-#ifdef WITH_RADOSGW_CUOBJ
-      if (rdma_active) {
+#ifdef WITH_CUOBJ
+      // only when execute() staged the body: with a libfabric token, or
+      // no cuObject server by then, the body came over HTTP
+      if (rdma_staged) {
         dump_header(s, "x-amz-rdma-reply", "200");
         dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
       }
 #endif
+      if (rdma_pulled) {
+        // the OSDs pulled every byte out of the client's memory; the
+        // checksums are theirs, folded, and the object's stored one is
+        // also in x-amz-checksum-<algorithm> below
+        dump_header(s, "x-amz-rdma-reply", "200");
+        dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
+        if (rdma_pulled_crc64) {
+          dump_header(s, rgw::rdma::HDR_CRC64NVME,
+                      rgw::rdma::cksum_crc64nvme(*rdma_pulled_crc64)
+                        .to_armor());
+        }
+        if (rdma_pulled_crc32c) {
+          dump_header(s, rgw::rdma::HDR_CRC32C,
+                      rgw::rdma::cksum_crc32c(*rdma_pulled_crc32c).to_armor());
+        }
+      }
       dump_header_if_nonempty(s, "x-amz-version-id", version_id);
       dump_header_if_nonempty(s, "x-amz-expiration", expires);
       if (cksum && cksum->aws()) {

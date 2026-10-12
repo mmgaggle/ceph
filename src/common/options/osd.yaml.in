@@ -1647,3 +1647,61 @@ options:
   level: dev
   default: true
   with_legacy: true
+# out-of-band delivery options: cuObject (DC), libfabric, EC gather windows
+- name: osd_oob_cutoff_late_tolerance
+  type: millisecs
+  level: advanced
+  desc: How late a libfabric write's cut-off can end, past the budget it
+    protects, and raise only a health warning
+  long_desc: A write still in flight when its budget, the pool's
+    rdma_delivery_lease plus rdma_delivery_drain from receipt, runs out is
+    cut off. A cut-off that ends after the budget by no more than this, and
+    that itself took no longer, is counted and raises the OOB_CUTOFF_LATE
+    health warning. It is usually a scheduling delay on a loaded host.
+    Clients that receive a response, and the gateway's fallback, wait for
+    the OSD's reply, which follows the cut-off, so they are not affected. A
+    client that gives a request up must allow this much beyond the lease and
+    the drain. A quick cut-off that ends later than this started late,
+    because the OSD's threads did not run. osd_oob_cutoff_policy says what
+    happens then. A cut-off that itself takes longer than this fails. The
+    cuObject executor does not use this option.
+  default: 1000
+  services:
+  - osd
+  see_also:
+  - osd_oob_cutoff_policy
+  flags:
+  - startup
+- name: osd_oob_cutoff_policy
+  type: str
+  level: advanced
+  desc: What an OSD does when its libfabric executor cannot cut off writes
+    in time
+  long_desc: A cut-off fails when the provider cannot close the endpoint, or
+    when the close or cancel itself takes longer than
+    osd_oob_cutoff_late_tolerance. With "warn", such a failure stops the
+    libfabric executor and raises OOB_DELIVERY_UNSAFE, and a quick cut-off
+    that ends later than the tolerance raises OOB_CUTOFF_PAST_TOLERANCE while
+    delivery goes on. With "disable", a late cut-off also stops the executor.
+    With "abort", the OSD exits in both cases.
+  default: warn
+  enum_values:
+  - warn
+  - disable
+  - abort
+  services:
+  - osd
+  see_also:
+  - osd_oob_cutoff_late_tolerance
+  flags:
+  - runtime
+- name: osd_ofi_inject_cutoff_failure
+  type: bool
+  level: dev
+  desc: Make the libfabric executor's cut-offs fail as if the provider could
+    not close its endpoint, to test osd_oob_cutoff_policy
+  default: false
+  services:
+  - osd
+  flags:
+  - runtime

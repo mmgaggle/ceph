@@ -11,6 +11,9 @@
 #include "common/ceph_context.h"
 #include "common/config.h"
 #include "common/dout.h"
+#include "common/oob_arena.h"
+#include "common/oob_config.h"
+#include "common/rdma_token.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -19,18 +22,21 @@ thread_local uint16_t RGWCuObjServer::tls_channel_id = 0;
 thread_local bool RGWCuObjServer::tls_channel_valid = false;
 
 static constexpr size_t MAX_RDMA_OP_SIZE = 1ULL << 30; // 1 GiB per cuObj API
+// DC initiators
+static constexpr int NUM_DCIS = 128;
 
 RGWCuObjServer::~RGWCuObjServer()
 {
   do_shutdown();
 }
 
-int RGWCuObjServer::init(CephContext* cct)
+int RGWCuObjServer::init(CephContext* cct, ceph::oob::Arena* arena)
 {
   if (s_instance) {
     return 0;
   }
   s_instance.reset(new RGWCuObjServer());
+  s_instance->m_arena = arena;
   int r = s_instance->do_init(cct);
   if (r < 0) {
     s_instance.reset();
@@ -52,24 +58,31 @@ int RGWCuObjServer::do_init(CephContext* cct)
 {
   m_cct = cct;
 
-  auto rdma_ip = cct->_conf.get_val<std::string>("rgw_cuobj_rdma_ip");
-  if (rdma_ip.empty()) {
-    lderr(cct) << "rgw_cuobj: ERROR: rgw_cuobj_rdma_ip not configured" << dendl;
+  ceph::oob::location_t loc;
+  std::string err;
+  if (int r = ceph::oob::resolve(cct, ceph::oob::public_ip(cct), &loc, &err); r < 0) {
+    lderr(cct) << "rgw_cuobj: ERROR: " << err << dendl;
+    return r;
+  }
+  if (loc.addr.empty()) {
+    lderr(cct) << "rgw_cuobj: ERROR: no out-of-band address: set oob_network"
+               << dendl;
     return -EINVAL;
   }
+  const std::string rdma_ip = loc.addr;
 
-  auto rdma_port = static_cast<unsigned short>(cct->_conf.get_val<uint64_t>("rgw_cuobj_rdma_port"));
-  auto num_dcis = static_cast<int>(cct->_conf.get_val<uint64_t>("rgw_cuobj_num_dcis"));
-  auto buf_size = static_cast<size_t>(cct->_conf.get_val<Option::size_t>("rgw_cuobj_buffer_size"));
-  auto buf_count = static_cast<size_t>(cct->_conf.get_val<uint64_t>("rgw_cuobj_buffer_count"));
+  // the library chooses its rdma_cm port; no client connects to it
+  const unsigned short rdma_port = 0;
+  const int num_dcis = NUM_DCIS;
 
   cuObjRDMATunable params;
   params.setNumDcis(num_dcis);
+  params.setDcKey(cct->_conf.get_val<uint64_t>("cuobj_dc_key"));
 
   ldout(cct, 1) << "rgw_cuobj: initializing cuObjServer on "
                 << rdma_ip << ":" << rdma_port
-                << " dcis=" << num_dcis
-                << " bufs=" << buf_count << "x" << buf_size << dendl;
+                << " dcis=" << num_dcis << ", staging in "
+                << m_arena->size() << " bytes" << dendl;
 
   try {
     m_server = std::make_unique<cuObjServer>(rdma_ip.c_str(), rdma_port, CUOBJ_PROTO_RDMA_DC_V1, params);
@@ -87,49 +100,28 @@ int RGWCuObjServer::do_init(CephContext* cct)
     return -ECONNREFUSED;
   }
 
-  m_buf_count = buf_count;
-  m_buffer_pool = std::make_unique<RDMABufEntry[]>(buf_count);
-  for (size_t i = 0; i < buf_count; i++) {
-    auto& entry = m_buffer_pool[i];
-    entry.ptr = m_server->allocHostBuffer(buf_size);
-    if (!entry.ptr) {
-      lderr(cct) << "rgw_cuobj: ERROR: allocHostBuffer failed for buffer " << i << dendl;
-      do_shutdown();
-      return -ENOMEM;
-    }
-    entry.size = buf_size;
-    entry.handle = m_server->registerBuffer(entry.ptr, buf_size);
-    if (!entry.handle) {
-      lderr(cct) << "rgw_cuobj: ERROR: registerBuffer failed for buffer " << i << dendl;
-      free(entry.ptr);
-      entry.ptr = nullptr;
-      do_shutdown();
-      return -EIO;
-    }
-    entry.in_use.store(false, std::memory_order_relaxed);
+  // the whole arena, once: each transfer stages in a buffer of it, which
+  // the library addresses by its offset
+  m_arena_handle = m_server->registerBuffer(m_arena->base(), m_arena->size());
+  if (!m_arena_handle) {
+    lderr(cct) << "rgw_cuobj: ERROR: registerBuffer failed for "
+               << m_arena->size() << " bytes of out-of-band memory" << dendl;
+    do_shutdown();
+    return -EIO;
   }
-
-  ldout(cct, 1) << "rgw_cuobj: initialized with " << buf_count
-                << " RDMA buffers of " << buf_size << " bytes" << dendl;
+  ldout(cct, 1) << "rgw_cuobj: staging in " << m_arena->size()
+                << " bytes of out-of-band memory" << dendl;
   return 0;
 }
 
 void RGWCuObjServer::do_shutdown()
 {
   ldout(m_cct, 1) << "rgw_cuobj: shutting down cuObjServer" << dendl;
-  for (size_t i = 0; i < m_buf_count; i++) {
-    auto& entry = m_buffer_pool[i];
-    if (entry.handle && m_server) {
-      m_server->deRegisterBuffer(entry.handle);
-      entry.handle = nullptr;
-    }
-    if (entry.ptr) {
-      free(entry.ptr);
-      entry.ptr = nullptr;
-    }
+  // the arena, which holds the memory, goes after the server
+  if (m_arena_handle && m_server) {
+    m_server->deRegisterBuffer(m_arena_handle);
   }
-  m_buffer_pool.reset();
-  m_buf_count = 0;
+  m_arena_handle = nullptr;
   m_server.reset();
 }
 
@@ -138,36 +130,30 @@ bool RGWCuObjServer::is_available() const
   return m_server && m_server->isConnected();
 }
 
-// descriptor format: "addr:size:rkey:reserved:qp_num:lid:gid"
-// all fields hex-encoded, colon-separated
+// descriptor token: leading "addr:size:" hex fields, remainder opaque;
+// see common/rdma_token.h
 size_t RGWCuObjServer::parse_rdma_descriptor_size(const std::string& rdma_descr)
 {
-  ldout(g_ceph_context, 21) << "rgw_cuobj: parsing RDMA descriptor: " << rdma_descr << dendl;
-  auto first_colon = rdma_descr.find(':');
-  if (first_colon == std::string::npos) {
-    lderr(g_ceph_context) << "rgw_cuobj: ERROR: failed to parse RDMA descriptor: no colon found" << dendl;
+  auto window = ceph::rdma::parse_rdma_token(rdma_descr);
+  if (!window) {
+    lderr(g_ceph_context) << "rgw_cuobj: ERROR: failed to parse RDMA descriptor" << dendl;
     return 0;
   }
-  auto second_colon = rdma_descr.find(':', first_colon + 1);
-  if (second_colon == std::string::npos) {
-    lderr(g_ceph_context) << "rgw_cuobj: ERROR: failed to parse RDMA descriptor: second colon not found" << dendl;
-    return 0;
-  }
-  auto size_str = rdma_descr.substr(first_colon + 1, second_colon - first_colon - 1);
-  ldout(g_ceph_context, 21) << "rgw_cuobj: parsed size from RDMA descriptor: " << size_str << dendl;
-  return std::stoull(size_str, nullptr, 16);
+  ldout(g_ceph_context, 21) << "rgw_cuobj: parsed size from RDMA descriptor: "
+                            << window->size << dendl;
+  return window->size;
 }
 
 static uint64_t parse_rdma_descriptor_addr(const std::string& rdma_descr)
 {
-  ldout(g_ceph_context, 21) << "rgw_cuobj: parsing RDMA descriptor for address: " << rdma_descr << dendl;
-  auto first_colon = rdma_descr.find(':');
-  if (first_colon == std::string::npos) {
-    lderr(g_ceph_context) << "rgw_cuobj: ERROR: failed to parse RDMA descriptor for address: no colon found" << dendl;
+  auto window = ceph::rdma::parse_rdma_token(rdma_descr);
+  if (!window) {
+    lderr(g_ceph_context) << "rgw_cuobj: ERROR: failed to parse RDMA descriptor for address" << dendl;
     return 0;
   }
-  ldout(g_ceph_context, 21) << "rgw_cuobj: parsed address from RDMA descriptor: " << rdma_descr.substr(0, first_colon) << dendl;
-  return std::stoull(rdma_descr.substr(0, first_colon), nullptr, 16);
+  ldout(g_ceph_context, 21) << "rgw_cuobj: parsed address from RDMA descriptor: "
+                            << window->addr << dendl;
+  return window->addr;
 }
 
 uint16_t RGWCuObjServer::get_channel_id()
@@ -192,25 +178,28 @@ void RGWCuObjServer::release_channel_id()
 RGWCuObjServer::RDMABufEntry* RGWCuObjServer::acquire_buffer(size_t needed_size)
 {
   ldout(m_cct, 21) << "rgw_cuobj: acquiring RDMA buffer for size " << needed_size << dendl;
-  for (size_t i = 0; i < m_buf_count; i++) {
-    auto& entry = m_buffer_pool[i];
-    if (entry.size >= needed_size) {
-      bool expected = false;
-      if (entry.in_use.compare_exchange_strong(expected, true,
-                                               std::memory_order_acquire)) {
-        return &entry;
-      }
-    }
+  // a buffer of the arena at the transfer's size; a larger transfer than
+  // Arena::MAX, or one that finds the arena full, gets none
+  const auto slice = m_arena->alloc(needed_size);
+  if (!slice) {
+    ldout(m_cct, 4) << "rgw_cuobj: no out-of-band buffer of " << needed_size
+                    << " bytes free" << dendl;
+    return nullptr;
   }
-  lderr(m_cct) << "rgw_cuobj: ERROR: no available RDMA buffer for size " << needed_size << dendl;
-  return nullptr;
+  auto entry = new RDMABufEntry;
+  entry->ptr = m_arena->ptr(slice);
+  entry->size = slice.len;
+  entry->offset = slice.offset;
+  entry->handle = m_arena_handle;
+  return entry;
 }
 
 void RGWCuObjServer::release_buffer(RDMABufEntry* buf)
 {
   ldout(m_cct, 21) << "rgw_cuobj: releasing RDMA buffer" << dendl;
   if (buf) {
-    buf->in_use.store(false, std::memory_order_release);
+    m_arena->free(buf->offset, buf->size);
+    delete buf;
   }
 }
 
@@ -240,7 +229,7 @@ ssize_t RGWCuObjServer::rdma_read_from_client(
     ibv_wc_status wc_status = IBV_WC_SUCCESS;
     ssize_t ret = m_server->handlePutObject(
         key, buf->handle, client_addr + total_read,
-        chunk, rdma_descr, channel, total_read, &wc_status);
+        chunk, rdma_descr, channel, buf->offset + total_read, &wc_status);
     if (ret < 0) {
       lderr(m_cct) << "rgw_cuobj: ERROR: handlePutObject failed:"
                    << " ret=" << ret
@@ -285,7 +274,7 @@ ssize_t RGWCuObjServer::rdma_write_to_client(
     size_t chunk = std::min(size - total_written, MAX_RDMA_OP_SIZE);
     ssize_t ret = m_server->handleGetObject(
         key, buf->handle, client_addr + total_written,
-        chunk, rdma_descr, channel, total_written);
+        chunk, rdma_descr, channel, buf->offset + total_written);
     if (ret < 0) {
       lderr(m_cct) << "rgw_cuobj: ERROR: handleGetObject failed:"
                    << " ret=" << ret

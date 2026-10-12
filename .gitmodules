@@ -85,3 +85,6 @@
 [submodule "src/lss"]
 	path = src/lss
 	url = https://chromium.googlesource.com/linux-syscall-support
+[submodule "src/ofi-rma"]
+	path = src/ofi-rma
+	url = https://github.com/mmgaggle/ofi-rma.git

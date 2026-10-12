@@ -102,6 +102,26 @@ add_executable(unittest_rgw_bencode test_rgw_bencode.cc)
 add_ceph_unittest(unittest_rgw_bencode)
 target_link_libraries(unittest_rgw_bencode ${rgw_libs})
 
+if(WITH_OOB_OFI)
+  # client for OSD-direct delivery over libfabric
+  add_executable(ceph_test_rgw_ofi_get ofi/ofi_s3_get.cc)
+  target_link_libraries(ceph_test_rgw_ofi_get ofi_rma ${CURL_LIBRARIES})
+  # client for OSD-direct PUTs over libfabric
+  add_executable(ceph_test_rgw_ofi_put ofi/ofi_s3_put.cc)
+  target_link_libraries(ceph_test_rgw_ofi_put ofi_rma ${CURL_LIBRARIES})
+endif()
+
+# unittest_rgw_rdma_rc_wire
+add_executable(unittest_rgw_rdma_rc_wire test_rgw_rdma_rc_wire.cc)
+add_ceph_unittest(unittest_rgw_rdma_rc_wire)
+target_link_libraries(unittest_rgw_rdma_rc_wire ${rgw_libs})
+
+# unittest_rgw_rdma_fence
+add_executable(unittest_rgw_rdma_fence test_rgw_rdma_fence.cc)
+add_ceph_unittest(unittest_rgw_rdma_fence)
+target_include_directories(unittest_rgw_rdma_fence
+  PRIVATE ${CMAKE_SOURCE_DIR}/src/rgw)
+
 # unittest_rgw_cors
 add_executable(unittest_rgw_cors
   test_rgw_cors.cc

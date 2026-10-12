@@ -36,6 +36,7 @@
 #include "common/ceph_time.h"
 
 #include "rgw_cksum.h"
+#include "rgw_rdma_cksum.h"
 #include "rgw_common.h"
 #include "rgw_dmclock.h"
 
@@ -358,6 +359,12 @@ public:
     }
     return 0;
   }
+  int handle_oob(uint64_t ofs, uint64_t len) override {
+    if (next) {
+      return next->handle_oob(ofs, len);
+    }
+    return 0;
+  }
   /**
    * Flushes any cached data. Used by RGWGetObjFilter.
    * Return logic same as handle_data.
@@ -467,6 +474,73 @@ protected:
   // Used by decrypt filter for range clamping. For non-AEAD modes, equals s->obj_size.
   off_t encrypted_obj_size{0};
 
+  // S3-over-RDMA (cuObject): how object data reaches the client
+  enum class RdmaMode {
+    NONE,        ///< HTTP body (x-amz-rdma-reply: 501 when a token was sent)
+    STAGED,      ///< staged in RGW memory, one RDMA_WRITE from the local cuObjServer
+    PASSTHROUGH, ///< OSDs RDMA-write stripes directly (delivery descriptor)
+    RELAY,       ///< OSDs RDMA-write stripes into a gateway window that a
+                 ///< subclass forwards to the client (hipobj-rc-v2)
+    RELAY_STAGED,///< stripes copied into that gateway window instead
+  };
+  std::string rdma_token;  ///< x-amz-rdma-token header, empty if absent
+  RdmaMode rdma_mode = RdmaMode::NONE;
+  /// a gateway memory window for the relay modes: the subclass serving
+  /// an RC session sets these before execute(); relay_token is the
+  /// cuObject descriptor the OSDs push into (empty = no OSD-direct
+  /// delivery, so RELAY_STAGED)
+  std::string relay_token;
+  size_t relay_window = 0;
+  /// The fence a GET owes once descriptor-bearing reads reached OSDs: a
+  /// write of theirs that no reply accounts for may still land in the
+  /// window until the pools' lease and drain run out, so the window is
+  /// not rewritten (a fallback) and the client is not answered (success
+  /// or error) before that.
+  struct rdma_fence_t {
+    bool sent = false;           ///< descriptor-bearing reads went out
+    bool needed = true;          ///< see rgw::rdma::fence_needed()
+    bool resent = false;         ///< one of them was sent more than once
+    bool client_window = false;  ///< they wrote the client's window
+    bool settled = false;        ///< waited out, or found not needed
+    uint64_t wait_ms = 0;        ///< the longest lease plus drain
+  } rdma_fence_state;
+  /// what the read that just ended left owing
+  void note_rdma_reads(bool submitted, bool needed, bool resent,
+                       double fence_s);
+  /// wait the fence owed, once, before what: a fallback rewriting the
+  /// window, or a response (success or not)
+  void rdma_fence_before(const char* what, bool response, bool success);
+  /// after execute(): how long a relay window must stay out of use for
+  /// the fence the response did not wait out (the pools' lease plus
+  /// drain), given whether the reads delivered the whole range, whatever
+  /// became of the relay to the client after that; 0 when no write of
+  /// the reads can land any more (see rgw::rdma::write_may_land())
+  uint64_t rdma_window_hold_ms(bool success) const;
+  /// where a GET that sent descriptor-bearing reads failed, for the log
+  const char* rdma_failed_at = nullptr;
+  /// true for the modes where the OSDs deliver out of band
+  bool rdma_oob_mode() const {
+    return rdma_mode == RdmaMode::PASSTHROUGH || rdma_mode == RdmaMode::RELAY;
+  }
+  uint64_t rdma_bytes = 0; ///< bytes delivered out of band (passthrough)
+  /// the CRCs of the delivered bytes that the client asked for
+  /// (x-amz-rdma-checksum-algorithm), which the response reports
+  rgw::rdma::cksum_want rdma_cksum_asked;
+  /// combined CRC64-NVME and CRC-32C of the delivered bytes, each when
+  /// every stripe reported it (the response's
+  /// x-amz-rdma-checksum-<algorithm>, and passthrough verification)
+  std::optional<uint64_t> rdma_crc64;
+  std::optional<uint32_t> rdma_crc32c;
+  /// staged-mode buffer (an RGWCuObjServer::RDMABufEntry*), reserved at
+  /// mode-selection time because staging failures cannot be signalled
+  /// once response headers are out
+  void* rdma_buf = nullptr;
+  size_t rdma_buf_offset = 0;
+
+  /// pick rdma_mode for this request; plain_chain is true when no data
+  /// filter (compression, encryption, lua, flight) is engaged
+  void select_rdma_mode(bool plain_chain);
+
   int init_common();
 public:
   RGWGetObj() {
@@ -520,6 +594,8 @@ public:
   int handle_slo_manifest(bufferlist& bl, optional_yield y);
 
   int get_data_cb(bufferlist& bl, off_t ofs, off_t len);
+  /// an out-of-band stripe landed (relay modes; see RGWGetDataCB)
+  virtual int get_oob_cb(uint64_t ofs, uint64_t len) { return 0; }
 
   virtual int get_params(optional_yield y) = 0;
   virtual int send_response_data_error(optional_yield y) = 0;
@@ -559,6 +635,9 @@ public:
 
   int handle_data(bufferlist& bl, off_t bl_ofs, off_t bl_len) override {
     return op->get_data_cb(bl, bl_ofs, bl_len);
+  }
+  int handle_oob(uint64_t ofs, uint64_t len) override {
+    return op->get_oob_cb(ofs, len);
   }
 };
 
@@ -1337,6 +1416,28 @@ protected:
   RGWObjectLegalHold *obj_legal_hold;
 
   std::optional<rgw::cksum::Cksum> cksum;
+
+  /// S3-over-RDMA (cuObject): a subclass whose get_data() supplies the
+  /// body (an RC session buffer) clears this before execute(), so that
+  /// no x-amz-rdma-token stages the body from the client's memory
+  bool rdma_staging_allowed = true;
+  /// S3-over-RDMA (cuObject): after execute(), whether the body came
+  /// from the client's memory (a gateway-staged PUT), which the reply
+  /// reports
+  bool rdma_staged = false;
+  /// S3-over-RDMA: after execute(), whether the OSDs pulled the object
+  /// out of the client's memory (an OSD-direct PUT, rgw_rdma_osd_direct),
+  /// which the reply reports
+  bool rdma_pulled = false;
+  /// S3-over-RDMA: with rdma_pulled, the OSDs' CRCs of the bytes they
+  /// pulled, folded in object order, which the reply reports
+  /// (x-amz-rdma-checksum-<algorithm>)
+  std::optional<uint64_t> rdma_pulled_crc64;
+  std::optional<uint32_t> rdma_pulled_crc32c;
+  /// S3-over-RDMA: the PUT carried x-amz-rdma-token and no body, and the
+  /// gateway could not have the OSDs pull it; the reply says so
+  /// (x-amz-rdma-reply: 501), and the client sends the body instead
+  bool rdma_put_declined = false;
 
 public:
   RGWPutObj() : ofs(0),

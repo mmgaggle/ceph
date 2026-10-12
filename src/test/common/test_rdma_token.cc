@@ -1,0 +1,347 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 smarttab
+
+#include "common/rdma_token.h"
+#include "common/oob_arena.h"
+#include "common/oob_config.h"
+
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+#include <unistd.h>
+
+#include "gtest/gtest.h"
+
+using ceph::rdma::parse_rdma_token;
+using ceph::rdma::RDMA_TOKEN_MAX_LEN;
+
+// the shape emitted by cuObject clients:
+// raddr:rsize:rkey:lid:qp:has_gid:gid
+static const std::string valid_token =
+  "0102030405060708:01020304:0102aabb:0102:010203:1:"
+  "0102030405060708090a0b0c0d0e0f10";
+
+TEST(RdmaToken, ParseValid)
+{
+  auto w = parse_rdma_token(valid_token);
+  ASSERT_TRUE(w);
+  EXPECT_EQ(0x0102030405060708ull, w->addr);
+  EXPECT_EQ(0x01020304ull, w->size);
+}
+
+TEST(RdmaToken, ParseMinimalFields)
+{
+  // only the leading addr:size fields are interpreted
+  auto w = parse_rdma_token("ff:10:rest-is-opaque");
+  ASSERT_TRUE(w);
+  EXPECT_EQ(0xffull, w->addr);
+  EXPECT_EQ(0x10ull, w->size);
+}
+
+TEST(RdmaToken, RejectMalformed)
+{
+  EXPECT_FALSE(parse_rdma_token(""));
+  EXPECT_FALSE(parse_rdma_token("deadbeef"));           // no colon
+  EXPECT_FALSE(parse_rdma_token("deadbeef:"));          // no second colon
+  EXPECT_FALSE(parse_rdma_token(":1234:rkey"));         // empty addr
+  EXPECT_FALSE(parse_rdma_token("1234::rkey"));         // empty size
+  EXPECT_FALSE(parse_rdma_token("xyz:1234:rkey"));      // non-hex addr
+  EXPECT_FALSE(parse_rdma_token("1234:no pe:rkey"));    // non-hex size
+  EXPECT_FALSE(parse_rdma_token("11112222333344445:1:x")); // >16 hex digits
+  EXPECT_FALSE(parse_rdma_token(std::string(RDMA_TOKEN_MAX_LEN + 1, '1')));
+}
+
+TEST(RdmaToken, MaxValues)
+{
+  auto w = parse_rdma_token("ffffffffffffffff:ffffffff:x");
+  ASSERT_TRUE(w);
+  EXPECT_EQ(~0ull, w->addr);
+  EXPECT_EQ(0xffffffffull, w->size);
+}
+
+TEST(RdmaToken, TransportList)
+{
+  using ceph::rdma::parse_transport_list;
+  using V = std::vector<std::string>;
+  EXPECT_EQ(parse_transport_list(""), V{});
+  EXPECT_EQ(parse_transport_list("tcp"), V{"tcp"});
+  // separators are commas, spaces and tabs; a provider's semicolon is
+  // part of its name, and <core>_ofi_<utility> spells the same provider
+  // without one
+  EXPECT_EQ(parse_transport_list("cuobj,verbs;ofi_rxm"),
+	    (V{"cuobj", "verbs;ofi_rxm"}));
+  EXPECT_EQ(parse_transport_list("Verbs_OFI_rxm, tcp_ofi_rxm, verbs;ofi_rxm"),
+	    (V{"verbs;ofi_rxm", "tcp;ofi_rxm"}));
+  EXPECT_EQ(ceph::rdma::libfabric_name("ofi_rxm"), "ofi_rxm");
+  EXPECT_EQ(ceph::rdma::libfabric_name("verbs"), "verbs;ofi_rxm");
+  EXPECT_EQ(ceph::rdma::libfabric_name("uet"), "uet");
+  EXPECT_EQ(parse_transport_list(" UET ,\tcuobj , "), (V{"uet", "cuobj"}));
+  // duplicates and empty entries drop
+  EXPECT_EQ(parse_transport_list("rc,,rc,tcp"), (V{"rc", "tcp"}));
+}
+
+TEST(RdmaToken, OobTransports)
+{
+  using ceph::rdma::parse_oob_transports;
+  // nothing
+  auto t = parse_oob_transports("", "");
+  EXPECT_TRUE(t.ofi_provider.empty());
+  EXPECT_FALSE(t.cuobj());
+  EXPECT_FALSE(t.client_rc());
+  EXPECT_TRUE(t.warnings.empty());
+
+  // one provider for both roles, cuObject and RC clients, in either
+  // spelling
+  t = parse_oob_transports("verbs_ofi_rxm, cuobj, rc", "verbs;ofi_rxm");
+  EXPECT_EQ("verbs;ofi_rxm", t.ofi_provider);
+  EXPECT_TRUE(t.client_ofi());
+  EXPECT_TRUE(t.client_cuobj());
+  EXPECT_TRUE(t.client_rc());
+  EXPECT_TRUE(t.cluster_ofi());
+  EXPECT_FALSE(t.cluster_cuobj());
+  EXPECT_TRUE(t.names_provider("verbs;ofi_rxm"));
+  EXPECT_TRUE(t.warnings.empty());
+
+  // cuObject between the daemons, libfabric to clients
+  t = parse_oob_transports("uet", "cuobj");
+  EXPECT_EQ("uet", t.ofi_provider);
+  EXPECT_TRUE(t.cuobj());
+  EXPECT_FALSE(t.client_cuobj());
+  EXPECT_TRUE(t.cluster_cuobj());
+  EXPECT_TRUE(t.names_provider("uet"));
+
+  // one libfabric endpoint: the cluster transport's provider wins
+  t = parse_oob_transports("tcp, uet", "verbs;ofi_rxm");
+  EXPECT_EQ("verbs;ofi_rxm", t.ofi_provider);
+  EXPECT_EQ(2u, t.warnings.size());
+  t = parse_oob_transports("tcp, uet", "");
+  EXPECT_EQ("tcp", t.ofi_provider);
+  EXPECT_EQ(1u, t.warnings.size());
+
+  // rc is no cluster transport, and the cluster transport is one
+  t = parse_oob_transports("", "rc");
+  EXPECT_TRUE(t.cluster.empty());
+  EXPECT_EQ(1u, t.warnings.size());
+  t = parse_oob_transports("", "cuobj, tcp");
+  EXPECT_EQ("cuobj", t.cluster);
+  EXPECT_TRUE(t.ofi_provider.empty());
+  EXPECT_EQ(1u, t.warnings.size());
+
+  // verbs alone, which is also what a configuration file leaves of an
+  // unescaped verbs;ofi_rxm, is the same provider
+  t = parse_oob_transports("verbs", "verbs_ofi_rxm");
+  EXPECT_EQ("verbs;ofi_rxm", t.ofi_provider);
+  EXPECT_TRUE(t.names_provider("verbs;ofi_rxm"));
+  EXPECT_TRUE(t.warnings.empty());
+}
+
+namespace {
+
+/// a fake sysfs with one RoCE device, two ports, and GID tables
+struct fake_sysfs {
+  std::filesystem::path root;
+  fake_sysfs() {
+    root = std::filesystem::temp_directory_path() /
+      ("oob-sysfs-" + std::to_string(getpid()));
+    std::filesystem::remove_all(root);
+  }
+  ~fake_sysfs() { std::filesystem::remove_all(root); }
+  void gid(const std::string& dev, unsigned port, unsigned i,
+	   const std::string& value, const std::string& type) {
+    const auto p = root / "class/infiniband" / dev / "ports" /
+      std::to_string(port);
+    std::filesystem::create_directories(p / "gids");
+    std::filesystem::create_directories(p / "gid_attrs/types");
+    std::ofstream(p / "gids" / std::to_string(i)) << value << "\n";
+    if (!type.empty()) {
+      std::ofstream(p / "gid_attrs/types" / std::to_string(i)) << type << "\n";
+    }
+  }
+};
+
+} // anonymous namespace
+
+TEST(OobConfig, FindRdmaGid)
+{
+  using ceph::oob::find_rdma_gid;
+  fake_sysfs fs;
+  const std::string link = "fe80:0000:0000:0000:5e5d:aaff:fe01:0203";
+  const std::string v4 = "0000:0000:0000:0000:0000:ffff:0a5a:0001";
+  fs.gid("mlx5_0", 1, 0, link, "IB/RoCE v1");
+  fs.gid("mlx5_0", 1, 1, link, "RoCE v2");
+  fs.gid("mlx5_0", 1, 2, v4, "IB/RoCE v1");
+  fs.gid("mlx5_0", 1, 3, v4, "RoCE v2");
+  fs.gid("mlx5_0", 2, 0, "0000:0000:0000:0000:0000:ffff:0a5b:0001",
+	 "RoCE v2");
+  // an unused entry: no type
+  fs.gid("mlx5_0", 2, 1, "0000:0000:0000:0000:0000:0000:0000:0000", "");
+
+  std::string dev;
+  unsigned port = 0;
+  int idx = -1;
+  // the RoCE v2 GID of the address, not its v1 twin
+  ASSERT_TRUE(find_rdma_gid(fs.root.string(), "10.90.0.1", &dev, &port, &idx));
+  EXPECT_EQ("mlx5_0", dev);
+  EXPECT_EQ(1u, port);
+  EXPECT_EQ(3, idx);
+  ASSERT_TRUE(find_rdma_gid(fs.root.string(), "10.91.0.1", &dev, &port, &idx));
+  EXPECT_EQ(2u, port);
+  EXPECT_EQ(0, idx);
+  // an IPv6 address matches its GID directly
+  ASSERT_TRUE(find_rdma_gid(fs.root.string(), "fe80::5e5d:aaff:fe01:203", &dev, &port,
+			    &idx));
+  EXPECT_EQ(1, idx);
+  // no GID holds it, or it is no address
+  EXPECT_FALSE(find_rdma_gid(fs.root.string(), "10.92.0.1", &dev, &port, &idx));
+  EXPECT_FALSE(find_rdma_gid(fs.root.string(), "mlx5_0", &dev, &port, &idx));
+  EXPECT_FALSE(find_rdma_gid((fs.root / "none").string(), "10.90.0.1", &dev, &port,
+			     &idx));
+}
+
+TEST(OobConfig, OfiWhere)
+{
+  using ceph::oob::ofi_where;
+  ceph::oob::location_t loc;
+  loc.addr = "10.90.0.1";
+  loc.iface = "uet-o3";
+  loc.rdma_device = "rocep101s0f0";
+  std::string domain, node;
+  ofi_where(loc, "verbs;ofi_rxm", &domain, &node);
+  EXPECT_EQ("rocep101s0f0", domain);
+  EXPECT_EQ("10.90.0.1", node);
+  ofi_where(loc, "uet", &domain, &node);
+  EXPECT_EQ("uet-o3", domain);
+  EXPECT_EQ("", node);
+  ofi_where(loc, "tcp", &domain, &node);
+  EXPECT_EQ("", domain);
+  EXPECT_EQ("10.90.0.1", node);
+  ofi_where(loc, "shm", &domain, &node);
+  EXPECT_EQ("", domain);
+  EXPECT_EQ("", node);
+  // no address: the provider chooses
+  ofi_where(ceph::oob::location_t{}, "verbs;ofi_rxm", &domain, &node);
+  EXPECT_EQ("", domain);
+  EXPECT_EQ("", node);
+}
+
+
+TEST(RdmaToken, OfiShape)
+{
+  using ceph::rdma::is_ofi_token;
+  const std::string ofi =
+    "7f0012345000:c00000:ofi1:rxm.1:020012340a00000100ff:1f";
+  EXPECT_TRUE(is_ofi_token(ofi));
+  EXPECT_TRUE(is_ofi_token("0:10:ofi1:xnet.1:0200:1"));
+  // any version of the family: one this build cannot parse is still not
+  // a cuObject descriptor, and is declined by the libfabric executor
+  EXPECT_TRUE(is_ofi_token("0:10:ofi10:xnet.1:0200:1"));
+  EXPECT_TRUE(is_ofi_token("0:10:ofi2:x"));
+  // a libfabric token has the addr:size prefix too, so parsing the
+  // window cannot tell the two apart
+  auto w = parse_rdma_token(ofi);
+  ASSERT_TRUE(w);
+  EXPECT_EQ(0xc00000ull, w->size);
+
+  EXPECT_FALSE(is_ofi_token(valid_token));
+  EXPECT_FALSE(is_ofi_token(""));
+  EXPECT_FALSE(is_ofi_token("ofi1"));
+  EXPECT_FALSE(is_ofi_token("0:10"));
+  EXPECT_FALSE(is_ofi_token("0:10:"));
+  // only the third field counts
+  EXPECT_FALSE(is_ofi_token("ofi1:0:10:tcp"));
+  EXPECT_FALSE(is_ofi_token("0:10:ofi:xnet.1:0200:1"));
+  EXPECT_FALSE(is_ofi_token("0:10:ofi1x:xnet.1:0200:1"));
+  EXPECT_FALSE(is_ofi_token("0:10:1:ofi1:0200:1"));
+}
+
+TEST(RdmaToken, CuobjDescriptor)
+{
+  using ceph::rdma::is_cuobj_descriptor;
+  EXPECT_TRUE(is_cuobj_descriptor(valid_token));
+  EXPECT_TRUE(is_cuobj_descriptor("ff:10:rest-is-opaque"));
+  // a libfabric token parses, but is not one
+  EXPECT_FALSE(is_cuobj_descriptor("0:10:ofi1:xnet.1:0200:1"));
+  EXPECT_FALSE(is_cuobj_descriptor("0:10:ofi2:xnet.1:0200:1"));
+  // neither is a token whose window does not parse, such as an RC
+  // queue-pair token, which has no colons
+  EXPECT_FALSE(is_cuobj_descriptor(std::string(88, 'a')));
+  EXPECT_FALSE(is_cuobj_descriptor(""));
+  EXPECT_FALSE(is_cuobj_descriptor("xyz:1234:rkey"));
+  EXPECT_FALSE(is_cuobj_descriptor("0:10"));
+}
+
+TEST(OobArena, BuddyBuffers)
+{
+  using ceph::oob::Arena;
+  std::string err;
+  // rounded down to whole blocks
+  auto a = Arena::create(2 * Arena::MAX + 5, &err);
+  ASSERT_TRUE(a) << err;
+  EXPECT_EQ(2 * Arena::MAX, a->size());
+
+  EXPECT_EQ(Arena::MIN, Arena::round(1));
+  EXPECT_EQ(Arena::MIN, Arena::round(Arena::MIN));
+  EXPECT_EQ(4 * Arena::MIN, Arena::round(3 * Arena::MIN));
+  EXPECT_EQ(Arena::MAX, Arena::round(Arena::MAX));
+  EXPECT_EQ(0u, Arena::round(Arena::MAX + 1));
+
+  // a buffer per transfer, in its power of two, never overlapping
+  auto s1 = a->alloc(100);
+  auto s2 = a->alloc(3 << 20);
+  auto s3 = a->alloc(Arena::MAX);
+  ASSERT_TRUE(s1 && s2 && s3);
+  EXPECT_EQ(Arena::MIN, s1.len);
+  EXPECT_EQ(4 * Arena::MIN, s2.len);
+  EXPECT_EQ(0u, s2.offset % s2.len);
+  EXPECT_TRUE(s1.offset + s1.len <= s2.offset ||
+              s2.offset + s2.len <= s1.offset);
+  EXPECT_FALSE(a->alloc(Arena::MAX + 1));
+  // the other block is split already, so no second MAX buffer
+  EXPECT_FALSE(a->alloc(Arena::MAX));
+  EXPECT_EQ(Arena::MIN + 4 * Arena::MIN + Arena::MAX, a->stats().in_use);
+
+  // freed buffers join their buddies again
+  a->free(s1);
+  a->free(s2.offset, 3 << 20);
+  auto s4 = a->alloc(Arena::MAX);
+  ASSERT_TRUE(s4);
+  a->free(s3);
+  a->free(s4);
+  EXPECT_EQ(0u, a->stats().in_use);
+
+  // every MIN buffer, then nothing more
+  std::vector<Arena::slice_t> all;
+  while (auto s = a->alloc(1)) {
+    all.push_back(s);
+  }
+  EXPECT_EQ(a->size() / Arena::MIN, all.size());
+  EXPECT_GE(a->stats().failed, 1u);
+  for (auto& s : all) {
+    a->free(s);
+  }
+  EXPECT_EQ(0u, a->stats().in_use);
+}
+
+TEST(OobArena, Reserve)
+{
+  using ceph::oob::Arena;
+  std::string err;
+  auto a = Arena::create(4 * Arena::MAX, &err);
+  ASSERT_TRUE(a) << err;
+  // a run of whole blocks at the top, inside the arena
+  char* w = a->reserve(Arena::MAX + 1);
+  ASSERT_TRUE(w);
+  EXPECT_EQ(a->base() + 2 * Arena::MAX, w);
+  EXPECT_EQ(2 * Arena::MAX, a->stats().reserved);
+  // buffers come from the rest
+  auto s = a->alloc(Arena::MAX);
+  ASSERT_TRUE(s);
+  EXPECT_LT(s.offset, 2 * Arena::MAX);
+  // no run of three blocks is left
+  EXPECT_FALSE(a->reserve(3 * Arena::MAX));
+  EXPECT_TRUE(a->reserve(Arena::MAX));
+  EXPECT_FALSE(a->alloc(Arena::MAX));
+  a->free(s);
+}
+

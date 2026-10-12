@@ -3347,9 +3347,20 @@ void PGMap::get_health_checks(
         summary += " experiencing high free space fragmentation of BlueStore";
       } else if (asum.first == "EXTBLKDEV") {
         summary += " reporting problems with ExtBlkDev plugin";
+      } else if (asum.first == "OOB_DELIVERY_UNSAFE") {
+        summary += " stopped out-of-band delivery after a write cut-off failed";
+      } else if (asum.first == "OOB_DELIVERY_DOWN") {
+        summary += " stopped out-of-band delivery after losing the transport";
+      } else if (asum.first == "OOB_CUTOFF_LATE") {
+        summary += " cut off out-of-band writes late, within the tolerance";
+      } else if (asum.first == "OOB_CUTOFF_PAST_TOLERANCE") {
+        summary += " cut off out-of-band writes later than the tolerance";
       }
 
-      auto& d = checks->add(asum.first, HEALTH_WARN, summary, asum.second.first);
+      // writes may have landed after the fence a client counts on
+      const auto severity = asum.first == "OOB_CUTOFF_PAST_TOLERANCE" ?
+        HEALTH_ERR : HEALTH_WARN;
+      auto& d = checks->add(asum.first, severity, summary, asum.second.first);
       for (auto& s : asum.second.second) {
         d.detail.push_back(s);
       }

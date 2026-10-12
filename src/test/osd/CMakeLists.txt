@@ -61,6 +61,37 @@ add_executable(unittest_osd_types
 add_ceph_unittest(unittest_osd_types)
 target_link_libraries(unittest_osd_types global)
 
+# unittest_oob_placement
+add_executable(unittest_oob_placement
+  test_oob_placement.cc
+  )
+add_ceph_unittest(unittest_oob_placement)
+target_link_libraries(unittest_oob_placement osd global)
+
+# unittest_oob_abandoned
+add_executable(unittest_oob_abandoned
+  test_oob_abandoned.cc
+  )
+add_ceph_unittest(unittest_oob_abandoned)
+
+# unittest_ec_gather
+add_executable(unittest_ec_gather
+  test_ec_gather.cc
+  )
+add_ceph_unittest(unittest_ec_gather)
+target_link_libraries(unittest_ec_gather osd global)
+
+if(WITH_OOB_OFI)
+  # unittest_osd_ofi: the libfabric executor over the tcp provider, which
+  # needs no special hardware
+  add_executable(unittest_osd_ofi
+    test_osd_ofi.cc
+    $<TARGET_OBJECTS:unit-main>
+    )
+  add_ceph_unittest(unittest_osd_ofi)
+  target_link_libraries(unittest_osd_ofi osd global)
+endif()
+
 # unittest_ecbackend_l (legacy EC)
 add_executable(unittest_ecbackend_l
   TestECBackendL.cc

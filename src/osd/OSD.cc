@@ -70,6 +70,18 @@
 #ifdef HAVE_LIBFUSE
 #include "os/FuseStore.h"
 #endif
+#ifdef WITH_CUOBJ
+#include "osd_cuobj.h"
+#endif
+#ifdef WITH_OOB_OFI
+#include "osd_ofi.h"
+#endif
+#ifdef HAVE_OSD_OOB_DELIVERY
+#include "common/oob_arena.h"
+#include "common/oob_config.h"
+#include "common/rdma_token.h"
+#include "oob_executor.h"
+#endif
 
 #include "PrimaryLogPG.h"
 
@@ -530,9 +542,68 @@ void OSDService::shutdown()
     f->stop();
   }
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+  oob_executors.clear();
+  oob_lender = nullptr;
+#endif
+#ifdef WITH_CUOBJ
+  // op threads are stopped by now, so no RDMA writes are in flight
+  delete cuobj;
+  cuobj = nullptr;
+#endif
+#ifdef WITH_OOB_OFI
+  delete ofi;
+  ofi = nullptr;
+#endif
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // after the executors, which registered it
+  oob_arena.reset();
+#endif
+
   publish_map(OSDMapRef());
   next_osdmap = OSDMapRef();
 }
+
+#ifdef HAVE_OSD_OOB_DELIVERY
+OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
+{
+  for (auto* e : oob_executors) {
+    if (e->handles(token)) {
+      return e;
+    }
+  }
+  return nullptr;
+}
+
+OSDOobExecutor* OSDService::oob_puller_for(const std::string& token) const
+{
+  for (auto* e : oob_executors) {
+    if (e->pulls(token)) {
+      return e;
+    }
+  }
+  return nullptr;
+}
+
+void OSDService::add_oob_executor(OSDOobExecutor* e, bool lends)
+{
+  oob_executors.push_back(e);
+  if (lends) {
+    ceph_assert(!oob_lender);
+    oob_lender = e;
+  }
+}
+
+OSDOobExecutor* OSDService::oob_gather_executor() const
+{
+  return oob_lender;
+}
+
+bool OSDService::has_oob_executor() const
+{
+  return !oob_executors.empty();
+}
+#endif
 
 void OSDService::fast_shutdown()
 {
@@ -541,6 +612,23 @@ void OSDService::fast_shutdown()
     std::lock_guard l(watch_lock);
     watch_timer.shutdown();
   }
+#ifdef HAVE_OSD_OOB_DELIVERY
+  oob_executors.clear();
+  oob_lender = nullptr;
+#endif
+#ifdef WITH_CUOBJ
+  // op threads are stopped by now, so no RDMA writes are in flight
+  delete cuobj;
+  cuobj = nullptr;
+#endif
+#ifdef WITH_OOB_OFI
+  delete ofi;
+  ofi = nullptr;
+#endif
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // after the executors, which registered it
+  oob_arena.reset();
+#endif
 }
 
 void OSDService::init()
@@ -1037,6 +1125,11 @@ void OSDService::set_statfs(const struct store_statfs_t &stbuf,
   logger->set(l_osd_stat_bytes_used, used);
   logger->set(l_osd_stat_bytes_avail, avail);
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+  for (auto* e : oob_executors) {
+    e->get_alerts(alerts);
+  }
+#endif
   std::lock_guard l(stat_lock);
   osd_stat.statfs = stbuf;
   osd_stat.os_alerts.clear();
@@ -1647,6 +1740,19 @@ void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
 				       !m->has_flag(CEPH_OSD_FLAG_RETURNVEC));
   reply->set_reply_versions(v, uv);
   reply->set_op_returns(op_returns);
+  if (m->has_rdma_delivery()) {
+    // an op answered here never reached complete_read_ctx, the only
+    // place a transfer starts: say so, so that a client bounced off a
+    // laggy replica can retry without fencing its window
+    const auto& deliveries = m->get_rdma_deliveries();
+    std::vector<ceph::rdma::oob_result_t> oob(deliveries.size());
+    for (size_t i = 0; i < deliveries.size(); i++) {
+      if (!deliveries[i].empty()) {
+	oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
+      }
+    }
+    reply->set_oob_results(std::move(oob));
+  }
   m->get_connection()->send_message(reply);
 }
 
@@ -2852,6 +2958,22 @@ void OSD::asok_command(
                      superblock.cluster_osdmap_trim_lower_bound);
     f->dump_unsigned("num_pgs", num_pgs);
     f->close_section();
+#ifdef WITH_CUOBJ
+  } else if (prefix == "cuobj status") {
+    f->open_object_section("cuobj");
+    if (service.cuobj) {
+      service.cuobj->dump_stats(f);
+    }
+    f->close_section();
+#endif
+#ifdef WITH_OOB_OFI
+  } else if (prefix == "ofi status") {
+    f->open_object_section("ofi");
+    if (service.ofi) {
+      service.ofi->dump_stats(f);
+    }
+    f->close_section();
+#endif
   } else if (prefix == "flush_journal") {
     store->flush_journal();
   } else if (prefix == "dump_ops_in_flight" ||
@@ -4048,6 +4170,73 @@ int OSD::init()
 
   check_config();
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // start the executors of the transports that oob_client_transports and
+  // oob_cluster_transport name; the cluster transport's lends the gather
+  // windows, and only it registers them
+  if (const auto oob = ceph::oob::read_transports(cct);
+      oob.cuobj() || !oob.ofi_provider.empty()) {
+    for (const auto& w : oob.warnings) {
+      derr << "WARNING: " << w << dendl;
+    }
+    ceph::oob::location_t loc;
+    std::string err;
+    if (ceph::oob::resolve(
+	  cct, client_messenger->get_myaddrs().front().ip_only_to_str(),
+	  &loc, &err) == 0) {
+      dout(1) << "out-of-band address: " << loc.describe() << dendl;
+      // the executors take their staging buffers, and the cluster
+      // transport's executor its gather windows, from one arena
+      service.oob_arena =
+	ceph::oob::Arena::create(ceph::oob::memory(cct), &err);
+    }
+    if (!service.oob_arena) {
+      derr << "WARNING: " << err << " (out-of-band transfers disabled on "
+	   << "this osd)" << dendl;
+    } else {
+      ceph::oob::Arena* arena = service.oob_arena.get();
+      dout(1) << "out-of-band memory: " << arena->size() << " bytes"
+	      << dendl;
+      const bool cuobj_lends = oob.cluster_cuobj();
+      const bool ofi_lends = oob.cluster_ofi();
+      if (oob.cuobj()) {
+#ifdef WITH_CUOBJ
+	auto cuobj = std::make_unique<OSDCuObj>(cct, loc.addr, cuobj_lends,
+						get_num_op_threads(), arena);
+	if (cuobj->is_available()) {
+	  service.cuobj = cuobj.release();
+	  service.add_oob_executor(service.cuobj, cuobj_lends);
+	} else {
+	  derr << "WARNING: cuObject RDMA init failed on " << loc.addr
+	       << " (cuObject delivery disabled on this osd)" << dendl;
+	}
+#else
+	derr << "WARNING: the out-of-band transports name cuobj, which this "
+	     << "osd was built without" << dendl;
+#endif
+      }
+      if (!oob.ofi_provider.empty()) {
+#ifdef WITH_OOB_OFI
+	auto ofi = std::make_unique<OSDOfi>(cct, clog);
+	if (int r = ofi->init(oob.ofi_provider, loc, ofi_lends, arena);
+	    r == 0) {
+	  service.ofi = ofi.release();
+	  service.add_oob_executor(service.ofi, ofi_lends);
+	} else {
+	  derr << "WARNING: libfabric delivery init failed: "
+	       << cpp_strerror(r) << " (libfabric delivery disabled on this "
+	       << "osd)" << dendl;
+	}
+#else
+	derr << "WARNING: the out-of-band transports name the libfabric "
+	     << "provider " << oob.ofi_provider << ", which this osd was "
+	     << "built without" << dendl;
+#endif
+      }
+    }
+  }
+#endif
+
   dout(10) << "ensuring pgs have consumed prior maps" << dendl;
   consume_map();
 
@@ -4087,6 +4276,21 @@ void OSD::final_init()
   int r = admin_socket->register_command("status", asok_hook,
 					 "high-level status of OSD");
   ceph_assert(r == 0);
+#ifdef WITH_CUOBJ
+  if (service.cuobj) {
+    r = admin_socket->register_command(
+      "cuobj status", asok_hook,
+      "cuObject out-of-band RDMA delivery statistics");
+    ceph_assert(r == 0);
+  }
+#endif
+#ifdef WITH_OOB_OFI
+  if (service.ofi) {
+    r = admin_socket->register_command(
+      "ofi status", asok_hook, "libfabric out-of-band delivery statistics");
+    ceph_assert(r == 0);
+  }
+#endif
   r = admin_socket->register_command("flush_journal",
                                      asok_hook,
                                      "flush the journal to permanent store");

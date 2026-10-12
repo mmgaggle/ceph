@@ -34,10 +34,6 @@ endfunction()
 find_package(ICU 52.0 COMPONENTS uc REQUIRED)
 
 set(librgw_common_srcs
-  spdk/crc64.c
-  madler/crc64nvme.c
-  madler/crc32iso_hdlc.c
-  madler/crc32iscsi.c
   rgw_account.cc
   rgw_acl.cc
   rgw_acl_s3.cc
@@ -290,8 +286,20 @@ if(WITH_RADOSGW_D4N)
         driver/d4n/rgw_sal_d4n.cc)
 endif()
 
-if(WITH_RADOSGW_CUOBJ)
+if(WITH_CUOBJ)
   list(APPEND librgw_common_srcs rgw_cuobj.cc)
+endif()
+
+# hipobj-rc-v2 wire encoding: pure, no transport dependency
+list(APPEND librgw_common_srcs rgw_rdma_rc_wire.cc)
+if(WITH_RDMA_RC)
+  list(APPEND librgw_common_srcs
+    rgw_rdma_rc_transport.cc
+    rgw_rdma_rc_session.cc
+    rgw_rest_rdma_rc.cc)
+  if(HAVE_MLX5DV)
+    list(APPEND librgw_common_srcs rgw_rdma_dc_target.cc)
+  endif()
 endif()
 
 add_library(rgw_common STATIC ${librgw_common_srcs})
@@ -376,8 +384,20 @@ if(WITH_JAEGER)
   target_link_libraries(rgw_common PUBLIC jaeger_base)
 endif()
 
-if(WITH_RADOSGW_CUOBJ)
+if(WITH_CUOBJ)
   target_link_libraries(rgw_common PRIVATE ${CUOBJSERVER_LIBRARY})
+endif()
+
+if(WITH_RDMA_RC)
+  target_link_libraries(rgw_common PRIVATE IBVerbs::verbs)
+  if(HAVE_MLX5DV)
+    target_include_directories(rgw_common PRIVATE ${MLX5DV_INCLUDE_DIR})
+    target_link_libraries(rgw_common PRIVATE ${MLX5_LIBRARY})
+  endif()
+  if(WITH_OOB_OFI)
+    # relay windows OSDs write into over libfabric
+    target_link_libraries(rgw_common PRIVATE ofi_rma)
+  endif()
 endif()
 
 if(WITH_RADOSGW_RADOS)

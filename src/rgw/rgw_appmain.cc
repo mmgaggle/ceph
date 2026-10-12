@@ -75,8 +75,15 @@
 #ifdef WITH_RADOSGW_DBSTORE
 #include "rgw_sal_dbstore.h"
 #endif
-#ifdef WITH_RADOSGW_CUOBJ
+#include "common/oob_config.h"
+#ifdef WITH_CUOBJ
+#include <algorithm>
+#include "common/rdma_token.h"
 #include "rgw_cuobj.h"
+#endif
+#ifdef WITH_RDMA_RC
+#include "rgw_rdma_rc_session.h"
+#include "rgw_rest_rdma_rc.h"
 #endif
 #include "rgw_lua_background.h"
 #include "services/svc_zone.h"
@@ -361,6 +368,17 @@ void rgw::AppMain::cond_init_apis()
     if (apis_set.contains("zero")) {
       rest.register_resource("zero", new rgw::RESTMgr_Zero());
     }
+
+#ifdef WITH_RDMA_RC
+    if (apis_set.contains("s3")) {
+      // the hipobj-rc-v2 control routes live under /.hipobj-rc/. They
+      // answer even when oob_client_transports does not name rc: the protocol's 501
+      // plus unsupported marker is what tells a client to fall back to
+      // plain HTTP
+      rest.register_resource(std::string(rgw::rdma::rc::CONTROL_PREFIX.substr(1)),
+                             set_logging(new rgw::rdma::rc::RESTMgr()));
+    }
+#endif
   } /* have_http_frontend */
 } /* init_apis */
 
@@ -443,9 +461,22 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
   ratelimiter.reset(new ActiveRateLimiter{dpp->get_cct()});
   ratelimiter->start();
 
-#ifdef WITH_RADOSGW_CUOBJ
-  if (g_conf().get_val<bool>("rgw_cuobj_enabled")) {
-    int cuobj_r = RGWCuObjServer::init(dpp->get_cct());
+  // the cuObject server and the RC service take their buffers from one
+  // arena
+  if (const auto oob = ceph::oob::read_transports(dpp->get_cct());
+      oob.client_cuobj() || oob.client_rc()) {
+    std::string err;
+    oob_arena = ceph::oob::Arena::create(
+      ceph::oob::memory(dpp->get_cct()), &err);
+    if (!oob_arena) {
+      derr << "WARNING: " << err << " (S3 over RDMA disabled)" << dendl;
+    }
+  }
+
+#ifdef WITH_CUOBJ
+  if (oob_arena &&
+      ceph::oob::read_transports(dpp->get_cct()).client_cuobj()) {
+    int cuobj_r = RGWCuObjServer::init(dpp->get_cct(), oob_arena.get());
     if (cuobj_r < 0) {
       derr << "WARNING: cuObj RDMA server init failed: " << cuobj_r
            << " (RDMA acceleration disabled)" << dendl;
@@ -523,6 +554,21 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
 
     fes.push_back(fe);
   }
+
+#ifdef WITH_RDMA_RC
+  // the frontends bound their ports and dropped privileges (--setuser)
+  // above; the verbs device must be opened after that, or the
+  // credentials that opened it no longer match any thread's. Until the
+  // service is up the RC routes answer 501 and clients use HTTP.
+  if (!nfs && oob_arena &&
+      ceph::oob::read_transports(dpp->get_cct()).client_rc()) {
+    int rc_r = rgw::rdma::rc::Service::init(dpp->get_cct(), oob_arena.get());
+    if (rc_r < 0) {
+      derr << "WARNING: hipobj-rc-v2 RDMA service init failed: "
+           << cpp_strerror(-rc_r) << " (RC sessions will be refused)" << dendl;
+    }
+  }
+#endif
 
   std::string daemon_type = (nfs) ? "rgw-nfs" : "rgw";
   r = env.driver->register_to_service_map(dpp, daemon_type, service_map_meta);
@@ -687,9 +733,15 @@ void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
 
   finalize_async_signals(); // callback
 
-#ifdef WITH_RADOSGW_CUOBJ
+#ifdef WITH_CUOBJ
   RGWCuObjServer::shutdown();
 #endif
+#ifdef WITH_RDMA_RC
+  // frontends are joined, so no handler still holds a session
+  rgw::rdma::rc::Service::shutdown();
+#endif
+  // after the servers, which registered it
+  oob_arena.reset();
 
   rgw_tools_cleanup();
   rgw_shutdown_resolver();

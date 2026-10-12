@@ -342,6 +342,61 @@ inline namespace v14_2_0 {
     void cmpext(uint64_t off, const bufferlist& cmp_bl, int *prval);
     void cmpxattr(const char *name, uint8_t op, const bufferlist& val);
     void cmpxattr(const char *name, uint8_t op, uint64_t v);
+
+    /**
+     * Out-of-band transfers over RDMA: what an OSD reports for a read it
+     * delivered into a client window
+     * (ObjectReadOperation::set_rdma_delivery()), or for a write whose
+     * payload it pulled out of one
+     * (ObjectWriteOperation::write_full_pulled()).
+     */
+    struct rdma_delivery_range {
+      uint64_t ofs = 0;     ///< client-window offset (token base relative)
+      uint64_t len = 0;
+      uint64_t crc64 = 0;   ///< canonical CRC-64/NVME of that range
+      uint32_t crc32c = 0;  ///< canonical CRC-32C of that range
+    };
+    struct rdma_delivery_result {
+      uint64_t bytes = 0;   ///< bytes delivered out of band
+      uint64_t crc64 = 0;   ///< canonical CRC-64/NVME of those bytes
+      uint32_t flags = 0;   ///< RDMA_DELIVERY_* result flags below
+      /// one entry per contiguous placed range, with RDMA_DELIVERY_RANGES
+      std::vector<rdma_delivery_range> ranges;
+      uint32_t crc32c = 0;  ///< canonical CRC-32C of those bytes
+    };
+    /// request flags: the CRC-64/NVME, the CRC-32C (Castagnoli, as S3's
+    /// CRC32C), or both, of the bytes moved out of band
+    static constexpr uint32_t RDMA_DELIVERY_WANT_CRC64 = 1;
+    static constexpr uint32_t RDMA_DELIVERY_WANT_CRC32C = 8;
+    /// result flags: crc64 and the ranges' crc64 are valid; crc32c and
+    /// the ranges' crc32c are valid
+    static constexpr uint32_t RDMA_DELIVERY_CRC64_VALID = 1;
+    static constexpr uint32_t RDMA_DELIVERY_CRC32C_VALID = 64;
+    /// result flag: the bytes are one contiguous logical extent, so crc64
+    /// and crc32c may be concatenate-combined with adjacent results
+    static constexpr uint32_t RDMA_DELIVERY_COMBINABLE = 2;
+    static constexpr uint32_t RDMA_DELIVERY_CRC64_COMBINABLE =
+      RDMA_DELIVERY_COMBINABLE;
+    /// result flag: ranges is populated
+    static constexpr uint32_t RDMA_DELIVERY_RANGES = 4;
+    static constexpr uint32_t RDMA_DELIVERY_CRC64_RANGES =
+      RDMA_DELIVERY_RANGES;
+    /// result flag: the OSD started no transfer for this read, so nothing
+    /// of it reached the window; its data came back inline. An older OSD
+    /// never sets it.
+    static constexpr uint32_t RDMA_DELIVERY_DECLINED = 8;
+    /// result flag: every byte was in the window before the OSD replied,
+    /// so nothing of this read lands after the reply (bar a transport's
+    /// late duplicate of a completed write, which retiring the window's
+    /// key stops)
+    static constexpr uint32_t RDMA_DELIVERY_LANDED = 16;
+    /// result flag: the operation was sent more than once, and an earlier
+    /// attempt may have started a transfer that this result knows nothing
+    /// of, which may land until the pool's lease and drain after it. Not
+    /// set when every earlier attempt was answered with each of its
+    /// descriptor-bearing reads declined or landed (a replica that bounced
+    /// a balanced read, say).
+    static constexpr uint32_t RDMA_DELIVERY_RESENT = 32;
    protected:
     void exec_impl(const char *cls, const char *method, bufferlist& inbl);
     void exec_impl(const char *cls, const char *method, bufferlist& inbl, bufferlist *obl, int *prval);
@@ -435,6 +490,30 @@ inline namespace v14_2_0 {
     void write_full(const bufferlist& bl);
     void writesame(uint64_t off, uint64_t write_len,
 		   const bufferlist& bl);
+    /**
+     * Write len bytes that the primary OSD pulls out of the client
+     * memory window the opaque token names, at the token's base plus
+     * base_offset, instead of bytes carried in the operation, as an
+     * OSD-direct PUT does. The primary RDMA-reads them before it runs
+     * the write, then writes them as it would the operation's own data:
+     * it encodes an erasure-coded write and sends each shard to its OSD,
+     * or sends a replicated write to the replicas. The window must stay
+     * valid, and unchanged, until the operation completes.
+     *
+     * Not advisory: the operation has no other data. An OSD that cannot
+     * pull fails the operation, and nothing is written: -EOPNOTSUPP when
+     * it has no way to read the window, -EIO when the read failed, and
+     * -EINVAL from an OSD that predates pulls. RDMA_DELIVERY_WANT_CRC64
+     * in flags asks for the CRC-64/NVME of the pulled bytes in *result,
+     * valid when result->flags has RDMA_DELIVERY_CRC64_VALID.
+     */
+    void write_full_pulled(uint64_t len, const std::string& token,
+			   uint64_t base_offset, uint32_t flags,
+			   rdma_delivery_result *result);
+    /// as write_full_pulled(), for len bytes at off
+    void write_pulled(uint64_t off, uint64_t len, const std::string& token,
+		      uint64_t base_offset, uint32_t flags,
+		      rdma_delivery_result *result);
     void append(const bufferlist& bl);
     void remove();
     void truncate(uint64_t off);
@@ -602,6 +681,49 @@ inline namespace v14_2_0 {
     void getxattr(const char *name, bufferlist *pbl, int *prval);
     void getxattrs(std::map<std::string, bufferlist> *pattrs, int *prval);
     void read(size_t off, uint64_t len, bufferlist *pbl, int *prval);
+    /**
+     * Request out-of-band delivery of the most recently added read's
+     * data (call it right after read() or sparse_read(); each read in
+     * a compound operation may carry its own request and result): an
+     * OSD that can honor it RDMA-writes the data into the client
+     * memory window identified by the opaque RDMA descriptor token,
+     * at the token's base address plus base_offset, and reports only
+     * byte counts through *result. The request is advisory - an OSD
+     * that cannot or will not push (no RDMA support, expired lease,
+     * retransmitted op) returns the data inline as usual with
+     * result->bytes = 0, so degradation is always plain in-band data.
+     * An OSD will not initiate a transfer against the descriptor
+     * later than the pool's rdma_delivery_lease after receiving the
+     * op, and every write it started has landed or been cut off by
+     * the pool's rdma_delivery_drain after that. On this path it also
+     * means a caller that abandoned a request may reuse the window
+     * once lease plus drain have elapsed (see
+     * IoCtx::pool_rdma_delivery_lease() and
+     * IoCtx::pool_rdma_delivery_drain()), because nothing else will
+     * write it. Passing
+     * RDMA_DELIVERY_WANT_CRC64 in flags asks the OSD to also report
+     * the canonical CRC-64/NVME of the delivered bytes; it is valid
+     * only when result->flags has RDMA_DELIVERY_CRC64_VALID set (best
+     * effort - older OSDs omit it). A caller folding several results
+     * into the checksum of a larger range must additionally check
+     * RDMA_DELIVERY_CRC64_COMBINABLE on each: a result whose bytes
+     * are not one contiguous logical extent carries a valid checksum
+     * of what that OSD moved, but one that cannot be concatenated
+     * with its neighbours. Such a result instead carries one entry
+     * per contiguous range it placed when RDMA_DELIVERY_CRC64_RANGES
+     * is set; a caller holding every range of a window can fold them
+     * in offset order regardless of how the OSDs interleaved them.
+     *
+     * A caller that falls back to another path after a read was not
+     * delivered must not let anything else write the window until no
+     * write of the read can land any more. It need not wait when every
+     * descriptor-bearing read it sent reported RDMA_DELIVERY_DECLINED or
+     * RDMA_DELIVERY_LANDED and none reported RDMA_DELIVERY_RESENT;
+     * otherwise, and for a read that got no result at all, it waits the
+     * pool's lease plus drain.
+     */
+    void set_rdma_delivery(const std::string& token, uint64_t base_offset,
+			   uint32_t flags, rdma_delivery_result *result);
     void checksum(rados_checksum_type_t type, const bufferlist &init_value_bl,
 		  uint64_t off, size_t len, size_t chunk_size, bufferlist *pbl,
 		  int *prval);
@@ -897,6 +1019,24 @@ inline namespace v14_2_0 {
     int pool_requires_alignment2(bool * req);
     uint64_t pool_required_alignment();
     int pool_required_alignment2(uint64_t * alignment);
+    /**
+     * The pool's rdma_delivery_lease in seconds: how long after
+     * receiving an operation that carries an out-of-band delivery
+     * descriptor (ObjectReadOperation::set_rdma_delivery()) an OSD
+     * may still initiate a transfer against it. Reflects the pool
+     * option or its built-in default, from the OSDMap this client
+     * holds. It bounds when an OSD may start, not how long a caller
+     * must keep a window registered.
+     */
+    int pool_rdma_delivery_lease(double *seconds);
+    /**
+     * The pool's rdma_delivery_drain in seconds: how long after the
+     * delivery lease runs out every out-of-band write an OSD started
+     * for an operation has landed or been cut off. A caller that gave
+     * up on a request may write its window again once lease plus drain
+     * have elapsed since it sent the request.
+     */
+    int pool_rdma_delivery_drain(double *seconds);
 
     // create an object
     int create(const std::string& oid, bool exclusive);

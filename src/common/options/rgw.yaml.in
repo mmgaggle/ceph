@@ -4507,54 +4507,88 @@ options:
   - startup
   with_legacy: true
 # cuObject RDMA server options
-- name: rgw_cuobj_enabled
+- name: rgw_rdma_checksum
   type: bool
   level: advanced
-  desc: Enable cuObject S3 RDMA server support for PUT/GET operations
-  default: false
+  desc: Compute checksums of out-of-band transfers
+  long_desc: For OSD passthrough, the gateway asks the OSDs for the CRC-64/NVME
+    or the CRC-32C of each stripe they deliver, as the client asks with
+    x-amz-rdma-checksum-algorithm, and for the type of the object's stored
+    full-object checksum. It combines the values, reports them in
+    x-amz-rdma-checksum-crc64nvme or x-amz-rdma-checksum-crc32c, which lets
+    the client test its own buffer, and compares whole-object GETs with the
+    stored checksum before it responds. For hipobj-rc-v2 sessions, the READY
+    answer reports the same headers. An OSD-direct PUT always asks the OSDs
+    for checksums, whatever this option says.
+  default: true
+  services:
+  - rgw
+- name: rgw_rdma_osd_direct
+  type: bool
+  level: advanced
+  desc: Have the OSDs move object data straight to and from client memory
+  long_desc: For a token of a transport in oob_client_transports, the
+    gateway forwards the token to the OSDs in a delivery descriptor on each
+    stripe operation. The OSDs write the data of a GET into the client's
+    window, and into the relay buffers of hipobj-rc-v2 sessions when
+    oob_cluster_transport is set. They pull the object of a body-less PUT
+    out of client memory. The object bypasses the gateway. A stripe that an
+    OSD returns inline restarts a GET in gateway-staged mode or over plain
+    HTTP, and a PUT that the OSDs cannot pull is declined with 501. Only
+    plain objects qualify; compressed or encrypted objects always take the
+    fallback.
+  default: true
+  services:
+  - rgw
+  see_also:
+  - oob_client_transports
+  - oob_cluster_transport
+- name: rgw_rdma_rc_max_sessions
+  type: uint
+  level: advanced
+  desc: Maximum concurrent hipobj-rc-v2 sessions
+  default: 1024
   services:
   - rgw
   flags:
   - startup
-- name: rgw_cuobj_rdma_ip
-  type: str
+- name: rgw_rdma_rc_max_sessions_per_user
+  type: uint
   level: advanced
-  desc: IP address of the RDMA-capable network interface
-  default:
+  desc: Maximum concurrent hipobj-rc-v2 sessions per authenticated user
+  default: 64
   services:
   - rgw
   flags:
   - startup
-- name: rgw_cuobj_rdma_port
+- name: rgw_rdma_rc_send_depth
   type: uint
   level: advanced
-  desc: Port for cuObject RDMA connections
-  default: 20886
+  desc: Send queue depth of each session's queue pair; bounds how many stripe
+    writes a GET relay may have in flight toward the client
+  default: 64
   services:
   - rgw
   flags:
   - startup
-- name: rgw_cuobj_buffer_size
-  type: size
-  level: advanced
-  desc: Size of each pre-registered RDMA buffer
-  default: 8_M
-  services:
-  - rgw
-- name: rgw_cuobj_buffer_count
+- name: rgw_rdma_rc_prepare_timeout_ms
   type: uint
   level: advanced
-  desc: Number of pre-registered RDMA buffers in the pool
-  default: 128
+  desc: Milliseconds a prepared session waits for READY before it is reaped
+  default: 100000
   services:
   - rgw
-- name: rgw_cuobj_num_dcis
+  flags:
+  - startup
+- name: rgw_rdma_rc_exec_timeout_ms
   type: uint
   level: advanced
-  desc: Number of Dynamic Connection Interfaces for RDMA
-  default: 128
+  desc: Milliseconds a READY transfer may take, including the object read
+  default: 30000
   services:
   - rgw
+  flags:
+  - startup
 - name: rgw_topic_persistency_time_to_live
   type: uint
   level: advanced

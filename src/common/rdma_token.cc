@@ -1,0 +1,242 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 smarttab
+
+#include "common/rdma_token.h"
+#include "common/crc64nvme.h"
+#include "include/crc32c.h"
+
+#include <algorithm>
+#include <cctype>
+#include <charconv>
+
+namespace ceph::rdma {
+
+namespace {
+
+std::optional<uint64_t> parse_hex_field(std::string_view field)
+{
+  if (field.empty() || field.size() > 16) {
+    return std::nullopt;
+  }
+  uint64_t v = 0;
+  auto [ptr, ec] = std::from_chars(field.begin(), field.end(), v, 16);
+  if (ec != std::errc() || ptr != field.end()) {
+    return std::nullopt;
+  }
+  return v;
+}
+
+} // anonymous namespace
+
+std::optional<token_window> parse_rdma_token(std::string_view token)
+{
+  if (token.empty() || token.size() > RDMA_TOKEN_MAX_LEN) {
+    return std::nullopt;
+  }
+  const auto first = token.find(':');
+  if (first == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto second = token.find(':', first + 1);
+  if (second == std::string_view::npos) {
+    return std::nullopt;
+  }
+  auto addr = parse_hex_field(token.substr(0, first));
+  auto size = parse_hex_field(token.substr(first + 1, second - first - 1));
+  if (!addr || !size) {
+    return std::nullopt;
+  }
+  return token_window{*addr, *size};
+}
+
+bool is_ofi_token(std::string_view token)
+{
+  const auto first = token.find(':');
+  if (first == std::string_view::npos) {
+    return false;
+  }
+  const auto second = token.find(':', first + 1);
+  if (second == std::string_view::npos) {
+    return false;
+  }
+  // the third field runs to the next colon, or to the end: "ofi" and a
+  // version, which no cuObject memory key can be, since 'o' is not hex
+  auto tag = token.substr(second + 1);
+  tag = tag.substr(0, tag.find(':'));
+  if (tag.size() < 4 || tag.substr(0, 3) != "ofi") {
+    return false;
+  }
+  return std::all_of(tag.begin() + 3, tag.end(), [](char c) {
+    return c >= '0' && c <= '9';
+  });
+}
+
+bool is_cuobj_descriptor(std::string_view token)
+{
+  return !is_ofi_token(token) && parse_rdma_token(token).has_value();
+}
+
+namespace {
+
+/// fold the values that get() picks out of ranges sorted by ofs, with
+/// combine(crc_a, crc_b, len_b); nullopt for a gap, an overlap or none
+template <typename T, typename Get, typename Combine>
+std::optional<T> fold_ranges(std::vector<crc_range_t> ranges, Get get,
+			     Combine combine)
+{
+  if (ranges.empty()) {
+    return std::nullopt;
+  }
+  std::sort(ranges.begin(), ranges.end(),
+	    [](const crc_range_t& a, const crc_range_t& b) {
+	      return a.ofs < b.ofs;
+	    });
+  T crc = get(ranges.front());
+  uint64_t next = ranges.front().ofs + ranges.front().len;
+  for (size_t i = 1; i < ranges.size(); ++i) {
+    const auto& r = ranges[i];
+    if (r.ofs != next) {
+      return std::nullopt;  // gap or overlap
+    }
+    crc = combine(crc, get(r), r.len);
+    next += r.len;
+  }
+  return crc;
+}
+
+} // anonymous namespace
+
+std::optional<uint64_t> fold_crc64_ranges(std::vector<crc_range_t> ranges)
+{
+  return fold_ranges<uint64_t>(
+    std::move(ranges), [](const crc_range_t& r) { return r.crc64; },
+    [](uint64_t a, uint64_t b, uint64_t len) {
+      return crc64nvme_combine(a, b, len);
+    });
+}
+
+std::optional<uint32_t> fold_crc32c_ranges(std::vector<crc_range_t> ranges)
+{
+  return fold_ranges<uint32_t>(
+    std::move(ranges), [](const crc_range_t& r) { return r.crc32c; },
+    crc32c_combine);
+}
+
+uint32_t crc32c_canonical(const ceph::buffer::list& bl)
+{
+  // ceph_crc32c() leaves out the final inversion: S3 has both
+  return bl.crc32c(0xffffffff) ^ 0xffffffff;
+}
+
+uint32_t crc32c_combine(uint32_t crc_a, uint32_t crc_b, uint64_t len_b)
+{
+  // The register update is linear in the register and the data, so
+  // with canonical values (init and xorout all ones) the inversions
+  // cancel: crc(A B) = crc(B) ^ raw(crc(A), len_b zero bytes).
+  // ceph_crc32c_zeros() runs over the zeros in O(log n).
+  uint32_t shifted = crc_a;
+  while (len_b > 0) {
+    const unsigned n = static_cast<unsigned>(
+      std::min<uint64_t>(len_b, 1u << 30));
+    shifted = ceph_crc32c_zeros(shifted, n);
+    len_b -= n;
+  }
+  return crc_b ^ shifted;
+}
+
+std::string libfabric_name(std::string_view name)
+{
+  // every libfabric utility provider's name starts with ofi_, and no
+  // core provider's name holds _ofi_
+  std::string n{name};
+  if (const auto pos = n.find("_ofi_"); pos != std::string::npos && pos > 0) {
+    n[pos] = ';';
+  }
+  // verbs reaches RDM endpoints only through ofi_rxm, which libfabric
+  // layers on it by itself; name it, so that the choice is not
+  // libfabric's
+  if (n == "verbs") {
+    n = "verbs;ofi_rxm";
+  }
+  return n;
+}
+
+std::vector<std::string> parse_transport_list(std::string_view list)
+{
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos <= list.size()) {
+    const size_t end = list.find_first_of(", \t", pos);
+    auto name = list.substr(pos, end == std::string_view::npos ?
+			    std::string_view::npos : end - pos);
+    if (!name.empty()) {
+      std::string n{name};
+      std::transform(n.begin(), n.end(), n.begin(),
+		     [](unsigned char c) { return std::tolower(c); });
+      n = libfabric_name(n);
+      if (std::find(out.begin(), out.end(), n) == out.end()) {
+	out.push_back(std::move(n));
+      }
+    }
+    if (end == std::string_view::npos) {
+      break;
+    }
+    pos = end + 1;
+  }
+  return out;
+}
+
+bool is_libfabric_provider(std::string_view name)
+{
+  return !name.empty() && name != TRANSPORT_CUOBJ && name != TRANSPORT_RC;
+}
+
+bool oob_transports::client_names(std::string_view t) const
+{
+  return std::find(client.begin(), client.end(), t) != client.end();
+}
+
+bool oob_transports::client_ofi() const
+{
+  return std::any_of(client.begin(), client.end(),
+		     [](const std::string& t) {
+		       return is_libfabric_provider(t);
+		     });
+}
+
+oob_transports parse_oob_transports(std::string_view client,
+				    std::string_view cluster)
+{
+  oob_transports t;
+  t.client = parse_transport_list(client);
+  const auto c = parse_transport_list(cluster);
+  if (!c.empty()) {
+    t.cluster = c.front();
+    if (c.size() > 1) {
+      t.warnings.push_back("oob_cluster_transport names one transport; "
+			   "using " + t.cluster);
+    }
+    if (t.cluster == TRANSPORT_RC) {
+      t.warnings.push_back("rc is a client transport only; "
+			   "oob_cluster_transport ignores it");
+      t.cluster.clear();
+    }
+  }
+  if (t.cluster_ofi()) {
+    t.ofi_provider = t.cluster;
+  }
+  for (const auto& n : t.client) {
+    if (!is_libfabric_provider(n) || n == t.ofi_provider) {
+      continue;
+    }
+    if (t.ofi_provider.empty()) {
+      t.ofi_provider = n;
+    } else {
+      t.warnings.push_back("one libfabric endpoint, for " + t.ofi_provider +
+			   "; " + n + " is not served");
+    }
+  }
+  return t;
+}
+
+} // namespace ceph::rdma

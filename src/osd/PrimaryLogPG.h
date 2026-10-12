@@ -1316,6 +1316,34 @@ protected:
   int prepare_transaction(OpContext *ctx);
   std::list<std::pair<OpRequestRef, OpContext*> > in_progress_async_reads;
   void complete_read_ctx(int result, OpContext *ctx);
+#ifdef HAVE_OSD_OOB_DELIVERY
+  /**
+   * Try to deliver the read reply's data out of band per the MOSDOp's
+   * per-op rdma delivery descriptors: for each op carrying one,
+   * builds an op-aware placement plan (linear, sparse-extent or
+   * EC-direct interleave) and executes it through the cuObject
+   * service. On success strips that op's outdata from rops and
+   * records the pushed byte count in oob[i]; on any refusal or
+   * failure leaves the op untouched so the reply carries its data
+   * inline. Returns true iff anything was pushed.
+   */
+  bool deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
+		   std::vector<ceph::rdma::oob_result_t>& oob);
+  /// deliver_oob for one op; *started when a transfer was started for it
+  bool deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
+		      const ceph::rdma::delivery_t& d,
+		      ceph::rdma::oob_result_t& res, bool* started);
+  /**
+   * Take the payload of each write that carries a pull descriptor
+   * (delivery_t::FLAG_PULL) out of the client's window, into the op's
+   * indata, before the request runs. The write then runs as if the
+   * client had sent the bytes: an erasure-coded one is encoded, and its
+   * shards go to their OSDs. Records what was pulled in the request
+   * (OpRequest::oob_pulled), for the reply. Returns 0, or a negative
+   * errno that fails the whole request, with nothing written.
+   */
+  int pull_oob_payloads(OpContext *ctx);
+#endif
 
   // pg on-disk content
   void check_local() override;
@@ -1979,6 +2007,10 @@ public:
   bool check_failsafe_full() override;
   bool maybe_preempt_replica_scrub(const hobject_t& oid) override;
   struct ECListener *get_eclistener() override;
+#ifdef HAVE_OSD_OOB_DELIVERY
+  OSDOobExecutor* oob_executor_for(const std::string& token) override;
+  OSDOobExecutor* oob_gather_executor() override;
+#endif
   const pg_missing_const_i * maybe_get_shard_missing(
     pg_shard_t peer) const {
     if (peer == primary_shard()) {

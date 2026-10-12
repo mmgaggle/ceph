@@ -23,6 +23,8 @@
 #include "os/ObjectStore.h"
 #include "boost/tuple/tuple.hpp"
 
+#include <optional>
+
 struct ECSubWrite {
   pg_shard_t from;
   ceph_tid_t tid;
@@ -119,6 +121,15 @@ struct ECSubRead {
   std::map<hobject_t, std::vector<std::pair<int, int>>> subchunks;
   std::set<hobject_t> omap_headers_to_read;
   std::map<hobject_t, std::pair<std::string, uint64_t>> omap_read_from;
+  /// out-of-band delivery token for a gather: push the data read into
+  /// the primary's window it names (in to_read order, back to back)
+  /// instead of returning it; empty for an ordinary sub-read. Advisory:
+  /// a shard that cannot push returns the data inline. A shard writes
+  /// into the window only bytes it also returns, listed in the reply's
+  /// pushed or carried inline in buffers_read: a reply with neither
+  /// wrote nothing, and the primary returns its window clean, as it does
+  /// for a reply whose push_declined says so.
+  std::string push_token;
   /**
     * Calculate the cost of the SubOp read operation for mClock scheduler.
     *
@@ -143,6 +154,19 @@ struct ECSubReadReply {
   std::map<hobject_t, ceph::buffer::list> omap_headers_read;
   std::map<hobject_t, std::map<std::string, ceph::buffer::list>> omap_entries_read;
   std::map<hobject_t, bool> omaps_complete;
+  /// extents (offset, length) whose data was pushed into the primary's
+  /// window rather than carried in buffers_read, in the order they sit
+  /// there back to back
+  std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
+  /// crc32c (seeded with -1) of the data pushed, as the shard read it;
+  /// the primary takes the window's content only if it matches. Unset
+  /// from a shard that pushed nothing, or predates it.
+  std::optional<uint32_t> pushed_crc;
+  /// the shard held a push token and handed no write for the window to
+  /// its transport: it returns its data inline, and nothing of it can
+  /// land in the window later. False from a shard that may have written,
+  /// or predates it.
+  bool push_declined = false;
   void encode(ceph::buffer::list &bl) const;
   void encode(ceph::buffer::list &p_bl,
 	      ceph::buffer::list &d_pl,

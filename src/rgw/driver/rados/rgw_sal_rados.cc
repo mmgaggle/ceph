@@ -3831,7 +3831,16 @@ int RadosObject::copy_object(const ACLOwner& owner,
 
 int RadosObject::RadosReadOp::iterate(const DoutPrefixProvider* dpp, int64_t ofs, int64_t end, RGWGetDataCB* cb, optional_yield y)
 {
-  return parent_op.iterate(dpp, ofs, end, cb, y);
+  parent_op.params.rdma_token = params.rdma_token;
+  parent_op.params.rdma_bytes = params.rdma_bytes;
+  parent_op.params.rdma_crc64 = params.rdma_crc64;
+  parent_op.params.rdma_crc32c = params.rdma_crc32c;
+  int r = parent_op.iterate(dpp, ofs, end, cb, y);
+  params.rdma_submitted = parent_op.params.rdma_submitted;
+  params.rdma_fence = parent_op.params.rdma_fence;
+  params.rdma_fence_needed = parent_op.params.rdma_fence_needed;
+  params.rdma_resent = parent_op.params.rdma_resent;
+  return r;
 }
 
 int RadosObject::swift_versioning_restore(const ACLOwner& owner, const rgw_user& remote_user, bool& restored,
@@ -5218,6 +5227,19 @@ int RadosAtomicWriter::prepare(optional_yield y)
 int RadosAtomicWriter::process(bufferlist&& data, uint64_t offset)
 {
   return processor.process(std::move(data), offset);
+}
+
+bool RadosAtomicWriter::set_pulled()
+{
+  processor.set_pulled();
+  return true;
+}
+
+int RadosAtomicWriter::process_pulled(uint64_t len, const std::string& token,
+                                      uint32_t want,
+                                      std::vector<PulledStripe>* stripes)
+{
+  return processor.process_pulled(len, token, want, stripes);
 }
 
 int RadosAtomicWriter::complete(size_t accounted_size, const std::string& etag,

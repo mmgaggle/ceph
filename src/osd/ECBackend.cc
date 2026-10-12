@@ -14,6 +14,8 @@
  */
 
 #include "ECBackend.h"
+#include "osd/ec_gather.h"
+#include "osd/oob_placement.h"
 
 #include <iostream>
 
@@ -281,7 +283,8 @@ bool ECBackend::_handle_message(
     reply->pgid = get_parent()->primary_spg_t();
     reply->map_epoch = switcher->get_osdmap_epoch();
     reply->min_epoch = get_parent()->get_interval_start_epoch();
-    handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace);
+    handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace,
+		    _op->get_req()->get_recv_stamp());
     reply->trace = _op->pg_trace;
     reply->pgid.reset_shard(op->op.from.shard);
     get_parent()->send_message_osd_cluster(
@@ -518,7 +521,8 @@ void ECBackend::handle_sub_read(
   pg_shard_t from,
   const ECSubRead &op,
   ECSubReadReply *reply,
-  const ZTracer::Trace &trace) {
+  const ZTracer::Trace &trace,
+  utime_t received) {
   trace.event("handle sub read");
   shard_id_t shard = get_parent()->whoami_shard().shard;
   for (auto &&[hoid, to_read]: op.to_read) {
@@ -640,6 +644,11 @@ void ECBackend::handle_sub_read(
       lgeneric_derr(cct) << __func__ << ": failed to decode OI for " << *i
               << ": " << e.what() << dendl;
       get_parent()->clog_warn() << "corrupt object info attribute for " << *i;
+      // as for every other error here, nothing of the object goes back
+      // with it: the primary asserts an errored object brought no data
+      reply->attrs_read.erase(*i);
+      reply->buffers_read.erase(*i);
+      reply->omaps_complete.erase(*i);
       reply->errors[*i] = -EIO;
       continue;
     }
@@ -734,6 +743,77 @@ void ECBackend::handle_sub_read(
 
   reply->from = get_parent()->whoami_shard();
   reply->tid = op.tid;
+
+  // the push stays last: the primary returns its window clean when the
+  // reply carries no bytes, so nothing may drop read bytes after a push
+  // was attempted, and a failed push leaves buffers_read as it was
+  if (!op.push_token.empty()) {
+    push_sub_read(op, reply,
+		  received.is_zero() ? ceph_clock_now() : received);
+  }
+}
+
+void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
+			      utime_t received)
+{
+  // the primary lent us a window: place everything read there, back to
+  // back in reply order, and return only the extents. Any refusal or
+  // failure leaves the reply as it is, with the data inline, and says
+  // whether anything went into the window: when nothing did, the
+  // primary can lend it again at once.
+  reply->push_declined = true;
+  OSDOobExecutor* exec =
+    get_parent()->get_eclistener()->oob_executor_for(op.push_token);
+  if (!exec || reply->buffers_read.empty()) {
+    return;
+  }
+  bufferlist all;
+  std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
+  for (auto &&[hoid, extents] : reply->buffers_read) {
+    for (auto &&[offset, bl] : extents) {
+      pushed[hoid].emplace_back(offset, bl.length());
+      all.append(bl);
+    }
+  }
+  if (all.length() == 0) {
+    return;
+  }
+  // the same bounds as client delivery: start within the pool's lease
+  // of receipt, land (or be cut off) within lease plus drain. The
+  // primary keeps an unused window out of use for that long.
+  const auto& pool = get_parent()->get_pool();
+  const double age = ceph_clock_now() - received;
+  if (age > pool.get_rdma_delivery_lease()) {
+    dout(10) << __func__ << ": lease expired (" << age << "s), replying inline"
+	     << dendl;
+    return;
+  }
+  const double bound = pool.get_rdma_delivery_lease() +
+    pool.get_rdma_delivery_drain() - age;
+  auto plan = ceph::osd::oob::linear_plan(0, all.length());
+  // from here only the executor's word returns the window clean: until
+  // it says it started nothing, a write may have gone out
+  reply->push_declined = false;
+  // an executor that cannot say counts as having started
+  bool started = true;
+  ssize_t r = exec->execute_plan(
+    "ec gather", op.push_token, all, plan,
+    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)),
+    &started);
+  reply->push_declined = !started;
+  if (r != static_cast<ssize_t>(all.length())) {
+    dout(10) << __func__ << ": push to the primary failed (" << r
+	     << (started ? "" : ", nothing sent") << "), replying inline"
+	     << dendl;
+    return;
+  }
+  dout(20) << __func__ << ": pushed " << all.length()
+	   << " bytes to the primary" << dendl;
+  reply->pushed = std::move(pushed);
+  // what the primary finds in its window has to match this before it
+  // passes for our data
+  reply->pushed_crc = all.crc32c(-1);
+  reply->buffers_read.clear();
 }
 
 void ECBackend::handle_sub_read_n_reply(
@@ -791,6 +871,68 @@ void ECBackend::handle_sub_read_reply(
     return;
   }
   ReadOp &rop = iter->second;
+  if (const auto* w = rop.gather.find(from); w) {
+    if (op.pushed.empty()) {
+      // the shard replied inline: a push it attempted may still land.
+      // One that read no bytes - every object failed, a media error
+      // say - attempted none (push_sub_read pushes only what it read),
+      // so its window goes back clean. Quarantining it would let one
+      // object a shard cannot read, read over and over, take every
+      // window this OSD can lend. The window of a shard whose reply
+      // says that its executor refused the push before sending
+      // anything - its endpoint busy adding a client, say - goes back
+      // clean too: quarantining it would keep every window a busy shard
+      // was lent out of use.
+      uint64_t read = 0;
+      for (auto &&[hoid, extents] : op.buffers_read) {
+	for (auto &&[offset, bl] : extents) {
+	  read += bl.length();
+	}
+      }
+      rop.gather.release(from, read == 0 || op.push_declined);
+    } else {
+      // the shard placed its data in our window: rebuild the buffers the
+      // reply would have carried, in the order it placed them, and check
+      // them against the shard's checksum of what it placed
+      rop.gather.exec->window_sync();
+      const auto t = ceph::osd::oob::take_pushed(
+	w->ptr, w->size, op.pushed, op.pushed_crc, op.buffers_read);
+      dout(20) << __func__ << ": " << t.bytes << " bytes from shard "
+	       << from << " arrived out of band" << dendl;
+      if (t.mismatch) {
+	// whatever is in the window, it is not what the shard placed: a
+	// push that completed short, or a write that landed after it.
+	// Read the object from the other shards instead.
+	dout(0) << __func__ << ": the " << t.bytes << " bytes shard " << from
+		<< " pushed into gather window " << w->id << " (" << w->token
+		<< ") do not match its checksum: crc32c 0x" << std::hex
+		<< t.crc << " != 0x" << *op.pushed_crc << std::dec
+		<< "; reading from the other shards" << dendl;
+	rop.gather.exec->note_gather_crc_mismatch();
+      } else if (t.overrun) {
+	dout(0) << __func__ << ": shard " << from << " pushed more than "
+		<< "gather window " << w->id << " holds ("
+		<< w->size << " bytes); reading from the other shards"
+		<< dendl;
+      }
+      // a window holding anything but the push may still take writes:
+      // it goes back quarantined, and the reads that rebuild what this
+      // shard's push should have brought come back inline
+      rop.gather.release(from, t.ok());
+      if (!t.ok()) {
+	rop.gather.inline_only = true;
+	for (auto &&[hoid, extents] : op.pushed) {
+	  op.buffers_read.erase(hoid);
+	  op.errors[hoid] = -EIO;
+	}
+      }
+    }
+  } else if (!op.pushed.empty()) {
+    // pushed data with no window of ours to find it in
+    for (auto &&[hoid, extents] : op.pushed) {
+      op.errors[hoid] = -EIO;
+    }
+  }
   if (cct->_conf->bluestore_debug_inject_read_err) {
     for (auto i = op.buffers_read.begin();
          i != op.buffers_read.end();

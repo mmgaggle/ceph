@@ -224,6 +224,47 @@ void librados::ObjectReadOperation::sparse_read(uint64_t off, uint64_t len,
   o->sparse_read(off, len, m, data_bl, prval, truncate_size, truncate_seq);
 }
 
+void librados::ObjectReadOperation::set_rdma_delivery(
+    const std::string& token, uint64_t base_offset, uint32_t flags,
+    rdma_delivery_result *result)
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  // the public flag values are the wire ones; the result itself is
+  // copied field by field when the reply is processed
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC64 ==
+		ceph::rdma::delivery_t::FLAG_CRC64NVME);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC32C ==
+		ceph::rdma::delivery_t::FLAG_CRC32C);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC32C_VALID ==
+		ceph::rdma::oob_result_t::FLAG_CRC32C);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_VALID ==
+		ceph::rdma::oob_result_t::FLAG_CRC64NVME);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_COMBINABLE ==
+		ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_RANGES ==
+		ceph::rdma::oob_result_t::FLAG_CRC64_RANGES);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_DECLINED ==
+		ceph::rdma::oob_result_t::FLAG_DECLINED);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_LANDED ==
+		ceph::rdma::oob_result_t::FLAG_LANDED);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_RESENT ==
+		ceph::rdma::oob_result_t::FLAG_RESENT);
+  o->set_rdma_delivery(token, base_offset, flags,
+		       [result](const ceph::rdma::oob_result_t& r) {
+			 result->bytes = r.bytes;
+			 result->crc64 = r.crc64;
+			 result->crc32c = r.crc32c;
+			 result->flags = r.flags;
+			 result->ranges.clear();
+			 result->ranges.reserve(r.ranges.size());
+			 for (const auto& x : r.ranges) {
+			   result->ranges.push_back(
+			     {x.ofs, x.len, x.crc64, x.crc32c});
+			 }
+		       });
+}
+
 void librados::ObjectReadOperation::checksum(rados_checksum_type_t type,
 					     const bufferlist &init_value_bl,
 					     uint64_t off, size_t len,
@@ -480,6 +521,55 @@ void librados::ObjectWriteOperation::write_full(const bufferlist& bl)
   ::ObjectOperation *o = &impl->o;
   bufferlist c = bl;
   o->write_full(c);
+}
+
+namespace {
+/// the wire result, as a librados caller sees it
+void copy_rdma_result(const ceph::rdma::oob_result_t& r,
+		      librados::ObjectOperation::rdma_delivery_result* out)
+{
+  out->bytes = r.bytes;
+  out->crc64 = r.crc64;
+  out->crc32c = r.crc32c;
+  out->flags = r.flags;
+  out->ranges.clear();
+  out->ranges.reserve(r.ranges.size());
+  for (const auto& x : r.ranges) {
+    out->ranges.push_back({x.ofs, x.len, x.crc64, x.crc32c});
+  }
+}
+} // anonymous namespace
+
+void librados::ObjectWriteOperation::write_full_pulled(
+    uint64_t len, const std::string& token, uint64_t base_offset,
+    uint32_t flags, rdma_delivery_result *result)
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  o->write_full_pulled(len);
+  o->set_rdma_delivery(token, base_offset,
+		       flags | ceph::rdma::delivery_t::FLAG_PULL,
+		       [result](const ceph::rdma::oob_result_t& r) {
+			 if (result) {
+			   copy_rdma_result(r, result);
+			 }
+		       });
+}
+
+void librados::ObjectWriteOperation::write_pulled(
+    uint64_t off, uint64_t len, const std::string& token,
+    uint64_t base_offset, uint32_t flags, rdma_delivery_result *result)
+{
+  ceph_assert(impl);
+  ::ObjectOperation *o = &impl->o;
+  o->write_pulled(off, len);
+  o->set_rdma_delivery(token, base_offset,
+		       flags | ceph::rdma::delivery_t::FLAG_PULL,
+		       [result](const ceph::rdma::oob_result_t& r) {
+			 if (result) {
+			   copy_rdma_result(r, result);
+			 }
+		       });
 }
 
 void librados::ObjectWriteOperation::writesame(uint64_t off, uint64_t write_len,
@@ -1225,6 +1315,16 @@ uint64_t librados::IoCtx::pool_required_alignment()
 int librados::IoCtx::pool_required_alignment2(uint64_t *alignment)
 {
   return io_ctx_impl->client->pool_required_alignment2(get_id(), alignment);
+}
+
+int librados::IoCtx::pool_rdma_delivery_lease(double *seconds)
+{
+  return io_ctx_impl->client->pool_rdma_delivery_lease(get_id(), seconds);
+}
+
+int librados::IoCtx::pool_rdma_delivery_drain(double *seconds)
+{
+  return io_ctx_impl->client->pool_rdma_delivery_drain(get_id(), seconds);
 }
 
 std::string librados::IoCtx::get_pool_name()

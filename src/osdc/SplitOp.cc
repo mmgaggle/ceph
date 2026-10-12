@@ -228,13 +228,15 @@ void ECSplitOp::init_read(OSDOp &op, bool sparse, int ops_index) {
     if (!sub_reads.contains(shard_index)) {
       sub_reads.emplace(shard_index, orig_op->ops.size() + 1);
     }
-    auto &d = sub_reads.at(shard_index).details[ops_index];
+    auto &sr = sub_reads.at(shard_index);
+    auto &d = sr.details[ops_index];
     if (sparse) {
       d.e.emplace();
-      sub_reads.at(shard_index).rd.sparse_read(offset, length, &(*d.e), &d.bl, &d.rval);
+      sr.rd.sparse_read(offset, length, &(*d.e), &d.bl, &d.rval);
     } else {
-      sub_reads.at(shard_index).rd.read(offset, length, &d.ec, &d.bl);
+      sr.rd.read(offset, length, &d.ec, &d.bl);
     }
+    sr.parent_ops.push_back(ops_index);
   }
 
   // If primary is required and we haven't created a sub_read for it yet, create one
@@ -379,6 +381,7 @@ void ReplicaSplitOp::init_read(OSDOp &op, bool sparse, int ops_index) {
     } else {
       sr.rd.read(offset, len, &sr.details[ops_index].ec, bl);
     }
+    sr.parent_ops.push_back(ops_index);
     offset += len;
     length -= len;
   }
@@ -532,7 +535,123 @@ void SplitOp::complete() {
   boost::system::error_code handler_error;
 
   int rc = assemble_rc();
+
+  // Aggregate out-of-band delivery per parent op. Mixed replies for
+  // one op (some sub-reads pushed, some returned inline) cannot be
+  // assembled into a coherent response: retry to the primary - as a
+  // resend, which it delivers inline, unless every sub-read settled
+  // (see below).
+  std::vector<uint64_t> oob_total(orig_op->ops.size(), 0);
   if (rc >= 0) {
+    for (unsigned i : oob_ops) {
+      bool any_inline = false;
+      for (auto& [index, sub_read] : sub_reads) {
+        for (unsigned j = 0; j < sub_read.parent_ops.size(); ++j) {
+          if (sub_read.parent_ops[j] == (int)i && j < sub_read.oob.size()) {
+            oob_total[i] += sub_read.oob[j].bytes;
+          }
+        }
+        if (sub_read.details.contains(i) &&
+            sub_read.details.at(i).bl.length()) {
+          any_inline = true;
+        }
+      }
+      if (oob_total[i] > 0 && any_inline) {
+        ldout(cct, DBG_LVL) << __func__ << " op " << i
+          << " mixed inline/oob sub-replies, retrying inline" << dendl;
+        rc = -EAGAIN;
+        break;
+      }
+    }
+  }
+
+  if (rc >= 0) {
+
+    // Each op's aggregate: bytes summed over its sub-reads, and every
+    // sub-read's crc ranges gathered. The sub-reads tile the op's
+    // logical range between them - replica sub-reads by disjoint
+    // extents, EC-direct ones by interleaved chunks - so when every
+    // pushing sub-read reported ranges, they fold into the crc64 and
+    // crc32c of the op as one contiguous extent, each when every
+    // sub-read reported it.
+    //
+    // The result goes to the caller in whichever form it asked for:
+    // librados takes the callback form, which a pointer-only copy here
+    // used to skip, so every split passthrough read reported nothing
+    // delivered.
+    for (unsigned i = 0; i < orig_op->rdma_oob_result.size(); ++i) {
+      if (!Objecter::rdma_oob_wanted(orig_op, i)) {
+        continue;
+      }
+      ceph::rdma::oob_result_t agg;
+      agg.bytes = i < oob_total.size() ? oob_total[i] : 0;
+      bool all_ranged = agg.bytes > 0;
+      bool all_crc64 = true, all_crc32c = true;
+      uint64_t ranged_bytes = 0;
+      for (auto& [index, sub_read] : sub_reads) {
+        for (unsigned j = 0; j < sub_read.parent_ops.size(); ++j) {
+          if (sub_read.parent_ops[j] != (int)i || j >= sub_read.oob.size()) {
+            continue;
+          }
+          const auto& r = sub_read.oob[j];
+          if (r.bytes == 0) {
+            continue;
+          }
+          if (!(r.flags & ceph::rdma::oob_result_t::FLAG_RANGES)) {
+            all_ranged = false;
+            continue;
+          }
+          all_crc64 = all_crc64 &&
+            (r.flags & ceph::rdma::oob_result_t::FLAG_CRC64NVME);
+          all_crc32c = all_crc32c &&
+            (r.flags & ceph::rdma::oob_result_t::FLAG_CRC32C);
+          for (const auto& range : r.ranges) {
+            ranged_bytes += range.len;
+          }
+          agg.ranges.insert(agg.ranges.end(), r.ranges.begin(),
+                            r.ranges.end());
+        }
+      }
+      // declined when every sub-read started no transfer, landed when
+      // every one placed all its bytes before replying, resent when any
+      // was resent
+      std::vector<uint32_t> part_flags;
+      for (auto& [index, sub_read] : sub_reads) {
+        for (unsigned j = 0; j < sub_read.parent_ops.size(); ++j) {
+          if (sub_read.parent_ops[j] == (int)i && j < sub_read.oob.size()) {
+            part_flags.push_back(sub_read.oob[j].flags);
+          }
+        }
+      }
+      agg.flags |= ceph::rdma::fold_transfer_flags(part_flags, agg.bytes);
+      if (all_ranged && ranged_bytes == agg.bytes &&
+          (all_crc64 || all_crc32c)) {
+        agg.flags |= ceph::rdma::oob_result_t::FLAG_RANGES;
+        std::optional<uint64_t> crc64;
+        std::optional<uint32_t> crc32c;
+        if (all_crc64) {
+          crc64 = ceph::rdma::fold_crc64_ranges(agg.ranges);
+        }
+        if (all_crc32c) {
+          crc32c = ceph::rdma::fold_crc32c_ranges(agg.ranges);
+        }
+        if (crc64) {
+          agg.crc64 = *crc64;
+          agg.flags |= ceph::rdma::oob_result_t::FLAG_CRC64NVME;
+        }
+        if (crc32c) {
+          agg.crc32c = *crc32c;
+          agg.flags |= ceph::rdma::oob_result_t::FLAG_CRC32C;
+        }
+        if (crc64 || crc32c) {
+          // the ranges tile the op without gaps: one contiguous extent
+          agg.flags |= ceph::rdma::oob_result_t::FLAG_COMBINABLE;
+        }
+      } else {
+        agg.ranges.clear();
+      }
+      Objecter::deliver_rdma_oob_result(orig_op, i, agg);
+    }
 
     // In a "normal" completion, out_ops is generated in the MOSDOpReply reply
     // which we do not have here. Here we are going to mimic this behaviour
@@ -611,6 +730,27 @@ void SplitOp::complete() {
     ldout(cct, DBG_LVL) << __func__ << " object_id=" << orig_op->target.base_oid << " success this=" << this << " rc=" << rc << dendl;
   } else {
     ldout(cct, DBG_LVL) << __func__ << " object_id=" << orig_op->target.base_oid << " retry this=" << this << " rc=" << rc << dendl;
+    if (rc == -EAGAIN && !oob_ops.empty()) {
+      // Every sub-read has replied by now. When each descriptor-bearing
+      // one was declined (a replica bounced it, a shard refused to push)
+      // or landed, no write of this split can land after this point, and
+      // the retry to the primary may deliver out of band as a first
+      // attempt instead of falling back behind the window's fence.
+      std::vector<uint32_t> parts;
+      for (unsigned i : oob_ops) {
+        for (auto& [index, sub_read] : sub_reads) {
+          for (unsigned j = 0; j < sub_read.parent_ops.size(); ++j) {
+            if (sub_read.parent_ops[j] == (int)i && j < sub_read.oob.size()) {
+              parts.push_back(sub_read.oob[j].flags);
+            }
+          }
+        }
+      }
+      orig_op->rdma_split_settled = ceph::rdma::attempt_settled(parts);
+      ldout(cct, DBG_LVL) << __func__ << " object_id=" << orig_op->target.base_oid
+        << " rdma sub-reads " << (orig_op->rdma_split_settled ? "settled" : "unsettled")
+        << dendl;
+    }
   }
   objecter.op_post_split_op_complete(orig_op, handler_error, rc);
 }
@@ -632,6 +772,7 @@ void SplitOp::protect_torn_reads() {
     auto &internal_version = sr.internal_version;
     internal_version = std::make_optional<InternalVersion>();
     sr.rd.get_internal_versions(&internal_version->ec, &internal_version->bl);
+    sr.parent_ops.push_back(-1);
   }
 }
 
@@ -651,8 +792,10 @@ void SplitOp::init(OSDOp &op, int ops_index) {
     if (!sub_reads.contains(reference_sub_read)) {
       sub_reads.emplace(reference_sub_read, orig_op->ops.size() + 1);
     }
-    Details &d = sub_reads.at(reference_sub_read).details[ops_index];
-    orig_op->pass_thru_op(sub_reads.at(reference_sub_read).rd, ops_index, &d.bl, &d.rval);
+    auto &sr = sub_reads.at(reference_sub_read);
+    Details &d = sr.details[ops_index];
+    orig_op->pass_thru_op(sr.rd, ops_index, &d.bl, &d.rval);
+    sr.parent_ops.push_back(ops_index);
     break;
   }
   }
@@ -1054,6 +1197,23 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
 
   split_read->protect_torn_reads();
 
+  // Fan out the per-op advisory rdma delivery descriptors. Only plain
+  // READ ops have well-defined per-sub placement: replica sub-reads
+  // cover disjoint logical ranges (window shifted to each sub-read's
+  // origin) while EC-direct sub-reads carry the original extent
+  // (shared origin; the shard OSD interleaves). A sparse read's
+  // descriptor is not fanned out (a follow-up) so its sub-replies
+  // arrive inline, which is always correct.
+  if (op->has_rdma_delivery()) {
+    ceph_assert(op->rdma_delivery.size() == op->ops.size());
+    for (unsigned i = 0; i < op->ops.size(); ++i) {
+      if (op->ops[i].op.op == CEPH_OSD_OP_READ &&
+          !op->rdma_delivery[i].empty()) {
+        split_read->oob_ops.push_back(i);
+      }
+    }
+  }
+
 
   op->split_op_tids = std::make_unique<std::vector<ceph_tid_t>>(split_read->sub_reads.size());
   auto &tids = *op->split_op_tids;
@@ -1073,6 +1233,29 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
     auto sub_op = objecter.prepare_read_op(
       target.base_oid, target.base_oloc, split_read->sub_reads.at(index).rd, op->snapid,
       nullptr, split_read->flags, -1, fin, objver);
+
+    if (!split_read->oob_ops.empty()) {
+      ceph_assert(sub_read.parent_ops.size() == sub_op->ops.size());
+      ceph_assert(sub_op->rdma_delivery.size() == sub_op->ops.size());
+      sub_read.oob.assign(sub_op->ops.size(), ceph::rdma::oob_result_t{});
+      for (unsigned j = 0; j < sub_op->ops.size(); ++j) {
+        const int parent = sub_read.parent_ops[j];
+        if (parent < 0 || sub_op->ops[j].op.op != CEPH_OSD_OP_READ ||
+            op->rdma_delivery[parent].empty()) {
+          continue;
+        }
+        auto d = op->rdma_delivery[parent];
+        // zero shift for EC-direct subs (they carry the parent extent)
+        d.base_offset += sub_op->ops[j].op.extent.offset -
+                         op->ops[parent].op.extent.offset;
+        // the crc request rides along unchanged: a shard OSD reports
+        // one range per chunk it placed, and the aggregate on
+        // completion folds every sub-read's ranges in window order,
+        // so interleaving across shards costs the caller nothing
+        sub_op->rdma_delivery[j] = std::move(d);
+        sub_op->rdma_oob_result[j] = &sub_read.oob[j];
+      }
+    }
 
     auto &st = sub_op->target;
     st = target; // Target can start off in same state as parent.

@@ -796,6 +796,19 @@ public:
         int* part_num = nullptr;
         std::optional<int> parts_count;
         RGWObjVersionTracker *objv_tracker = nullptr;
+        // OSD-direct RDMA passthrough; see rgw::sal::Object::ReadOp
+        std::string rdma_token;
+        uint64_t *rdma_bytes = nullptr;
+        std::optional<uint64_t> *rdma_crc64 = nullptr;
+        std::optional<uint32_t> *rdma_crc32c = nullptr;
+        bool rdma_submitted = false; // out: descriptor-bearing ops reached OSDs
+        double rdma_fence = 0; // out: longest delivery lease plus drain
+                               // (seconds) among the pools those ops
+                               // were sent to
+        bool rdma_fence_needed = true; // out: a fallback must wait out
+                                       // rdma_fence first; see
+                                       // rgw::rdma::fence_needed()
+        bool rdma_resent = false; // out: a descriptor-bearing op was resent
 
         Params() : lastmod(nullptr), obj_size(nullptr), attrs(nullptr),
 		   target_obj(nullptr), epoch(nullptr)
@@ -1780,7 +1793,29 @@ struct get_obj_data {
   D3nGetObjData d3n_get_data;
   std::atomic_bool d3n_bypass_cache_write{false};
 
+  // OSD-direct RDMA passthrough: each stripe read carries an advisory
+  // delivery descriptor; OSDs that can push write straight into client
+  // memory (per-stripe byte counts land in rdma_slots), and any inline
+  // reply is the signal to fall back
+  bool rdma = false;
+  std::string rdma_token;
+  uint64_t rdma_range_start = 0; // logical offset of the range start
+  uint32_t rdma_flags = 0;       // delivery request flags (e.g. want-crc64)
+  bool rdma_ops_sent = false;    // at least one descriptor-bearing op issued
+  // the lease and drain each OSD enforces are pool options; the fence
+  // the caller waits before reusing the client window must cover the
+  // longest lease plus drain among the pools descriptor-bearing ops
+  // were sent to
+  std::map<int64_t, double> rdma_fence_by_pool;
+  double rdma_fence = 0;
+  // per-stripe oob results, pushed in logical stripe order (stable addrs)
+  std::deque<librados::ObjectReadOperation::rdma_delivery_result> rdma_slots;
+  // slot index by the stripe's logical offset (the aio result id), so a
+  // completion can report where its bytes landed
+  std::map<uint64_t, size_t> rdma_slot_by_ofs;
+
   int flush(rgw::AioResultList&& results);
+  int flush_rdma(rgw::AioResultList&& results);
 
   void cancel() {
     // wait for all completions to drain and ignore the results

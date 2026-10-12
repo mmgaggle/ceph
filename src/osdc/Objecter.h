@@ -16,6 +16,7 @@
 #ifndef CEPH_OBJECTER_H
 #define CEPH_OBJECTER_H
 
+#include <algorithm>
 #include <list>
 #include <map>
 #include <mutex>
@@ -48,6 +49,7 @@
 
 #include "common/admin_socket.h"
 #include "common/ceph_time.h"
+#include "common/rdma_token.h"
 #include "common/ceph_mutex.h"
 #include "common/ceph_timer.h"
 #include "common/config_obs.h"
@@ -102,6 +104,28 @@ struct ObjectOperation {
   boost::container::small_vector<boost::system::error_code*,
 				 osdc_opvec_len> out_ec;
 
+  /// per-op advisory out-of-band delivery descriptors, carried on the
+  /// MOSDOp aligned with ops (see common/rdma_token.h; an empty token
+  /// means inline for that op): an OSD that can honor one RDMA-writes
+  /// that op's read data straight into the client window and returns
+  /// only a byte count (plus, on request, a CRC64-NVME of the
+  /// delivered bytes); any other OSD returns the data inline as usual
+  boost::container::small_vector<ceph::rdma::delivery_t, osdc_opvec_len>
+    rdma_delivery;
+  /// out: per-op out-of-band delivery result (bytes 0 = inline)
+  boost::container::small_vector<ceph::rdma::oob_result_t*, osdc_opvec_len>
+    rdma_oob_result;
+  /// results a caller takes through a callback rather than a pointer:
+  /// one handler per op, indexed like ops, that the Objecter invokes
+  /// from the reply's out-of-band copy (after the pointer form's copy,
+  /// before the op's completion) with the wire result, or an all-zero
+  /// one when the reply carries none for that op; allocated only when
+  /// that form is used so the common case pays one pointer (neorados
+  /// embeds this struct in fixed storage)
+  using rdma_oob_handler_t =
+    fu2::unique_function<void(const ceph::rdma::oob_result_t&) &&>;
+  std::unique_ptr<std::vector<rdma_oob_handler_t>> rdma_oob_handler;
+
   ObjectOperation() = default;
   ObjectOperation(const ObjectOperation&) = delete;
   ObjectOperation& operator =(const ObjectOperation&) = delete;
@@ -121,6 +145,35 @@ struct ObjectOperation {
     out_handler.clear();
     out_rval.clear();
     out_ec.clear();
+    rdma_delivery.clear();
+    rdma_oob_result.clear();
+    rdma_oob_handler.reset();
+  }
+
+  /// request out-of-band delivery for the most recently added op
+  void set_rdma_delivery(std::string_view token, uint64_t base_offset,
+			 uint32_t flags, ceph::rdma::oob_result_t* result) {
+    ceph_assert(!ops.empty());
+    ceph_assert(rdma_delivery.size() == ops.size());
+    rdma_delivery.back() = ceph::rdma::delivery_t{std::string(token),
+						  base_offset, flags};
+    rdma_oob_result.back() = result;
+  }
+  /// as above, but hand the result to on_result when the reply is
+  /// processed (see rdma_oob_handler), for callers whose result type
+  /// is not the wire one
+  void set_rdma_delivery(std::string_view token, uint64_t base_offset,
+			 uint32_t flags, rdma_oob_handler_t on_result) {
+    set_rdma_delivery(token, base_offset, flags, nullptr);
+    if (!rdma_oob_handler) {
+      rdma_oob_handler = std::make_unique<std::vector<rdma_oob_handler_t>>();
+    }
+    rdma_oob_handler->resize(ops.size());
+    rdma_oob_handler->back() = std::move(on_result);
+  }
+  bool has_rdma_delivery() const {
+    return std::any_of(rdma_delivery.begin(), rdma_delivery.end(),
+		       [](const auto& d) { return !d.empty(); });
   }
 
   void set_last_op_flags(int flags) {
@@ -177,6 +230,10 @@ struct ObjectOperation {
     ceph_assert(ops.size() == out_rval.size());
     out_ec.push_back(nullptr);
     ceph_assert(ops.size() == out_ec.size());
+    rdma_delivery.emplace_back();
+    ceph_assert(ops.size() == rdma_delivery.size());
+    rdma_oob_result.push_back(nullptr);
+    ceph_assert(ops.size() == rdma_oob_result.size());
     return ops.back();
   }
   void add_data(int op, uint64_t off, uint64_t len, ceph::buffer::list& bl) {
@@ -592,6 +649,19 @@ struct ObjectOperation {
   }
   void write_full(ceph::buffer::list&& bl) {
     add_data(CEPH_OSD_OP_WRITEFULL, 0, bl.length(), bl);
+  }
+  /// a write of len bytes that the primary pulls out of a client window
+  /// rather than takes from the op: follow it with set_rdma_delivery()
+  /// and delivery_t::FLAG_PULL (see common/rdma_token.h)
+  void write_pulled(uint64_t off, uint64_t len) {
+    OSDOp& o = add_op(CEPH_OSD_OP_WRITE);
+    o.op.extent.offset = off;
+    o.op.extent.length = len;
+  }
+  void write_full_pulled(uint64_t len) {
+    OSDOp& o = add_op(CEPH_OSD_OP_WRITEFULL);
+    o.op.extent.offset = 0;
+    o.op.extent.length = len;
   }
   void writesame(uint64_t off, uint64_t write_len, ceph::buffer::list& bl) {
     add_writesame(CEPH_OSD_OP_WRITESAME, off, write_len, bl);
@@ -2058,6 +2128,35 @@ public:
 
     int *data_offset;
 
+    /// per-op advisory out-of-band delivery (aligned with ops; empty
+    /// token = inline); re-stamped onto every MOSDOp this Op sends
+    /// (resends included, where the OSD-side retry refusal keeps the
+    /// descriptors inert unless every earlier attempt is settled)
+    boost::container::small_vector<ceph::rdma::delivery_t, osdc_opvec_len>
+      rdma_delivery;
+    /// the attempt last sent with descriptors has had no settled reply
+    /// (every descriptor-bearing op declined or landed) yet
+    bool rdma_attempt_unsettled = false;
+    /// some superseded attempt never had a settled reply, so a write of
+    /// it may still land: every later attempt stays a plain resend
+    bool rdma_history_unsettled = false;
+    /// the attempt in flight is a resend whose earlier attempts were all
+    /// settled; its results are not marked resent
+    bool rdma_retry_settled = false;
+    /// set by a split read that ends in EAGAIN: every sub-read was
+    /// answered declined or landed, so the retry is a first attempt
+    bool rdma_split_settled = false;
+    boost::container::small_vector<ceph::rdma::oob_result_t*, osdc_opvec_len>
+      rdma_oob_result;
+    /// callback-form results, taken over from the ObjectOperation at
+    /// submission so they outlive it (see ObjectOperation::rdma_oob_handler)
+    std::unique_ptr<std::vector<::ObjectOperation::rdma_oob_handler_t>>
+      rdma_oob_handler;
+    bool has_rdma_delivery() const {
+      return std::any_of(rdma_delivery.begin(), rdma_delivery.end(),
+			 [](const auto& d) { return !d.empty(); });
+    }
+
     osd_reqid_t reqid; // explicitly setting reqid
     ZTracer::Trace trace;
     std::uint64_t subsystem = 0;
@@ -2102,7 +2201,10 @@ public:
       out_ec(ops.size(), nullptr),
       onfinish(std::move(fin)),
       objver(ov),
-      data_offset(offset), subsystem(subsystem) {
+      data_offset(offset),
+      rdma_delivery(ops.size()),
+      rdma_oob_result(ops.size(), nullptr),
+      subsystem(subsystem) {
       if (target.base_oloc.key == o)
 	target.base_oloc.key.clear();
       if (parent_trace && parent_trace->valid()) {
@@ -2124,6 +2226,8 @@ public:
       onfinish(fin),
       objver(ov),
       data_offset(offset),
+      rdma_delivery(ops.size()),
+      rdma_oob_result(ops.size(), nullptr),
       subsystem(subsystem),
       otel_trace(otel_trace) {
       if (target.base_oloc.key == o)
@@ -2152,6 +2256,8 @@ public:
       other.out_rval.resize(p + 1);
       other.out_ec.resize(p + 1);
       other.out_handler.resize(p + 1);
+      other.rdma_delivery.resize(p + 1);
+      other.rdma_oob_result.resize(p + 1);
 
       other.out_bl[p] = bl;
       other.out_rval[p] = rval;
@@ -2581,6 +2687,19 @@ public:
   void _cancel_linger_op(Op *op);
   void _finish_op(Op *op, int r);
   boost::system::error_code process_op_reply_handlers(Op *op, std::vector<OSDOp> &out_ops);
+public:
+  /// true when op i asked for its out-of-band delivery result, through
+  /// the pointer form or the callback form (ObjectOperation::rdma_oob_handler)
+  static bool rdma_oob_wanted(const Op *op, unsigned i);
+  /// hand op i's out-of-band delivery result to its caller: copy it
+  /// through the pointer form, then invoke (and drop) the callback
+  /// form. Every path that completes an op's reads goes through here,
+  /// the split-read completion included: librados takes the callback
+  /// form, so a path that serves only the pointer leaves it believing
+  /// that nothing was delivered.
+  static void deliver_rdma_oob_result(Op *op, unsigned i,
+                                      const ceph::rdma::oob_result_t& r);
+private:
   void complete_op_reply(Op *op, boost::system::error_code handler_error, OSDSession *s, std::unique_lock<std::shared_mutex> &sl, int rc);
   static bool is_pg_changed(
     int oldprimary,
@@ -3071,6 +3190,15 @@ public:
       }, consigned);
   }
 
+  /// move op's out-of-band descriptors, result slots and result handlers
+  /// into o, for every op builder: a read's delivery and a write's pull
+  /// alike
+  static void take_rdma(Op* o, ObjectOperation& op) {
+    o->rdma_delivery.swap(op.rdma_delivery);
+    o->rdma_oob_result.swap(op.rdma_oob_result);
+    o->rdma_oob_handler.swap(op.rdma_oob_handler);
+  }
+
   // mid-level helpers
   Op *prepare_mutate_op(
     const object_t& oid, const object_locator_t& oloc,
@@ -3090,6 +3218,9 @@ public:
     o->out_bl.swap(op.out_bl);
     o->out_handler.swap(op.out_handler);
     o->out_ec.swap(op.out_ec);
+    // a write whose payload the primary pulls out of client memory
+    // carries its descriptor, and takes the primary's report
+    take_rdma(o, op);
     o->reqid = reqid;
     op.clear();
     return o;
@@ -3123,6 +3254,7 @@ public:
     o->out_handler.swap(op.out_handler);
     o->out_rval.swap(op.out_rval);
     o->out_ec.swap(op.out_ec);
+    take_rdma(o, op);
     o->reqid = reqid;
     op.clear();
     op_submit(o);
@@ -3148,6 +3280,7 @@ public:
     o->out_handler.swap(op.out_handler);
     o->out_rval.swap(op.out_rval);
     o->out_ec.swap(op.out_ec);
+    take_rdma(o, op);
     op.clear();
     return o;
   }
@@ -3187,6 +3320,7 @@ public:
     o->out_handler.swap(op.out_handler);
     o->out_rval.swap(op.out_rval);
     o->out_ec.swap(op.out_ec);
+    take_rdma(o, op);
     if (features)
       o->features = features;
     op.clear();

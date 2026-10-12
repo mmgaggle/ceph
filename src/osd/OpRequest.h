@@ -20,6 +20,9 @@
 #include "common/TrackedOp.h"
 #include "common/tracer.h"
 #include "osd/Coroutines.h"
+#ifdef HAVE_OSD_OOB_DELIVERY
+#include "common/rdma_token.h"
+#endif
 
 /**
  * The OpRequest takes in a Message* and takes over a single reference
@@ -33,6 +36,14 @@ private:
 
 public:
   std::optional<CoroHandles> coro_handles = std::nullopt;
+#ifdef HAVE_OSD_OOB_DELIVERY
+  /// what the primary pulled out of client memory for the request's
+  /// writes (delivery_t::FLAG_PULL), aligned with its ops; the payload
+  /// itself went into the ops' indata. Kept with the request, so that an
+  /// op that waits and runs again neither pulls again nor loses what it
+  /// reports.
+  std::vector<ceph::rdma::oob_result_t> oob_pulled;
+#endif
 
   int maybe_init_op_info(const OSDMap &osdmap);
 

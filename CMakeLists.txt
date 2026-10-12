@@ -588,9 +588,35 @@ option(WITH_RADOSGW_RADOS "RADOS backend for Rados Gateway" ON)
 option(WITH_RADOSGW_SELECT_PARQUET "Support for s3 select on parquet objects" ON)
 option(WITH_RADOSGW_ARROW_FLIGHT "Build arrow flight when not using system-provided arrow" OFF)
 option(WITH_RADOSGW_BACKTRACE_LOGGING "Enable backtraces in rgw logs" OFF)
-option(WITH_RADOSGW_CUOBJ "cuObject RDMA support for RADOS Gateway" OFF)
-if(WITH_RADOSGW_CUOBJ)
+# the cuObject transport, in the OSD and in the gateway, with NVIDIA's
+# cuobjserver library
+option(WITH_CUOBJ "cuObject out-of-band transport, in the OSD and the gateway" OFF)
+if(WITH_CUOBJ)
   find_library(CUOBJSERVER_LIBRARY cuobjserver REQUIRED)
+  # osd_cuobj.cc uses ibverbs types; make IBVerbs::verbs exist even
+  # when WITH_RDMA (the async messenger transport) is disabled
+  find_package(verbs REQUIRED)
+endif()
+# out-of-band delivery over libfabric: one transport for the OSD
+# executor, EC gather windows and the gateway's relay window, on any
+# provider (tcp, shm, verbs, efa, a UET provider such as the UEC
+# reference provider's libfabric wrapper)
+option(WITH_OOB_OFI "out-of-band delivery over libfabric" OFF)
+if(WITH_OOB_OFI)
+  find_path(FABRIC_INCLUDE_DIR rdma/fabric.h REQUIRED)
+  find_library(FABRIC_LIBRARY fabric REQUIRED)
+endif()
+cmake_dependent_option(WITH_RDMA_RC
+  "hipobj-rc-v2 S3-over-RDMA (RC transport) server in RADOS Gateway"
+  ON "WITH_RADOSGW;WITH_RDMA" OFF)
+if(WITH_RDMA_RC)
+  # the gateway can also stand in as a cuObject DC target for OSD-direct
+  # delivery, which needs the mlx5 direct verbs; optional
+  find_path(MLX5DV_INCLUDE_DIR infiniband/mlx5dv.h)
+  find_library(MLX5_LIBRARY mlx5)
+  if(MLX5DV_INCLUDE_DIR AND MLX5_LIBRARY)
+    set(HAVE_MLX5DV TRUE)
+  endif()
 endif()
 
 option(WITH_SYSTEM_ARROW "Use system-provided arrow" OFF)

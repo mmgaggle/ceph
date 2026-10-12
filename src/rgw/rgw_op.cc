@@ -2,16 +2,20 @@
 // vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <cerrno>
+#include <chrono>
+#include <cmath>
 #include <optional>
 #include <cstdlib>
 #include <system_error>
 #include <span>
 #include <sstream>
 #include <string_view>
+#include <thread>
 
 #include <unistd.h>
 
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/optional.hpp>
 #include <boost/utility/in_place_factory.hpp>
 #include <fmt/format.h>
@@ -86,9 +90,13 @@
 #include "rgw_flight_frontend.h"
 #endif
 
-#ifdef WITH_RADOSGW_CUOBJ
+#ifdef WITH_CUOBJ
 #include "rgw_cuobj.h"
 #endif
+#include "common/crc64nvme.h"
+#include "common/oob_config.h"
+#include "common/rdma_token.h"
+#include "rgw_rdma_fence.h"
 
 #ifdef WITH_LTTNG
 #define TRACEPOINT_DEFINE
@@ -2575,6 +2583,15 @@ int RGWGetObj::handle_slo_manifest(bufferlist& bl, optional_yield y)
 
 int RGWGetObj::get_data_cb(bufferlist& bl, off_t bl_ofs, off_t bl_len)
 {
+  if (rdma_oob_mode() && bl_len > 0) {
+    // the store streamed data instead of honoring the passthrough
+    // contract (rgw_sal.h) - e.g. a SAL store or filter that predates
+    // params.rdma_token. Reject it before any HTTP bytes are committed
+    // so execute() transparently restarts in a fallback mode.
+    ldpp_dout(this, 4) << "rdma passthrough: store returned inline data, "
+                       << "falling back" << dendl;
+    return -EOPNOTSUPP;
+  }
   /* garbage collection related handling:
    * defer_gc disabled for https://tracker.ceph.com/issues/47866 */
   return send_response_data(bl, bl_ofs, bl_len);
@@ -2594,10 +2611,32 @@ int RGWGetObj::get_lua_filter(std::unique_ptr<RGWGetObj_Filter>* filter, RGWGetO
   return 0;
 }
 
+/// whether the OSDs move the data of a token straight to or from client
+/// memory: rgw_rdma_osd_direct is on, and a transport in
+/// oob_client_transports serves the token
+static bool rdma_osd_direct(CephContext* cct, std::string_view token)
+{
+  if (!cct->_conf.get_val<bool>("rgw_rdma_osd_direct")) {
+    return false;
+  }
+  const auto t = ceph::oob::read_transports(cct);
+  if (ceph::rdma::is_ofi_token(token)) {
+    return t.client_ofi();
+  }
+  return ceph::rdma::is_cuobj_descriptor(token) && t.client_cuobj();
+}
+
 bool RGWGetObj::prefetch_data()
 {
   /* HEAD request, stop prefetch*/
   if (!get_data || s->info.env->exists("HTTP_X_RGW_AUTH")) {
+    return false;
+  }
+
+  /* when the OSDs may push data straight into client memory, inline
+   * head data staged in RGW memory would defeat the passthrough */
+  if (const char* token = s->info.env->get("HTTP_X_AMZ_RDMA_TOKEN", nullptr);
+      token && rdma_osd_direct(s->cct, token)) {
     return false;
   }
 
@@ -2653,6 +2692,168 @@ static bool rgw_calc_aead_obj_size(const DoutPrefixProvider* dpp,
     return true;
   }
   return rgw_get_aead_decrypted_size(dpp, attrs, encrypted_size, out_size);
+}
+
+void RGWGetObj::note_rdma_reads(bool submitted, bool needed, bool resent,
+                                double fence_s)
+{
+  if (!submitted) {
+    return;
+  }
+  auto& f = rdma_fence_state;
+  f.sent = true;
+  f.needed = needed;
+  f.resent = resent;
+  f.client_window = rdma_mode == RdmaMode::PASSTHROUGH;
+  f.settled = false;
+  f.wait_ms = static_cast<uint64_t>(std::ceil(fence_s * 1000.0));
+}
+
+void RGWGetObj::rdma_fence_before(const char* what, bool response,
+                                  bool success)
+{
+  auto& f = rdma_fence_state;
+  if (!f.sent || f.settled) {
+    return;
+  }
+  if (response && !f.client_window) {
+    // the reads wrote a gateway relay window, which goes back to its pool
+    // quarantined for rdma_window_hold_ms() instead of holding up the
+    // answer
+    return;
+  }
+  f.settled = true;
+  // Every read has completed by now, failed or not: iterate() drains them
+  // all before it returns. A write that a reply does not account for (an
+  // OSD marked down mid-request, the original attempt of a read the
+  // Objecter resent, a push cut off and answered inline) may still start
+  // until the pool's delivery lease runs out from the OSD's receipt of
+  // the read, and land until the drain runs out after that, so waiting
+  // lease plus drain from here covers it - unless every read came back
+  // declined or landed, and none was resent. After a GET that delivered
+  // everything, each stripe's OSD placed its bytes before replying, and
+  // only an earlier attempt of a resent read can still write the window.
+  const bool needed = rgw::rdma::write_may_land(success, f.needed, f.resent);
+  if (!needed) {
+    ldpp_dout(this, 4) << "rdma fence: not needed before " << what << ", "
+                       << (success ? "every stripe was placed and none "
+                                     "was resent"
+                                   : "every stripe was declined or landed "
+                                     "and none was resent")
+                       << dendl;
+    return;
+  }
+  if (!f.wait_ms) {
+    return;
+  }
+  ldpp_dout(this, 4) << "rdma fence: waiting " << f.wait_ms
+                     << "ms (lease + drain) before " << what << dendl;
+  if (s->yield) {
+    auto& yctx = s->yield.get_yield_context();
+    boost::asio::steady_timer timer(yctx.get_executor());
+    timer.expires_after(std::chrono::milliseconds(f.wait_ms));
+    boost::system::error_code ec;
+    timer.async_wait(yctx[ec]);
+  } else {
+    std::this_thread::sleep_for(std::chrono::milliseconds(f.wait_ms));
+  }
+}
+
+uint64_t RGWGetObj::rdma_window_hold_ms(bool success) const
+{
+  // the fence rdma_fence_before() left to the window's pool, by the same
+  // rule: none when it was waited out already, before a fallback
+  const auto& f = rdma_fence_state;
+  if (!f.sent || f.settled ||
+      !rgw::rdma::write_may_land(success, f.needed, f.resent)) {
+    return 0;
+  }
+  return f.wait_ms;
+}
+
+void RGWGetObj::select_rdma_mode(bool plain_chain)
+{
+  rdma_mode = RdmaMode::NONE;
+  if (relay_window) {
+    // a subclass relays the data from a gateway window: the OSDs push
+    // into it when they can (the window has a cuObject descriptor, the
+    // data needs no transformation and fits), else the stripes are
+    // copied in
+    if (total_len > relay_window) {
+      ldpp_dout(this, 4) << "rdma relay: response larger than the gateway "
+                         << "window" << dendl;
+      return;
+    }
+    if (plain_chain && !relay_token.empty() &&
+        s->cct->_conf.get_val<bool>("rgw_rdma_osd_direct")) {
+      rdma_token = relay_token;
+      rdma_mode = RdmaMode::RELAY;
+    } else {
+      rdma_mode = RdmaMode::RELAY_STAGED;
+    }
+    return;
+  }
+  if (rdma_token.empty() || !get_data || get_type() != RGW_OP_GET_OBJ) {
+    return;
+  }
+  if (plain_chain && rdma_osd_direct(s->cct, rdma_token)) {
+    // the whole response must fit the client's registered window for
+    // per-stripe scatter writes to be valid
+    auto window = ceph::rdma::parse_rdma_token(rdma_token);
+    if (window && total_len <= window->size) {
+      rdma_mode = RdmaMode::PASSTHROUGH;
+      return;
+    }
+    ldpp_dout(this, 4) << "rdma passthrough not eligible: "
+                       << (window ? "response larger than client window"
+                                  : "malformed token") << dendl;
+  }
+#ifdef WITH_CUOBJ
+  // the gateway's own cuObjServer can only write to cuObject descriptors;
+  // a libfabric token that cannot pass through goes over HTTP, and so
+  // does a token the server could not take the window's address from
+  if (auto* cuobj = RGWCuObjServer::get_instance();
+      cuobj && cuobj->is_available() &&
+      ceph::rdma::is_cuobj_descriptor(rdma_token)) {
+    // reserve the staging buffer up front: once the response headers
+    // are out there is no way left to signal a staging failure
+    if (!rdma_buf) {
+      rdma_buf = cuobj->acquire_buffer(total_len);
+      rdma_buf_offset = 0;
+    }
+    if (rdma_buf) {
+      rdma_mode = RdmaMode::STAGED;
+      return;
+    }
+    ldpp_dout(this, 1) << "rgw_cuobj: no staging buffer for " << total_len
+                       << " bytes, serving the body over HTTP" << dendl;
+  }
+#endif
+  // otherwise NONE: data goes over HTTP with x-amz-rdma-reply: 501
+}
+
+/// the object's stored checksum, when it is a full-object CRC-64/NVME
+/// or CRC-32C, which an out-of-band GET of the whole object compares
+/// with what the OSDs deliver
+static std::optional<rgw::cksum::Cksum> stored_full_crc(
+  const rgw::sal::Attrs& attrs)
+{
+  auto it = attrs.find(RGW_ATTR_CKSUM);
+  if (it == attrs.end()) {
+    return std::nullopt;
+  }
+  try {
+    rgw::cksum::Cksum stored;
+    auto bp = it->second.cbegin();
+    decode(stored, bp);
+    if ((stored.type == rgw::cksum::Type::crc64nvme ||
+         stored.type == rgw::cksum::Type::crc32c) && !stored.composite()) {
+      return stored;
+    }
+  } catch (const buffer::error&) {
+    // an undecodable attr verifies nothing
+  }
+  return std::nullopt;
 }
 
 void RGWGetObj::execute(optional_yield y)
@@ -2914,6 +3115,7 @@ void RGWGetObj::execute(optional_yield y)
   end_x = end;
   filter->fixup_range(ofs_x, end_x);
 
+  select_rdma_mode(filter == (RGWGetObj_Filter*)&cb);
 
   if (!get_data || ofs > end) {
     send_response_data(bl, 0, 0);
@@ -2926,10 +3128,71 @@ void RGWGetObj::execute(optional_yield y)
 
   rgw::op_counters::inc(counters, l_rgw_op_get_obj_b, end-ofs);
 
-  op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
+  if (rdma_oob_mode()) {
+    read_op->params.rdma_token = rdma_token;
+    read_op->params.rdma_bytes = &rdma_bytes;
+    // the CRCs to ask the OSDs for: those the client asked for, and the
+    // type of the object's stored full-object checksum, with which a
+    // whole-object GET compares what the OSDs deliver
+    rgw::rdma::cksum_want want;
+    if (s->cct->_conf.get_val<bool>("rgw_rdma_checksum")) {
+      want = rdma_cksum_asked;
+      if (ofs == 0 && total_len == s->obj_size) {
+        if (auto stored = stored_full_crc(attrs); stored) {
+          want.crc64nvme |= stored->type == rgw::cksum::Type::crc64nvme;
+          want.crc32c |= stored->type == rgw::cksum::Type::crc32c;
+        }
+      }
+    }
+    rdma_crc64.reset();
+    rdma_crc32c.reset();
+    read_op->params.rdma_crc64 = want.crc64nvme ? &rdma_crc64 : nullptr;
+    read_op->params.rdma_crc32c = want.crc32c ? &rdma_crc32c : nullptr;
+  }
 
-  if (op_ret >= 0)
+  op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
+  note_rdma_reads(read_op->params.rdma_submitted,
+                  read_op->params.rdma_fence_needed,
+                  read_op->params.rdma_resent, read_op->params.rdma_fence);
+  if (op_ret < 0) {
+    rdma_failed_at = "the read";
+  }
+
+  if (op_ret == -EOPNOTSUPP && rdma_oob_mode()) {
+    // an OSD (or the store) cannot push directly - old OSDs, cuObject
+    // absent or disabled, an expired lease, a resent op or a push cut
+    // off. No HTTP bytes are committed yet, so restart the whole GET in
+    // staged (or plain HTTP) mode, once nothing of this attempt can
+    // write the window any more.
+    ldpp_dout(this, 4) << "rdma passthrough unsupported, restarting GET "
+                       << "in fallback mode" << dendl;
+    rdma_fence_before("the fallback", false, false);
+    read_op->params.rdma_token.clear();
+    read_op->params.rdma_bytes = nullptr;
+    read_op->params.rdma_crc64 = nullptr;
+    read_op->params.rdma_crc32c = nullptr;
+    rdma_bytes = 0;
+    rdma_crc64.reset();
+    rdma_crc32c.reset();
+    select_rdma_mode(false);
+    // send_response_data() emits the response header from op_ret on the
+    // first handle_data() of the retry, and skips the body when it is
+    // set; leaving the failed attempt's -EOPNOTSUPP here turns the
+    // transparent fallback into a 500.
+    op_ret = 0;
+    op_ret = read_op->iterate(this, ofs_x, end_x, filter, s->yield);
+    note_rdma_reads(read_op->params.rdma_submitted,
+                    read_op->params.rdma_fence_needed,
+                    read_op->params.rdma_resent, read_op->params.rdma_fence);
+    rdma_failed_at = op_ret < 0 ? "the fallback read" : nullptr;
+  }
+
+  if (op_ret >= 0) {
     op_ret = filter->flush();
+    if (op_ret < 0) {
+      rdma_failed_at = "flushing the response";
+    }
+  }
 
   rgw::op_counters::tinc(counters, l_rgw_op_get_obj_lat, s->time_elapsed());
 
@@ -2937,13 +3200,64 @@ void RGWGetObj::execute(optional_yield y)
     goto done_err;
   }
 
+  if (rdma_oob_mode()) {
+    if (rdma_bytes != total_len) {
+      ldpp_dout(this, 0) << "ERROR: rdma passthrough delivered " << rdma_bytes
+                         << " of " << total_len << " bytes" << dendl;
+      op_ret = -EIO;
+      rdma_failed_at = "the delivered byte count";
+      goto done_err;
+    }
+    s->rdma_bytes_transferred = rdma_bytes;
+
+    // end-to-end integrity: the OSDs checksummed each stripe after the
+    // RDMA write; for a whole-object GET the combined value must match
+    // the object's stored full-object checksum, CRC-64/NVME or CRC-32C.
+    // No HTTP bytes are committed yet, so a mismatch can still fail the
+    // request cleanly.
+    if (ofs == 0 && total_len == s->obj_size) {
+      if (auto stored = stored_full_crc(attrs); stored) {
+        std::optional<rgw::cksum::Cksum> computed;
+        if (stored->type == rgw::cksum::Type::crc64nvme && rdma_crc64) {
+          computed = rgw::rdma::cksum_crc64nvme(*rdma_crc64);
+        } else if (stored->type == rgw::cksum::Type::crc32c && rdma_crc32c) {
+          computed = rgw::rdma::cksum_crc32c(*rdma_crc32c);
+        }
+        if (computed && computed->to_armor() != stored->to_armor()) {
+          ldpp_dout(this, 0) << "ERROR: rdma passthrough "
+                             << rgw::cksum::to_string(stored->type)
+                             << " mismatch: delivered " << computed->to_armor()
+                             << " != stored " << stored->to_armor() << dendl;
+          op_ret = -EIO;
+          rdma_failed_at = "the delivered checksum";
+          goto done_err;
+        }
+        if (computed) {
+          ldpp_dout(this, 20) << "rdma passthrough "
+                              << rgw::cksum::to_string(stored->type)
+                              << " verified: " << computed->to_armor() << dendl;
+        }
+      }
+    }
+  }
+
+  rdma_fence_before("the response", true, true);
   op_ret = send_response_data(bl, 0, 0);
   if (op_ret < 0) {
+    rdma_failed_at = "sending the response";
     goto done_err;
   }
   return;
 
 done_err:
+  if (rdma_fence_state.sent) {
+    ldpp_dout(this, 1) << "GET with out-of-band delivery failed at "
+                       << (rdma_failed_at ? rdma_failed_at : "the read")
+                       << ": " << cpp_strerror(op_ret) << dendl;
+  }
+  // no answer, not even an error, before nothing of the reads can write
+  // the client's window any more
+  rdma_fence_before("the error response", true, false);
   send_response_data_error(y);
 }
 
@@ -4698,6 +5012,38 @@ int RGWPutObj::get_lua_filter(std::unique_ptr<rgw::sal::DataProcessor>* filter, 
   return 0;
 }
 
+/**
+ * The ETag of an object that the OSDs pulled out of client memory. The
+ * gateway saw none of its bytes, so it has no MD5 of them. The ETag
+ * takes the form of a multipart upload's: the MD5 of the parts'
+ * digests, then "-" and their count. The parts are the object's
+ * stripes, and each one's digest is the CRC-64/NVME its OSD reported,
+ * in big-endian order. The suffix tells S3 clients that the ETag is not
+ * the MD5 of the object, and the same bytes in the same stripes always
+ * get the same ETag.
+ */
+static std::string osd_put_etag(
+  const std::vector<rgw::sal::PulledStripe>& stripes)
+{
+  MD5 hash;
+  // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+  hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
+  for (const auto& st : stripes) {
+    unsigned char be[8];
+    for (int i = 0; i < 8; i++) {
+      be[i] = static_cast<unsigned char>(st.crc64 >> (56 - 8 * i));
+    }
+    hash.Update(be, sizeof(be));
+  }
+  unsigned char digest[CEPH_CRYPTO_MD5_DIGESTSIZE];
+  hash.Final(digest);
+  std::string etag;
+  etag.reserve(CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16);
+  buf_to_hex(digest, std::back_inserter(etag));
+  fmt::format_to(std::back_inserter(etag), "-{}", stripes.size());
+  return etag;
+}
+
 void RGWPutObj::execute(optional_yield y)
 {
   char supplied_md5_bin[CEPH_CRYPTO_MD5_DIGESTSIZE + 1];
@@ -4854,6 +5200,44 @@ void RGWPutObj::execute(optional_yield y)
   if (s->info.env->get_optional("HTTP_X_RGW_CACHE_REQUEST"))
     s->object->set_cache_request();
 
+  // S3 over RDMA: a PUT that names a window of the client's memory in
+  // x-amz-rdma-token, and sends no body, asks for the object to be taken
+  // out of that memory. With rgw_rdma_osd_direct the primary OSD of each
+  // stripe pulls the stripe itself, and the gateway sees none of the
+  // bytes (an OSD-direct PUT). Such a PUT is never stored as an empty
+  // object: what cannot be served out of band is declined with 501, and
+  // the client sends the body instead.
+  const auto rdma_put_token =
+    s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
+  std::optional<ceph::rdma::token_window> rdma_put_window;
+  if (rdma_put_token && copy_source.empty() && s->content_length == 0 &&
+      !chunked_upload && rdma_staging_allowed) {
+    rdma_put_window = ceph::rdma::parse_rdma_token(*rdma_put_token);
+    if (rdma_put_window && rdma_put_window->size == 0) {
+      rdma_put_window.reset();  // an empty object needs no transfer
+    }
+  }
+  bool osd_put = false;
+  const char* osd_put_refusal = nullptr;
+  if (rdma_put_window) {
+    if (!rdma_osd_direct(s->cct, *rdma_put_token)) {
+      osd_put_refusal = "rgw_rdma_osd_direct is off, or no client transport "
+        "serves the token";
+    } else if (append) {
+      osd_put_refusal = "an append";
+    } else if (multipart) {
+      osd_put_refusal = "a part of a multipart upload";
+    } else if (supplied_md5_b64) {
+      osd_put_refusal = "Content-MD5, which needs the bytes";
+    } else if (driver->get_compression_type(*pdest_placement) != "none") {
+      osd_put_refusal = "the placement compresses";
+    } else if (!processor->set_pulled()) {
+      osd_put_refusal = "the storage cannot pull";
+    } else {
+      osd_put = true;
+    }
+  }
+
   op_ret = processor->prepare(s->yield);
   if (op_ret < 0) {
     ldpp_dout(this, 20) << "processor->prepare() returned ret=" << op_ret
@@ -4968,22 +5352,74 @@ void RGWPutObj::execute(optional_yield y)
     }
   } /* !append */
 
-#ifdef WITH_RADOSGW_CUOBJ
+  if (osd_put) {
+    // the head holds no data either way, so the PUT can still be staged
+    // through these filters, or declined
+    if (encrypt) {
+      osd_put_refusal = "server-side encryption";
+    } else if (compressor) {
+      osd_put_refusal = "compression";
+    } else if (torrent) {
+      osd_put_refusal = "a torrent";
+    } else if (run_lua) {
+      osd_put_refusal = "a Lua data filter";
+    } else if (cksum_filter &&
+               cksum_filter->type() != rgw::cksum::Type::crc64nvme &&
+               cksum_filter->type() != rgw::cksum::Type::crc32c) {
+      osd_put_refusal = "a checksum other than CRC64NVME or CRC32C";
+    }
+    if (osd_put_refusal) {
+      osd_put = false;
+    }
+  }
+
+#ifdef WITH_CUOBJ
   std::string rdma_descr;
   bool rdma_put = false;
   auto* cuobj_srv = RGWCuObjServer::get_instance();
-  if (cuobj_srv && cuobj_srv->is_available() && copy_source.empty()) {
+  if (cuobj_srv && cuobj_srv->is_available() && copy_source.empty() &&
+      rdma_staging_allowed && !osd_put) {
     auto rdma_token = s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
-    if (rdma_token) {
+    if (rdma_token && ceph::rdma::is_ofi_token(*rdma_token)) {
+      // the cuObjServer can only read from cuObject descriptors, and
+      // libfabric clients have no staged PUT: the token is advisory and
+      // the body comes over HTTP, as it does with no cuObjServer
+      ldpp_dout(this, 4) << "rgw_cuobj: libfabric token on a PUT, reading "
+                         << "the body over HTTP" << dendl;
+    } else if (rdma_token) {
       rdma_descr = *rdma_token;
       rdma_put = true;
     }
   }
+#else
+  constexpr bool rdma_put = false;
+#endif
 
+  if (rdma_put_window && !osd_put && !rdma_put) {
+    ldpp_dout(this, 5) << "S3 over RDMA: a PUT without a body cannot be "
+                       << "taken out of band ("
+                       << (osd_put_refusal ? osd_put_refusal
+                                           : "no transport stages it")
+                       << "); asking the client for the body" << dendl;
+    s->err.message = std::string("this PUT cannot be taken out of the "
+                                 "client's memory (") +
+      (osd_put_refusal ? osd_put_refusal : "no transport stages it") +
+      "); send the object in the body";
+    rdma_put_declined = true;
+    op_ret = -ERR_NOT_IMPLEMENTED;
+    return;
+  }
+
+  std::string pulled_etag;
+#ifdef WITH_CUOBJ
   if (rdma_put) {
     size_t total = RGWCuObjServer::parse_rdma_descriptor_size(rdma_descr);
     if (total == 0) {
+      // any token but a libfabric one is taken for a cuObject
+      // descriptor, and a staged PUT is not advisory: one that does not
+      // parse fails, rather than storing whatever body came with it
       ldpp_dout(this, 0) << "rgw_cuobj: ERROR: failed to parse size from RDMA descriptor" << dendl;
+      s->err.message = "x-amz-rdma-token is not a cuObject descriptor";
       op_ret = -EINVAL;
       return;
     }
@@ -5038,9 +5474,75 @@ void RGWPutObj::execute(optional_yield y)
     s->obj_size = ofs;
     s->rdma_bytes_transferred = ofs;
     s->object->set_obj_size(ofs);
+    rdma_staged = true;
   }
   else
 #endif
+  if (osd_put) {
+    const uint64_t total = rdma_put_window->size;
+    if (total > s->cct->_conf->rgw_max_put_size) {
+      op_ret = -ERR_TOO_LARGE;
+      return;
+    }
+    // the ETag is built from every stripe's CRC-64/NVME; the object's
+    // checksum is the CRC-32C when the client chose that, else the
+    // CRC-64/NVME
+    const bool want32c = cksum_filter &&
+      cksum_filter->type() == rgw::cksum::Type::crc32c;
+    const uint32_t want =
+      librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC64 |
+      (want32c ? librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC32C : 0);
+    std::vector<rgw::sal::PulledStripe> stripes;
+    tracepoint(rgw_op, before_data_transfer, s->req_id.c_str());
+    op_ret = processor->process_pulled(total, *rdma_put_token, want, &stripes);
+    tracepoint(rgw_op, after_data_transfer, s->req_id.c_str(), total);
+    // every stripe must have arrived whole, with its checksums: the
+    // object's checksum and ETag are built from them
+    std::optional<uint64_t> crc;
+    std::optional<uint32_t> crc32c;
+    if (op_ret == 0) {
+      for (const auto& st : stripes) {
+        const bool sums = st.crc64_valid && (!want32c || st.crc32c_valid);
+        if (st.bytes != st.len || !sums) {
+          ldpp_dout(this, 1) << "OSD-direct PUT: the stripe at " << st.ofs
+                             << " reported " << st.bytes << " of " << st.len
+                             << " bytes"
+                             << (sums ? "" : ", and not every checksum")
+                             << dendl;
+          op_ret = -EIO;
+          break;
+        }
+        crc = crc ? ceph::crc64nvme_combine(*crc, st.crc64, st.len)
+                  : st.crc64;
+        if (want32c) {
+          crc32c = crc32c ?
+            ceph::rdma::crc32c_combine(*crc32c, st.crc32c, st.len) :
+            st.crc32c;
+        }
+      }
+    }
+    if (op_ret < 0 || !crc || (want32c && !crc32c)) {
+      // nothing is visible: the head was not written, and the writer
+      // removes the stripes it wrote
+      ldpp_dout(this, 1) << "OSD-direct PUT of " << total << " bytes failed: "
+                         << cpp_strerror(op_ret < 0 ? op_ret : -EIO)
+                         << "; asking the client for the body" << dendl;
+      s->err.message = "the OSDs could not take the object out of the "
+                       "client's memory; send it in the body";
+      rdma_put_declined = true;
+      op_ret = -ERR_NOT_IMPLEMENTED;
+      return;
+    }
+    ofs = total;
+    s->obj_size = total;
+    s->object->set_obj_size(total);
+    s->rdma_bytes_transferred = total;
+    rdma_pulled_crc64 = crc;
+    rdma_pulled_crc32c = crc32c;
+    pulled_etag = osd_put_etag(stripes);
+    rdma_pulled = true;
+  }
+  else
   {
     tracepoint(rgw_op, before_data_transfer, s->req_id.c_str());
     do {
@@ -5153,7 +5655,9 @@ void RGWPutObj::execute(optional_yield y)
 
   buf_to_hex(m, std::back_inserter(calc_md5));
 
-  etag = calc_md5;
+  // the gateway saw none of a pulled object's bytes, and has no MD5 of
+  // them: its ETag comes from the OSDs' checksums
+  etag = rdma_pulled ? pulled_etag : calc_md5;
 
   if (supplied_md5_b64 && (calc_md5 != supplied_md5)) {
     op_ret = -ERR_BAD_DIGEST;
@@ -5197,7 +5701,30 @@ void RGWPutObj::execute(optional_yield y)
   bl.append(etag.c_str(), etag.size());
   emplace_attr(RGW_ATTR_ETAG, std::move(bl));
 
-  if (cksum_filter) {
+  if (rdma_pulled) {
+    // the OSDs' checksums of what they pulled, folded in object order:
+    // the object's full CRC-32C when the client chose it, else its full
+    // CRC-64/NVME. The client's must match, and a later passthrough GET
+    // compares it with what the OSDs deliver.
+    const bool is32c = rdma_pulled_crc32c.has_value();
+    const rgw::cksum::Cksum pulled = is32c ?
+      rgw::rdma::cksum_crc32c(*rdma_pulled_crc32c) :
+      rgw::rdma::cksum_crc64nvme(*rdma_pulled_crc64);
+    const auto expected = s->info.env->get_optional(
+      is32c ? "HTTP_X_AMZ_CHECKSUM_CRC32C" : "HTTP_X_AMZ_CHECKSUM_CRC64NVME");
+    if (expected && *expected != pulled.to_armor()) {
+      ldpp_dout(this, 4) << "OSD-direct PUT: "
+                         << (is32c ? "CRC32C" : "CRC64NVME")
+                         << " mismatch: pulled " << pulled.to_armor()
+                         << " != expected " << *expected << dendl;
+      op_ret = -ERR_BAD_DIGEST;
+      return;
+    }
+    cksum = pulled;
+    buffer::list cksum_bl;
+    cksum->encode(cksum_bl);
+    emplace_attr(RGW_ATTR_CKSUM, std::move(cksum_bl));
+  } else if (cksum_filter) {
     const auto& hdr = cksum_filter->header();
 
     auto expected_ck = cksum_filter->expected(*s->info.env);

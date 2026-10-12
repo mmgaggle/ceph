@@ -38,9 +38,10 @@ cuObject clients
 libfabric clients
   A client that uses libfabric registers a window with a libfabric
   provider. It sends a libfabric token in ``x-amz-rdma-token``. The
-  token names the provider, the client's endpoint and the memory key.
-  Any server process that runs the same provider can write into the
-  window without a connection to the client. The provider selects the
+  token names the wire protocol, the client's endpoint and the memory
+  key. Any server process whose provider speaks the same wire protocol
+  can write into the window without a connection to the client. The
+  provider selects the
   wire: ``tcp``, ``shm``, RDMA reliable connections, AWS SRD or Ultra
   Ethernet.
 
@@ -66,8 +67,8 @@ OSD-direct
   needs no RDMA adapter and no transport library for it. For RC
   clients, the window is a gateway session buffer. The gateway writes
   the buffer to the client over the paired queue pair while the
-  stripes arrive. This is OSD-direct relay. ``rgw_rdma_osd_passthrough``
-  turns on both.
+  stripes arrive. This is OSD-direct relay. ``rgw_rdma_osd_direct``
+  turns on both, and it is on by default.
 
 Gateway-staged
   The gateway reads the object from RADOS into a registered buffer and
@@ -85,7 +86,7 @@ The gateway uses OSD-direct when it can, and gateway-staged otherwise.
 OSD-direct PUT
 --------------
 
-With ``rgw_rdma_osd_put``, a PUT can leave the object in client memory.
+With ``rgw_rdma_osd_direct``, a PUT can leave the object in client memory.
 The client registers the object's bytes as a window that peers can
 read. It then sends a PUT with ``x-amz-rdma-token`` and an empty body.
 The window's size is the object's size. Both token types work: a
@@ -133,8 +134,8 @@ object. If the gateway cannot serve such a PUT out of band, it answers
 ``501`` with ``x-amz-rdma-reply: 501``, and the client sends the body
 instead. The gateway declines these PUTs:
 
-* PUTs that arrive while ``rgw_rdma_osd_put`` is off, unless a cuObject
-  gateway-staged PUT serves the token.
+* PUTs that arrive while ``rgw_rdma_osd_direct`` is off, unless a
+  cuObject gateway-staged PUT serves the token.
 * Appends, parts of multipart uploads, and PUTs with ``Content-MD5``.
 * Objects that the placement compresses or that the gateway encrypts,
   torrents, and PUTs that a Lua data filter reads.
@@ -142,9 +143,10 @@ instead. The gateway declines these PUTs:
 * PUTs with a stripe that an OSD could not pull. The gateway removes
   the stripes that it wrote, and the old object stays.
 
-``osd_oob_pull`` lets an OSD pull. The libfabric executor then asks its
-provider for RMA reads, and pulls through its staging buffers
-(``osd_oob_buffer_size``). The cuObject executor reads with
+Every OSD executor can pull. The libfabric executor asks its provider
+for RMA reads, and pulls into a buffer of the OSD's arena (see
+`Registered memory`_). A provider without RMA reads still starts, for
+delivery only. The cuObject executor reads with
 ``handlePutObject``, as the gateway's staged PUT does. A pull holds the
 object's lock and the op thread until it completes, at most for the
 pool's lease plus drain. An OSD that cannot pull fails the write with
@@ -158,30 +160,182 @@ the PUT is complete, re-key the window.
 Transports
 ----------
 
-An OSD reaches a window through an executor. An executor is a
-transport that writes the bytes of a read into the window that a token
-names. ``osd_oob_transports`` lists the executors that an OSD starts,
-and ``rgw_rdma_transports`` lists the transports that the gateway
-starts. Both name the transports ``ofi`` and ``cuobj``. Two executors
-exist:
+A transport moves object data between two processes out of band. Ceph
+uses transports in two roles:
 
-cuObject executor
-  Writes to DC descriptors with NVIDIA's ``cuobjserver`` library. It
-  needs a ConnectX adapter on the OSD host.
+Client transports
+  The transports that move object data to and from clients.
+  ``oob_client_transports`` lists them, and so decides which tokens the
+  cluster accepts.
 
-libfabric executor
-  Writes to libfabric tokens with any libfabric provider.
+Cluster transport
+  The transport that moves object data between Ceph daemons. It carries
+  the shard reads that an erasure-coded primary gathers, and the stripes
+  that the OSDs write into the gateway's relay buffers.
+  ``oob_cluster_transport`` names it.
 
-Either executor also carries the transfers that stay inside the
-cluster, into windows of its own transport: shard reads that an
-erasure-coded primary gathers, and stripes into the gateway's relay
-windows.
+Three transports exist:
+
+libfabric
+  Any libfabric provider, named as ``fi_info`` names it, for example
+  ``verbs;ofi_rxm``, ``uet`` or ``tcp``. It writes into the windows that
+  libfabric tokens name. It can be a client transport and the cluster
+  transport.
+
+cuObject (``cuobj``)
+  Writes into the windows that DC descriptors name, with NVIDIA's
+  ``cuobjserver`` library. It needs a ConnectX adapter on each host that
+  runs it. It can be a client transport and the cluster transport.
+
+Reliable Connection (``rc``)
+  The gateway's ``hipobj-rc-v2`` server. It is a client transport, and
+  only the gateway runs it.
+
+An OSD runs the libfabric and cuObject transports through executors. An
+executor writes the bytes of a read into the window that a token names,
+and pulls the payload of a write out of such a window.
 
 Every out-of-band read is advisory. When a daemon cannot deliver read
 data out of band, it sends the same bytes in band, and the request
 still completes with correct data. A gateway-staged PUT is not: when
 the gateway cannot take the object from the client's memory, as when
 no staging buffer holds it, the PUT fails.
+
+Configuring a cluster
+=====================
+
+Quick start
+-----------
+
+Put the options below in the ``[global]`` section of the cluster's
+configuration, so that every OSD and every gateway reads the same
+values. A daemon reads them only when it starts.
+
+#. Set ``oob_network`` to the subnets of the interfaces that carry
+   out-of-band traffic. See `The out-of-band network`_.
+#. Set ``oob_client_transports`` to the transports of your clients: the
+   libfabric provider that they use, ``cuobj`` for cuObject clients,
+   and ``rc`` for RC clients such as hipObject.
+#. Set ``oob_cluster_transport`` to the transport between the daemons:
+   one libfabric provider, or ``cuobj``. If you leave it empty, the
+   gathers of erasure-coded reads stay on the messenger, and RC GETs
+   take staged relay.
+#. Give each OSD and each gateway unlimited locked memory, for example
+   with ``LimitMEMLOCK=infinity`` in its systemd unit. See `Registered
+   memory`_.
+#. Restart the OSDs and the gateways.
+
+This configuration serves libfabric, cuObject and RC clients on
+ConnectX adapters, and moves data between the daemons over libfabric::
+
+  [global]
+  oob_network           = 10.90.0.0/24
+  oob_client_transports = verbs;ofi_rxm, cuobj, rc
+  oob_cluster_transport = verbs;ofi_rxm
+
+The gateway then uses OSD-direct transfers for every token of a client
+transport. Each transport also needs some host configuration. See
+`cuObject`_, `libfabric`_ and `UET`_.
+
+The out-of-band network
+-----------------------
+
+``oob_network`` works like ``public_network``. It lists subnets, and
+each daemon takes the first address of its host in one of them. That
+is the daemon's out-of-band address. The daemon finds the interface
+that carries the address, and from the interface what each transport
+needs:
+
+* ``verbs;ofi_rxm``, ``cuobj`` and ``rc``: the RDMA device, its port,
+  and the index of the RoCE v2 GID that holds the address. The GID
+  table names the interface of each GID, so an address on a VLAN above
+  a bond works too.
+* ``uet``: the interface itself, which is the provider's domain.
+* ``tcp`` and other providers: the address, to bind to.
+
+If no RDMA device carries the address, the daemon logs ``no RDMA device
+carries <address>``, and starts no transport that needs one.
+
+If ``oob_network`` is empty, each daemon uses its public address. That
+works only when the RDMA adapter carries the public address.
+
+Two options change the choice for one daemon:
+
+* ``oob_network_interface`` limits the choice to the interfaces that it
+  names. The value can use ``$id``, for example ``uet-o$id``.
+* ``oob_addr`` gives the address directly. Set it in the section of the
+  daemon, such as ``[osd.3]``.
+
+Choosing transports
+-------------------
+
+``oob_client_transports`` lists the transports that the cluster serves
+to clients:
+
+* Each OSD starts an executor for the libfabric provider in the list,
+  and one for ``cuobj``.
+* The gateway starts its cuObject server for ``cuobj``, for
+  gateway-staged mode, and its ``hipobj-rc-v2`` server for ``rc``.
+* The gateway passes a cuObject descriptor to the OSDs only when the
+  list names ``cuobj``. It passes a libfabric token only when the list
+  names a libfabric provider. An OSD whose provider speaks another wire
+  protocol than the token returns the stripe inline, and the gateway
+  falls back. See `Fallback order`_.
+
+``oob_cluster_transport`` names one transport for the transfers between
+daemons. Every daemon must run the same one. It turns on two things:
+
+* The primary of an erasure-coded read lends windows to its peer
+  shards, which write their shard data into them. See `Gathering shard
+  reads out of band`_.
+* The gateway exposes its RC session buffers to the OSDs, which write
+  their stripes into them. See `GET relay`_.
+
+A libfabric provider works on any adapter that it supports. ``cuobj``
+needs a ConnectX adapter on every host that runs it.
+
+An OSD runs one libfabric endpoint. If ``oob_cluster_transport`` and
+``oob_client_transports`` name different libfabric providers, the OSD
+starts the provider of ``oob_cluster_transport``, and logs a warning
+for the other one. A daemon also skips, with a warning, a transport
+that it was built without or that fails to start.
+
+Registered memory
+-----------------
+
+Each daemon that runs a transport registers one arena of memory with
+its adapter when it starts. ``oob_memory`` sets the size of the arena,
+2 GiB by default. All transports of the daemon share it. A daemon that
+runs no transport registers nothing.
+
+Each buffer comes from the arena at the size that its transfer needs,
+rounded up to a power of two from 1 MiB to 64 MiB. These uses take
+buffers:
+
+* An OSD stages in one buffer each read that it delivers out of band,
+  and each payload that it pulls.
+* The primary of an erasure-coded read lends one window to each peer
+  shard that it reads from.
+* The gateway stages each cuObject transfer of gateway-staged mode in
+  one buffer.
+* The gateway holds one buffer for each RC session, from PREPARE until
+  the session ends.
+
+A transfer larger than 64 MiB, or one that finds no room in the arena,
+takes its fallback. An OSD delivers the read inline, and a shard replies
+inline. A pull fails, and the gateway declines the PUT with ``501``. A
+cuObject GET gets the HTTP body, and a cuObject PUT fails with ``503``.
+An RC PREPARE fails with ``413`` for a transfer larger than 64 MiB, and
+with ``503 SlowDown`` when the arena is full.
+
+A window that a daemon lends to a peer gets a memory key of its own,
+which changes when the window comes back. See `Reusing a window`_.
+
+The arena is far above the usual 8 MiB ``memlock`` limit. Give the OSDs
+and the gateways ``LimitMEMLOCK=infinity``. For a vstart cluster, run
+``ulimit -l unlimited``. Each OSD registers an arena of its own, so a
+host locks ``oob_memory`` once for each OSD that it runs. On a host with
+many OSDs, set a smaller ``oob_memory`` in the ``osd`` section.
 
 How a read reaches client memory
 ================================
@@ -271,9 +425,10 @@ a resend otherwise.
 Executors and tokens
 --------------------
 
-An OSD starts the executors that ``osd_oob_transports`` lists. It
-skips, with a warning, a transport that it was built without or that
-fails to start. It chooses an executor for each token by the shape of
+An OSD starts the executors of the transports in
+``oob_client_transports`` and ``oob_cluster_transport``: a libfabric
+executor, a cuObject executor, or both. See `Choosing transports`_. It
+chooses an executor for each token by the shape of
 the token. A token whose third field is ``ofi`` and a version, such as
 ``ofi1``, goes to the libfabric executor. The executor serves it only
 when the token names the wire protocol of the OSD's own endpoint. A
@@ -336,8 +491,9 @@ Fallback order
 
 The gateway tries these modes in order, for each request:
 
-#. Passthrough, when the request has a token, ``rgw_rdma_osd_passthrough``
-   is on and the request is eligible. If any stripe comes back inline,
+#. Passthrough, when the request has a token of a transport in
+   ``oob_client_transports``, ``rgw_rdma_osd_direct`` is on, and the
+   request is eligible. If any stripe comes back inline,
    the gateway restarts the whole GET in the next mode. The client does
    not see the restart, because the gateway has not sent HTTP bytes
    yet. When stripe operations were already sent, the gateway first
@@ -349,9 +505,8 @@ The gateway tries these modes in order, for each request:
    GET instead, and the gateway sends the error behind the same fence.
 #. Gateway-staged mode, when the token is a cuObject descriptor, the
    gateway runs its cuObject server (``cuobj`` in
-   ``rgw_rdma_transports``), and one of its staging buffers is free and
-   holds the whole response (``rgw_cuobj_buffer_size``, 8 MiB by
-   default).
+   ``oob_client_transports``), and its arena has room for a buffer that
+   holds the whole response, at most 64 MiB. See `Registered memory`_.
 #. The HTTP body, with ``x-amz-rdma-reply: 501``. The cuObject protocol
    defines this value as the signal to fall back to HTTP.
 
@@ -461,9 +616,8 @@ gives a request up, and counts the fence from when it sent the request,
 needs to allow for it. So a cut-off that ends late by no more than
 ``osd_oob_cutoff_late_tolerance`` (1 s by default), and that itself
 took no longer, is counted in ``cutoffs_late``, and the OSD raises the
-``OOB_CUTOFF_LATE`` health warning, with the worst lateness, for
-``osd_oob_cutoff_late_alert_period`` (an hour by default) after the
-latest one. Delivery goes on. 1 s is a third of the default drain, and
+``OOB_CUTOFF_LATE`` health warning, with the worst lateness, for an hour
+after the latest one. Delivery goes on. 1 s is a third of the default drain, and
 thousands of times what a cut-off costs, so a cut-off that late is a
 scheduling delay, not a transport that fails to discard.
 
@@ -475,12 +629,11 @@ OSD says so when nothing polled its endpoint for about as long. The
 endpoint is clean once the close or cancel returns: nothing of the
 writes it cut off is sent any more. So the OSD logs the cut-off to the
 cluster log as an error, with its lateness, raises the
-``OOB_CUTOFF_PAST_TOLERANCE`` health error for
-``osd_oob_cutoff_late_alert_period`` (an hour by default), and goes on
+``OOB_CUTOFF_PAST_TOLERANCE`` health error for an hour, and goes on
 delivering. Stopping the executor would not undo a write that already
 landed, and it would turn every long pause into an outage until the OSD
-restarts. Set ``osd_oob_cutoff_late_fail_closed`` to stop the libfabric
-executor instead.
+restarts. Set ``osd_oob_cutoff_policy`` to ``disable`` to stop the
+libfabric executor instead.
 
 Who can such a late write reach? Say the OSD received the operation at
 ``t``. Its writes must land by ``t + lease + drain``, and one landed
@@ -512,13 +665,13 @@ writes go on. Or the close or cancel itself may take longer than the
 tolerance, as when a provider drains its writes instead of discarding
 them, so that every cut-off would be late. In these cases writes may
 land in a client's window after the fence, and may keep doing so. With
-``osd_oob_cutoff_late_fail_closed``, a quick cut-off that ends later
-than the tolerance fails too, although its endpoint is clean. When a
-cut-off fails, the OSD stops its libfabric executor. It delivers inline
-every read that the executor would have written, lends none of its
-gather windows, logs the cause to the cluster log, and raises the
-``OOB_DELIVERY_UNSAFE`` health warning. With ``osd_oob_cutoff_failure``
-set to ``abort``, the OSD exits instead. That ends the writes of a
+``osd_oob_cutoff_policy`` set to ``disable`` or ``abort``, a quick
+cut-off that ends later than the tolerance fails too, although its
+endpoint is clean. When a cut-off fails, the OSD stops its libfabric
+executor. It delivers inline every read that the executor would have
+written, lends none of its gather windows, logs the cause to the
+cluster log, and raises the ``OOB_DELIVERY_UNSAFE`` health warning.
+With ``osd_oob_cutoff_policy`` set to ``abort``, the OSD exits instead. That ends the writes of a
 software provider, and a device drops the queue pair's. Restart the OSD
 once the transport is fixed. ``OOB_DELIVERY_DOWN`` means that a cut-off
 could not reopen the endpoint; no write is at risk then, but libfabric
@@ -596,9 +749,11 @@ every client fell back to HTTP.
 Ceph does the first for the windows it lends itself, as soon as the
 operation that used a window ends, in place where the provider can. An
 OSD's libfabric gather windows get a new key when the gather releases
-them (``osd_oob_rekey_windows``), and so do the gateway's libfabric
-relay windows when a session ends (``rgw_rdma_rekey_windows``), also
-when a gather or a relay failed. A gather window returned while a
+them, and so do the gateway's libfabric relay windows when a session
+ends, also when a gather or a relay failed. The registration cache of
+the verbs provider keeps the key of a closed region valid. So a daemon
+sets ``FI_MR_CACHE_MONITOR=disabled`` in its own environment before it
+opens a libfabric endpoint. A gather window returned while a
 ``FI_THREAD_DOMAIN`` provider adds a client gets its new key from a
 later gather instead, and is not lent before (see `libfabric`_).
 Windows behind a cuObject DC target keep their key. A window whose
@@ -651,9 +806,9 @@ Gathering shard reads out of band
 ---------------------------------
 
 The primary of an erasure-coded read normally collects the shards it
-needs from its peers in the sub-read replies, over the messenger. With
-``osd_oob_gather`` on, the peers write their shard data into the
-primary's memory over an executor. This needs a pool with
+needs from its peers in the sub-read replies, over the messenger. When
+``oob_cluster_transport`` names a transport, the peers write their shard
+data into the primary's memory over it instead. This needs a pool with
 ``allow_ec_optimizations``. It covers every read that the primary
 decodes for a client or for a partial write, whether or not the
 client's read carries a delivery descriptor. Recovery reads do not
@@ -694,21 +849,23 @@ read over and over, cannot use up the windows. So does the window of a
 shard that says in its reply that its executor sent nothing into it:
 the push was refused before any write went out, because the shard's
 endpoint was adding a client, no staging buffer was free, or the lease
-had run out, say. With ``osd_oob_rekey_windows``, the libfabric executor
-also gives every released window a new key, after which no write meant
+had run out, say. The libfabric executor also gives every released
+window a new key, after which no write meant
 for the last gather can land where the provider drops writes with a
 retired key. A window whose data the primary used is lent again at once,
 unless its new key fails. One whose data it did not use keeps its
 quarantine, and stays out of use for 10 s at least once it has a new
 key. A cuObject window gets no new key. See `Reusing a window`_.
 
-The first transport in ``osd_oob_transports`` that started lends the
-windows, and only its executor registers them; another executor on the
-OSD registers none. The libfabric executor registers them on its
-endpoint, and starts a progress thread that places the data pushed
-into them. The cuObject executor puts them behind a DC target on the
-OSD's adapter. Peers must run the same transport to write into a
-window.
+The executor of ``oob_cluster_transport`` lends the windows. It takes
+each window from the OSD's arena, at the size of the shard read, up to
+64 MiB. A shard read larger than that, or one that finds no room in the
+arena, is returned inline. The libfabric executor registers each window
+on its endpoint, and starts a progress thread that places the data
+pushed into the windows. The cuObject executor puts the windows behind
+a DC target on the OSD's adapter. A peer can write into a window only
+over the window's transport, so every OSD must run the same cluster
+transport.
 
 The token travels in a new trailing field of the sub-read message, and
 the pushed extents, their crc32c, and whether the shard sent nothing,
@@ -791,8 +948,8 @@ subuser or role session. READY and CANCEL from another identity fail,
 and leave the session alone. A CANCEL of a session that has already
 ended succeeds.
 
-When ``rgw_rdma_rc_enabled`` is off, the control routes answer ``501``
-with ``x-amz-rdma-protocol-status: unsupported``. That answer tells a
+When ``oob_client_transports`` does not name ``rc``, the control routes
+answer ``501`` with ``x-amz-rdma-protocol-status: unsupported``. That answer tells a
 hipObject client to use plain HTTP.
 
 GET relay
@@ -805,12 +962,11 @@ OSD-direct relay
   The gateway exposes its session buffers to the OSDs. Each stripe read
   carries a delivery descriptor for the session buffer, and the OSDs
   write their stripes into it, as in passthrough mode. The gateway does
-  not copy the object. This needs ``rgw_rdma_osd_passthrough``, and a
-  transport in ``rgw_rdma_transports`` that can expose the buffers.
-  The first one that can does so. With ``ofi``, the buffers are exposed
-  over libfabric, on any adapter that the provider supports. With
-  ``cuobj``, they are exposed as a cuObject DC target, which needs an
-  mlx5 adapter on the gateway.
+  not copy the object. This needs ``rgw_rdma_osd_direct`` and an
+  ``oob_cluster_transport``. With a libfabric provider, the gateway
+  exposes the buffers over libfabric, on any adapter that the provider
+  supports. With ``cuobj``, it exposes them as a cuObject DC target,
+  which needs an mlx5 adapter on the gateway.
 
 Staged relay
   This is gateway-staged mode for RC clients. The gateway reads the
@@ -842,9 +998,8 @@ writes to the client fail afterwards. A session whose buffer is held
 this way ends, even when the client's queue pair was only not ready,
 which otherwise lets the client send READY again. When a stripe comes
 back inline, the gateway waits for the same fence before staged relay
-copies the object into the buffer. With ``rgw_rdma_rekey_windows``, the
-gateway also gives the buffer's libfabric window a new key when the
-session ends, after which no OSD write meant for that session can land
+copies the object into the buffer. The gateway also gives the buffer's
+libfabric window a new key when the session ends, after which no OSD write meant for that session can land
 where the provider drops writes with a retired key. After a session
 that left no write in flight the buffer is free at once; otherwise it
 keeps the quarantine, and for 10 s at least. See `Reusing a window`_.
@@ -870,17 +1025,20 @@ read only its leading address and size fields. The rest names the
 client's remote key and DC target. Every writer needs the DC key that
 the client library uses, which is ``0xffeeddcc`` by default.
 
-The OSD executor needs ``cuobj`` in ``osd_oob_transports``, a build
-with ``WITH_OSD_CUOBJ``, a ConnectX-5 or newer adapter, ``rdma-core``,
-and NVIDIA's proprietary ``cuobjserver`` library. Gateway-staged mode
-for cuObject clients needs ``cuobj`` in ``rgw_rdma_transports``,
-``rgw_cuobj_rdma_ip``, which has no default, a build with
-``WITH_RADOSGW_CUOBJ``, and the same adapter and library on the gateway
-host. No GPU is needed on the OSD, gateway or client hosts. Only GPU
-memory targets on the client need CUDA.
+The OSD executor needs ``cuobj`` in ``oob_client_transports`` or in
+``oob_cluster_transport``, a build with ``WITH_CUOBJ``, a ConnectX-5 or
+newer adapter, ``rdma-core``, and NVIDIA's proprietary ``cuobjserver``
+library. Gateway-staged mode for cuObject clients needs ``cuobj`` in
+``oob_client_transports``, and the same build, adapter and library on
+the gateway host. No GPU is needed on the OSD, gateway or client hosts.
+Only GPU memory targets on the client need CUDA.
 
-Three host settings are easy to miss. Each one fails with an error that
-does not name the real cause.
+Each OSD creates one DC initiator for each op worker thread, and the
+gateway creates 128. Every DC initiator and target uses
+``cuobj_dc_key``. The library chooses its ``rdma_cm`` port, and clients
+never connect to it.
+
+Three parts of the host configuration are easy to miss:
 
 ``rdma_ucm`` must be loaded
   The cuObject server connects through ``rdma_cm``, so
@@ -895,28 +1053,22 @@ does not name the real cause.
   cuObject cannot start a session.
 
 Locked memory must be raised
-  Every OSD registers ``osd_oob_buffer_count`` times
-  ``osd_oob_buffer_size`` of memory for each executor, which is 256 MiB
-  at the defaults. With ``osd_oob_gather``, the executor that lends the
-  gather windows also registers ``osd_oob_window_count`` times
-  ``osd_oob_window_size`` for them, 128 MiB more, once per OSD. A
-  cuObject executor whose buffers are all in use registers a one-time
-  buffer of up to four times ``osd_oob_buffer_size``. The gateway's
-  cuObject server registers ``rgw_cuobj_buffer_count`` times
-  ``rgw_cuobj_buffer_size``, 1 GiB at the defaults. That is far above
-  the usual 8 MiB ``memlock`` limit. Give the OSDs, and the gateway in
-  staged mode, ``LimitMEMLOCK=infinity``. For a vstart cluster, run
-  ``ulimit -l unlimited``.
+  The cuObject executor and the cuObject server register the daemon's
+  arena, ``oob_memory``, 2 GiB by default. That is far above the usual
+  8 MiB ``memlock`` limit. Without more, the registration fails. See
+  `Registered memory`_.
 
 The RDMA address must belong to the RDMA device
-  ``osd_cuobj_rdma_ip``, and ``rgw_cuobj_rdma_ip`` on the gateway, must
-  name an address that the RDMA device carries. When the ConnectX
-  ports are bonded and tenant traffic is VLAN-tagged, that is the
-  address on the VLAN above the bond. It is
-  usually not the public address. ``ibv_devinfo`` and the GID table
-  under ``/sys/class/infiniband/<device>/ports/1/gids`` show the
+  The daemon's address in ``oob_network`` must be an address that the
+  ConnectX adapter carries. When the ConnectX ports are bonded and
+  tenant traffic is VLAN-tagged, that is the address on the VLAN above
+  the bond. It is usually not the public address, so an empty
+  ``oob_network`` does not work there. ``ibv_devinfo`` and the GID
+  table under ``/sys/class/infiniband/<device>/ports/1/gids`` show the
   addresses of the device. A RoCE v2 entry whose GID ends in the
-  IPv4-mapped form of the address shows the pairing.
+  IPv4-mapped form of the address shows the pairing. If no adapter
+  carries the address, the daemon logs ``no RDMA device carries
+  <address>``.
 
 A client that reads into host memory needs no GPU and no NVIDIA kernel
 driver. ``libcufile`` reaches that configuration only with DMABuf
@@ -933,8 +1085,7 @@ selects another copy of the file::
   "rdma_dev_addr_list": [ "10.0.9.7" ],
 
 Leave ``rdma_transport_type`` at ``DC_V1``, and keep ``rdma_dc_key``
-equal to ``osd_cuobj_dc_key`` on the OSDs. The defaults on both sides
-agree.
+equal to ``cuobj_dc_key``. The defaults on both sides agree.
 
 libfabric
 ---------
@@ -1045,16 +1196,17 @@ for the response, or use a provider with automatic progress.
 These providers are known to work:
 
 ``tcp``
-  Needs no special hardware. Set ``osd_ofi_node`` to the address the
-  OSD sends from. It cannot cut off a write that misses its deadline,
+  Needs no special hardware. It binds to the daemon's address in
+  ``oob_network``. It cannot cut off a write that misses its deadline,
   so use it for tests only.
 
 ``shm``
   Works between processes on one host. It is useful for tests.
 
 ``verbs;ofi_rxm``
-  RDMA reliable connections on any verbs device. Set ``osd_ofi_domain``
-  to the device, for example ``mlx5_0`` or ``rxe0``. On soft-RoCE the
+  RDMA reliable connections on any verbs device. The daemon finds the
+  device, for example ``mlx5_0`` or ``rxe0``, from its address in
+  ``oob_network``. On soft-RoCE the
   provider fails to open with "Unable to create verbs CQ". The rxm
   provider sizes its completion queues from the universe size, and
   soft-RoCE allows 32767 entries per queue. Set
@@ -1080,23 +1232,25 @@ that holds the wrapper, in the environment of every daemon and client.
 
 Each OSD needs these settings:
 
-* ``ofi`` in ``osd_oob_transports``, and ``osd_ofi_provider`` set to
-  ``uet``.
-* ``osd_ofi_domain`` set to the interface that the OSD sends and
-  receives on. The interface's IPv4 address is the OSD's fabric
-  endpoint. The value can use ``$id``, for example ``uet-o$id``.
+* ``uet`` in ``oob_client_transports``, in ``oob_cluster_transport``,
+  or in both.
+* An address in ``oob_network`` on the interface that the OSD sends and
+  receives on. The OSD uses the interface as the provider's domain, and
+  the interface's IPv4 address is the OSD's fabric endpoint. The
+  reference provider needs one interface for each process, so give each
+  OSD an interface of its own, and set ``oob_network_interface`` to its
+  name. The value can use ``$id``, for example ``uet-o$id``.
 * The ``CAP_NET_RAW`` capability, for the raw socket. An OSD normally
   drops every capability that its block-device plugins do not need.
-  When ``osd_oob_transports`` names ``ofi`` and ``osd_ofi_provider`` is
-  ``uet``, the OSD also keeps ``CAP_NET_RAW``.
+  When either option names ``uet``, the OSD also keeps ``CAP_NET_RAW``.
 
-The gateway's relay windows need ``ofi`` in ``rgw_rdma_transports``,
-``rgw_ofi_provider`` set to ``uet``, an interface in
-``rgw_ofi_domain``, and ``CAP_NET_RAW``.
+The gateway's relay windows need ``uet`` in ``oob_cluster_transport``,
+an address in ``oob_network`` on the gateway's own UET interface, and
+``CAP_NET_RAW``.
 
-An OSD-direct PUT (see `OSD-direct PUT`_) needs RMA reads. The OSD asks
-for them with ``osd_oob_pull``, and the wrapper must offer
-``FI_READ`` and ``FI_REMOTE_READ``. Under RUDI, a read is idempotent at
+An OSD-direct PUT (see `OSD-direct PUT`_) needs RMA reads. The OSD
+always asks for them, and the wrapper must offer ``FI_READ`` and
+``FI_REMOTE_READ``. Under RUDI, a read is idempotent at
 the client, so it goes over RUDI too: each request packet asks for one
 packet of data, which the client sends back in its answer, keeping no
 state for the OSD. When the wrapper offers ``FI_HMEM``, the client can
@@ -1222,21 +1376,20 @@ Configuration reference
 Build options
 -------------
 
-``WITH_RADOSGW_CUOBJ``
-  Gateway-staged mode with NVIDIA's ``cuobjserver`` library.
-
-``WITH_OSD_CUOBJ``
-  The OSD's cuObject executor, with the ``cuobjserver`` library.
-
 ``WITH_OOB_OFI``
-  The libfabric executor, gather windows over libfabric, and the
-  gateway's relay windows over libfabric. Needs the libfabric headers
-  and library, API version 1.18 or later.
+  The libfabric transport: the OSD's executor, gather windows over
+  libfabric, and the gateway's relay windows over libfabric. Needs the
+  libfabric headers and library, API version 1.18 or later.
 
-``WITH_RADOSGW_RDMA_RC``
-  The ``hipobj-rc-v2`` server. It is on by default when ``WITH_RDMA``
-  is on. The DC target for OSD-direct relay also needs the ``mlx5``
-  direct verbs library at build time.
+``WITH_CUOBJ``
+  The cuObject transport, in the OSD and in the gateway, with NVIDIA's
+  ``cuobjserver`` library.
+
+``WITH_RDMA_RC``
+  The gateway's ``hipobj-rc-v2`` server. It is on by default when
+  ``WITH_RDMA`` is on. With ``cuobj`` as the cluster transport, the
+  gateway's DC target also needs the ``mlx5`` direct verbs library at
+  build time.
 
 Pool options
 ------------
@@ -1257,153 +1410,104 @@ restores the default.
   its writes. That is about two seconds for cuObject. For libfabric, it
   is the time an endpoint takes to close and reopen. The default is 3.
 
+Common options
+--------------
+
+Set these options in the ``global`` section, so that every OSD and
+every gateway reads the same values. A daemon reads them only when it
+starts.
+
+``oob_network``
+  The subnets of the out-of-band network, as a comma-separated list.
+  Each daemon takes the first address of its host in these subnets. The
+  default is empty, which means the daemon's public address. See `The
+  out-of-band network`_.
+
+``oob_network_interface``
+  Limits the choice of address to these interfaces. The value can use
+  ``$id``. The default is empty.
+
+``oob_addr``
+  The out-of-band address of one daemon. It overrides ``oob_network``.
+  Set it in the section of that daemon. The default is empty.
+
+``oob_client_transports``
+  The transports that the cluster serves to clients: a libfabric
+  provider, ``cuobj`` and ``rc``. The default is empty, which turns
+  out-of-band transfers with clients off. See `Choosing transports`_.
+
+``oob_cluster_transport``
+  The transport between daemons: one libfabric provider, or ``cuobj``.
+  The default is empty, which keeps gathers on the messenger and relays
+  in the gateway. See `Choosing transports`_.
+
+``oob_memory``
+  The size of the arena that each daemon registers. The default is
+  2 GiB. See `Registered memory`_.
+
+``cuobj_dc_key``
+  The DC key of every cuObject DC initiator and target in the cluster.
+  It must match the key of the cuObject client library. The default is
+  ``0xffeeddcc``, the library's default.
+
 Gateway options
 ---------------
 
-Transports and out-of-band behavior:
+``rgw_rdma_osd_direct``
+  Have the OSDs move object data straight to and from client memory.
+  The OSDs write the data of a GET into client windows and into RC relay
+  buffers. They pull the object of a body-less PUT out of client memory.
+  The default is true. See `Data paths`_ and `OSD-direct PUT`_.
 
-* ``rgw_rdma_transports``: the transports that the gateway starts, in
-  order of preference. ``cuobj`` starts the gateway's cuObject server
-  for gateway-staged mode, and can expose the RC relay windows as a DC
-  target. ``ofi`` opens a libfabric endpoint that can expose the relay
-  windows. The default is empty.
-* ``rgw_rdma_osd_passthrough``: have the OSDs write GET data directly,
-  into client windows and into RC relay windows. The default is false.
-* ``rgw_rdma_osd_put``: have the OSDs pull the object of a body-less PUT
-  out of client memory. The default is false. See `OSD-direct PUT`_.
-* ``rgw_rdma_checksum``: compute checksums of out-of-band transfers.
-  The gateway reports them in ``x-amz-rdma-checksum-<algorithm>``, and
-  compares whole-object passthrough GETs with the stored checksum. An
-  OSD-direct PUT computes them whatever this option says. The default is
-  true.
+``rgw_rdma_checksum``
+  Compute checksums of out-of-band transfers. The gateway reports them
+  in ``x-amz-rdma-checksum-<algorithm>``, and compares whole-object
+  passthrough GETs with the stored checksum. An OSD-direct PUT computes
+  them whatever this option says. The default is true. See
+  `Integrity`_.
 
-libfabric endpoint (``ofi``):
+RC sessions:
 
-* ``rgw_ofi_provider``: the provider. It must match the OSDs'
-  ``osd_ofi_provider``. The default is ``tcp``.
-* ``rgw_ofi_domain`` and ``rgw_ofi_node``: the domain and the local
-  address to bind. The address must be reachable from the OSDs. When
-  they are empty, the provider chooses.
-* ``rgw_rdma_rekey_windows``: give a relay window a new memory key when
-  its session ends, so that no OSD write meant for the session can land
-  in the next one. The default is true. See `Reusing a window`_.
-
-cuObject server (``cuobj``):
-
-* ``rgw_cuobj_rdma_ip`` and ``rgw_cuobj_rdma_port``: its address and
-  port. The default port is 20886. The address has no default, and the
-  cuObject server does not start without it.
-* ``rgw_cuobj_buffer_size`` and ``rgw_cuobj_buffer_count``: the staging
-  buffers, 128 buffers of 8 MiB by default.
-* ``rgw_cuobj_num_dcis``: the DC initiators, 128 by default.
-* ``rgw_cuobj_dc_key``: the DC key of the server and of the relay DC
-  target. It must match the clients' key and ``osd_cuobj_dc_key``. The
-  default is ``0xffeeddcc``.
-
-RC clients:
-
-* ``rgw_rdma_rc_enabled``: serve RC sessions. The default is false.
-* ``rgw_rdma_rc_device``, ``rgw_rdma_rc_gid_hint``,
-  ``rgw_rdma_rc_port`` and ``rgw_rdma_rc_gid_index``: select the verbs
-  device, port and GID.
-* ``rgw_rdma_rc_buffer_size`` and ``rgw_rdma_rc_buffer_count``: the
-  session buffers, 16 buffers of 64 MiB by default. Each session holds
-  one buffer from PREPARE until the session ends. A buffer that an OSD
-  write can still land in stays out of use after that, for the pool's
-  lease plus drain and, when it is re-keyed, for 10 s at least. See
-  `GET relay`_. Such a buffer no longer counts against its user's
-  session limit, but no PREPARE can take it until then. A transfer
-  larger than one buffer is refused with ``413``.
 * ``rgw_rdma_rc_max_sessions`` and ``rgw_rdma_rc_max_sessions_per_user``:
   the session limits, 1024 and 64 by default. A PREPARE over a limit,
-  or one that finds no free buffer, gets ``503 SlowDown``.
+  or one that finds no room in the arena, gets ``503 SlowDown``.
 * ``rgw_rdma_rc_send_depth``: the writes to the client that can be in
   flight for one session, 64 by default.
 * ``rgw_rdma_rc_prepare_timeout_ms`` and ``rgw_rdma_rc_exec_timeout_ms``:
   how long a session waits for READY, and how long a transfer can take,
   100 s and 30 s by default.
 
+Each session holds one buffer of the arena from PREPARE until the
+session ends. A buffer that an OSD write can still land in stays out of
+use after that, for the pool's lease plus drain and, when it is
+re-keyed, for 10 s at least. See `GET relay`_. Such a buffer no longer
+counts against its user's session limit, but no PREPARE can take it
+until then. A transfer larger than 64 MiB is refused with ``413``.
+
 OSD options
 -----------
 
-Executors and out-of-band behavior:
+``osd_oob_cutoff_policy``
+  What the OSD does when its libfabric executor cannot cut off writes
+  in time. With ``warn``, the default, a cut-off that fails stops the
+  executor and raises ``OOB_DELIVERY_UNSAFE``. A quick cut-off that
+  ends later than the tolerance raises ``OOB_CUTOFF_PAST_TOLERANCE``,
+  and delivery goes on. With ``disable``, such a late cut-off also
+  stops the executor. With ``abort``, the OSD exits in both cases. See
+  `Fencing a window before reuse`_.
 
-* ``osd_oob_transports``: the executors that the OSD starts, in order
-  of preference. ``ofi`` starts the libfabric executor and ``cuobj``
-  starts the cuObject executor. The default is empty.
-* ``osd_oob_buffer_size`` and ``osd_oob_buffer_count``: the staging
-  buffers of each executor, 16 buffers of 16 MiB by default. A buffer
-  must hold the largest read that is delivered out of band, such as a
-  gateway stripe (``rgw_get_obj_max_req_size``, 4 MiB by default). The
-  libfabric executor delivers a read inline when it does not fit or
-  finds no free buffer. The cuObject executor registers a one-time
-  buffer for it instead, of up to four times ``osd_oob_buffer_size``,
-  which is slower. A larger read is delivered inline.
-* ``osd_oob_pull``: let the executors pull the payload of a write out of
-  client memory, for an OSD-direct PUT. The default is true. The
-  libfabric executor asks its provider for RMA reads only when this is
-  on. A provider without them still starts, for delivery only. See
-  `OSD-direct PUT`_.
-* ``osd_oob_gather``: lend windows when this OSD is the primary of an
-  erasure-coded read. The default is false. The first transport in
-  ``osd_oob_transports`` that started lends them, and its executor
-  registers them when it starts, so a change takes effect only when the
-  OSD restarts.
-* ``osd_oob_window_size`` and ``osd_oob_window_count``: the window
-  pool, 16 windows of 8 MiB by default. A shard read larger than a
-  window, or one that finds no free window, is returned inline.
-* ``osd_oob_rekey_windows``: give a libfabric gather window a new memory
-  key when it is released, so that no write meant for an earlier gather
-  can land in a later one. The default is true. See `Reusing a window`_.
-* ``osd_oob_cutoff_failure``: what the OSD does when the libfabric
-  executor fails to cut off writes, or when the close or cancel itself
-  takes longer than the tolerance. With
-  ``osd_oob_cutoff_late_fail_closed``, a cut-off that ends later than the
-  tolerance counts too. ``disable``, the default, stops the libfabric
-  executor and raises ``OOB_DELIVERY_UNSAFE``. ``abort`` makes the OSD
-  exit. See `Fencing a window before reuse`_.
-* ``osd_oob_cutoff_late_tolerance``: how late a cut-off may end, past the
-  budget it protects, and still be only counted and warned of
-  (``OOB_CUTOFF_LATE``). A quick cut-off that ends later is counted too,
-  logged to the cluster log, and raises ``OOB_CUTOFF_PAST_TOLERANCE``;
-  delivery goes on. A close or cancel that itself takes longer fails.
-  The default is 1000 ms.
-* ``osd_oob_cutoff_late_fail_closed``: stop the libfabric executor when
-  a quick cut-off ends later than the tolerance, instead of logging it
-  and raising ``OOB_CUTOFF_PAST_TOLERANCE``. The default is false.
-* ``osd_oob_cutoff_late_alert_period``: how long ``OOB_CUTOFF_LATE`` and
-  ``OOB_CUTOFF_PAST_TOLERANCE`` stay raised after the latest late
-  cut-off. The default is an hour.
+``osd_oob_cutoff_late_tolerance``
+  How late a cut-off can end, past the budget it protects, and still be
+  only counted and warned of (``OOB_CUTOFF_LATE``). A close or cancel
+  that itself takes longer fails. The default is 1000 ms.
 
-Only the libfabric executor cuts off writes, so these four options
-apply to it alone. The cuObject executor stops waiting ahead of the
-deadline instead; see `Fencing a window before reuse`_.
+Only the libfabric executor cuts off writes, so these two options apply
+to it alone. The cuObject executor stops waiting ahead of the deadline
+instead. See `Fencing a window before reuse`_.
 
-Erasure-coded reads:
-
-* ``osd_ec_repair_on_read``: have the primary repair a shard whose
-  store failed a client read with a media error. The default is true.
-  See `Shard read errors`_.
-
-libfabric executor (``ofi``):
-
-* ``osd_ofi_provider``: the provider. The default is ``tcp``.
-* ``osd_ofi_domain`` and ``osd_ofi_node``: the domain, such as an RDMA
-  device or a network interface, and the local address to bind. When
-  they are empty, the provider chooses.
-
-cuObject executor (``cuobj``):
-
-* ``osd_cuobj_rdma_ip``: the RDMA interface address. The default is the
-  OSD's public address. You must set it when the RDMA adapter is not
-  the public-network interface.
-* ``osd_cuobj_rdma_port``: the local ``rdma_cm`` port. The default, 0,
-  lets the library choose. Clients never connect to this port.
-* ``osd_cuobj_num_dcis``: the DC initiators, 128 by default. Use at
-  least the number of OSD op worker threads.
-* ``osd_cuobj_dc_key``: the DC key. It must match the key of the client
-  library across the cluster. The default is ``0xffeeddcc``, the
-  library's default.
+``osd_ec_repair_on_read``
+  Have the primary repair a shard whose store failed a client read with
+  a media error. The default is true. See `Shard read errors`_.
 
 Operations
 ==========
@@ -1558,6 +1662,9 @@ Limitations
   them, for up to the DC retry budget.
 * An OSD copies each read into a staging buffer. It does not register
   the read's own buffers.
+* An OSD runs one libfabric endpoint, so ``oob_cluster_transport`` and
+  ``oob_client_transports`` can name one libfabric provider between
+  them. See `Choosing transports`_.
 * Every call into one libfabric endpoint is serialized, except the
   adding and removing of peers on a provider that offers
   ``FI_THREAD_SAFE``.
@@ -1566,9 +1673,9 @@ Limitations
 * A split read, erasure-coded shard-direct or replicated balanced,
   delivers a sparse read inline.
 * Only cuObject clients can PUT with ``x-amz-rdma-token`` in
-  gateway-staged mode. The object must fit one of the gateway's staging
-  buffers (``rgw_cuobj_buffer_size``), and a PUT that finds no free
-  buffer large enough fails with ``503``. Libfabric clients have no
+  gateway-staged mode. The object must fit one buffer of the gateway's
+  arena, 64 MiB, and a PUT that finds no room fails with ``503``.
+  Libfabric clients have no
   gateway-staged mode, so a libfabric GET that cannot use passthrough
   gets the HTTP body. A PUT with a body and a libfabric token is read
   over HTTP, as a gateway that does not run its cuObject server reads

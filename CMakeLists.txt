@@ -596,6 +596,10 @@ if(WITH_CUOBJ)
   # osd_cuobj.cc uses ibverbs types; make IBVerbs::verbs exist even
   # when WITH_RDMA (the async messenger transport) is disabled
   find_package(verbs REQUIRED)
+  # the OSD's gather windows sit behind a DC target, which
+  # osd_dc_target.cc creates with the mlx5 direct verbs
+  find_path(MLX5DV_INCLUDE_DIR infiniband/mlx5dv.h REQUIRED)
+  find_library(MLX5_LIBRARY mlx5 REQUIRED)
 endif()
 # out-of-band delivery over libfabric: one transport for the OSD
 # executor, EC gather windows and the gateway's relay window, on any

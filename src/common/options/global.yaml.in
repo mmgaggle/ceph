@@ -245,7 +245,9 @@ options:
     register it, and take their staging buffers, gather windows and session
     buffers from it, each buffer at most 64 MiB. Each OSD allocates its own,
     so a host with many OSDs needs a smaller value in the osd section. The
-    memory is locked, so give the daemons LimitMEMLOCK=infinity.
+    memory is locked, so give the daemons LimitMEMLOCK=infinity. It is
+    mapped outside the heap, so the OSD's cache autotuner does not count it,
+    and an OSD uses up to osd_memory_target plus oob_memory.
   default: 2_G
   services:
   - osd
@@ -253,6 +255,7 @@ options:
   see_also:
   - oob_client_transports
   - oob_cluster_transport
+  - osd_memory_target
   flags:
   - startup
 - name: cuobj_dc_key

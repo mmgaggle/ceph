@@ -19,7 +19,9 @@
 #include "common/config.h"
 #include "common/pick_address.h"
 #include "msg/msg_types.h"
+#include "include/ipaddr.h"
 #include "include/scope_guard.h"
+#include "include/str_list.h"
 
 namespace fs = std::filesystem;
 
@@ -115,6 +117,28 @@ std::string device_of_iface(const std::string& sysfs, const std::string& iface)
   }
   std::sort(devs.begin(), devs.end());
   return devs.empty() ? std::string{} : devs.front();
+}
+
+/// what is wrong with oob_network, empty when nothing is: an entry that
+/// is not a subnet, on which find_ip_in_subnet_list() would exit rather
+/// than return, or no entry, which would match every address (and with
+/// oob_network_interface exit too). oob_network_interface needs no
+/// check: a name that no interface has matches none
+std::string check_networks(const std::string& nets)
+{
+  const auto subnets = get_str_list(nets);
+  if (subnets.empty()) {
+    return "oob_network '" + nets + "' names no subnet";
+  }
+  for (const auto& n : subnets) {
+    sockaddr_storage net;
+    unsigned prefix_len;
+    if (!parse_network(n.c_str(), &net, &prefix_len)) {
+      return "oob_network entry '" + n + "' is not a subnet, such as "
+	"10.0.0.0/24 or fd00::/64";
+    }
+  }
+  return {};
 }
 
 /// the interface that carries addr, or empty
@@ -228,6 +252,10 @@ int resolve(CephContext* cct, std::string_view fallback, location_t* out,
     out->addr = addr;
     out->source = "oob_addr";
   } else if (!nets.empty()) {
+    if (auto bad = check_networks(nets); !bad.empty()) {
+      *err = std::move(bad);
+      return -EINVAL;
+    }
     ifaddrs* ifa = nullptr;
     if (getifaddrs(&ifa) < 0) {
       const int e = errno;

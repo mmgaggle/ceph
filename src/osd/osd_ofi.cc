@@ -111,11 +111,13 @@ int OSDOfi::init(const std::string& provider,
       if (!windows) {
 	derr << "registering the gather windows: " << err
 	     << "; gathers stay inline" << dendl;
+	// nothing registered them: the run goes back to staging
+	arena->unreserve(mem, WINDOW_SIZE * WINDOW_COUNT);
       }
     } else {
       derr << "oob_memory has no room for " << WINDOW_COUNT
-	   << " gather windows of " << WINDOW_SIZE << " bytes; gathers stay "
-	   << "inline" << dendl;
+	   << " gather windows of " << WINDOW_SIZE << " bytes and for "
+	   << "staging; gathers stay inline" << dendl;
     }
   }
   dout(1) << "libfabric delivery up: " << ep->describe() << ", staging in "

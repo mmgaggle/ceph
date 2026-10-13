@@ -5,12 +5,19 @@
 #include "common/oob_arena.h"
 #include "common/oob_config.h"
 
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
 
+#include <net/if.h>
 #include <unistd.h>
 
+#include <boost/smart_ptr/intrusive_ptr.hpp>
+
+#include "common/ceph_context.h"
+#include "common/config.h"
 #include "gtest/gtest.h"
 
 using ceph::rdma::parse_rdma_token;
@@ -225,6 +232,53 @@ TEST(OobConfig, OfiWhere)
   EXPECT_EQ("", node);
 }
 
+// A malformed oob_network, or oob_network_interface without a subnet, is
+// an error that the daemon reports, and runs on without out-of-band
+// transfers: the subnet parser that picks the address exits instead.
+TEST(OobConfig, ResolveRejectsMalformedNetworks)
+{
+  boost::intrusive_ptr<CephContext> cct{
+    new CephContext(CEPH_ENTITY_TYPE_OSD), false};
+  cct->_conf._clear_safe_to_start_threads();  // so we can set configs
+  cct->_conf.set_val("oob_addr", "");
+  cct->_conf.set_val("oob_network_interface", "");
+  ceph::oob::location_t loc;
+  std::string err;
+  for (const char* bad : {"10.10.0.5", "10.10.0.0/255.255.0.0",
+			  "10.10.0.0/", "10.10.0.0/16,fd00::", "nonsense/8",
+			  " , "}) {
+    cct->_conf.set_val("oob_network", bad);
+    err.clear();
+    EXPECT_EQ(-EINVAL, ceph::oob::resolve(cct.get(), "", &loc, &err))
+      << bad;
+    EXPECT_NE(std::string::npos, err.find("oob_network")) << err;
+    EXPECT_TRUE(loc.addr.empty());
+  }
+  // interfaces with no subnet to pick from them
+  cct->_conf.set_val("oob_network", ",");
+  cct->_conf.set_val("oob_network_interface", "eth0");
+  EXPECT_EQ(-EINVAL, ceph::oob::resolve(cct.get(), "", &loc, &err));
+  // a well-formed subnet that no address of the host is in (TEST-NET-1)
+  cct->_conf.set_val("oob_network_interface", "");
+  cct->_conf.set_val("oob_network", "192.0.2.0/24");
+  EXPECT_EQ(-EADDRNOTAVAIL, ceph::oob::resolve(cct.get(), "", &loc, &err));
+  // a name longer than an interface's, such as an altname, is only a
+  // name that no interface has: the others in the list still pick the
+  // address
+  const std::string altname(IFNAMSIZ + 4, 'e');
+  cct->_conf.set_val("oob_network_interface", altname);
+  EXPECT_EQ(-EADDRNOTAVAIL, ceph::oob::resolve(cct.get(), "", &loc, &err));
+  cct->_conf.set_val("oob_network", "127.0.0.0/8");
+  cct->_conf.set_val("oob_network_interface", "lo," + altname);
+  err.clear();
+  const int r = ceph::oob::resolve(cct.get(), "", &loc, &err);
+  EXPECT_NE(-EINVAL, r) << err;
+  if (r == 0) {
+    // the loopback is up
+    EXPECT_EQ("127.0.0.1", loc.addr);
+  }
+}
+
 
 TEST(RdmaToken, OfiShape)
 {
@@ -343,5 +397,43 @@ TEST(OobArena, Reserve)
   EXPECT_TRUE(a->reserve(Arena::MAX));
   EXPECT_FALSE(a->alloc(Arena::MAX));
   a->free(s);
+}
+
+TEST(OobArena, ReserveLeavesStaging)
+{
+  using ceph::oob::Arena;
+  std::string err;
+  auto a = Arena::create(2 * Arena::MAX, &err);
+  ASSERT_TRUE(a) << err;
+  // mapped on a huge page, and writable from end to end
+  EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(a->base()) % (2 << 20));
+  std::memset(a->base(), 0xab, 4096);
+  std::memset(a->base() + a->size() - 4096, 0xcd, 4096);
+  // a run of every block would leave transfers nowhere to stage
+  EXPECT_FALSE(a->reserve(2 * Arena::MAX));
+  EXPECT_FALSE(a->reserve(Arena::MAX + 1));
+  EXPECT_EQ(0u, a->stats().reserved);
+  char* w = a->reserve(Arena::MAX);
+  ASSERT_TRUE(w);
+  EXPECT_EQ(a->base() + Arena::MAX, w);
+  // the last block stays for buffers
+  EXPECT_FALSE(a->reserve(Arena::MAX));
+  auto s = a->alloc(Arena::MAX);
+  ASSERT_TRUE(s);
+  EXPECT_FALSE(a->alloc(Arena::MIN));
+  a->free(s);
+  // a run given back, when its windows did not come up, is for buffers
+  // again, or for another run
+  a->unreserve(w, Arena::MAX);
+  EXPECT_EQ(0u, a->stats().reserved);
+  auto s1 = a->alloc(Arena::MAX);
+  auto s2 = a->alloc(Arena::MAX);
+  ASSERT_TRUE(s1 && s2);
+  a->free(s1);
+  a->free(s2);
+  EXPECT_EQ(w, a->reserve(Arena::MAX));
+  a->unreserve(w, Arena::MAX);
+  EXPECT_EQ(0u, a->stats().reserved);
+  EXPECT_EQ(0u, a->stats().in_use);
 }
 

@@ -327,6 +327,13 @@ void PrimaryLogPG::OpContext::finish_read(PrimaryLogPG *pg)
     ceph_assert(pg->in_progress_async_reads.front().second == this);
     pg->in_progress_async_reads.pop_front();
 
+    if (this == pg->active_coro_ctx && pg->coro_awaits_reads &&
+	pg->coro_resumer) {
+      // the op's coroutine waits for these reads: it runs the op again,
+      // where the op's sync reads can yield
+      resume_coroutine(pg->coro_resumer);
+      return;
+    }
     // Restart the op context now that all reads have been
     // completed. Read failures will be handled by the op finisher
     pg->execute_ctx(this);
@@ -2634,6 +2641,20 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
           do_op_impl(op_ref);
         }
 
+        // Reads of the op that went async run it again when they
+        // complete. An op with sync reads (a CALL's cls_cxx_read) must
+        // run again here, where they can yield; outside this coroutine
+        // they fail.
+        while (active_coro_ctx && active_coro_ctx->op->ec_sync_read() &&
+               !active_coro_ctx->async_reads_complete()) {
+          dout(20) << "do_op: coroutine op waits for its async reads"
+                   << dendl;
+          coro_awaits_reads = true;
+          yield();
+          coro_awaits_reads = false;
+          execute_ctx(active_coro_ctx);
+        }
+
         // Cleanup
         on_coroutine_complete();
       });
@@ -2654,6 +2675,12 @@ void PrimaryLogPG::on_coroutine_complete()
   ceph_assert(coro_op_in_flight);
   coro_resumer = nullptr;
   coro_op_in_flight = false;
+  // the handles point into this coroutine's stack, which is freed once
+  // it returns; the op's OpContext that runs again outside it (after an
+  // async read) must not find them and yield
+  if (active_coro_op) {
+    active_coro_op->coro_handles.reset();
+  }
   active_coro_op = nullptr;
 
   if (active_coro_ctx) {
@@ -13779,7 +13806,12 @@ void PrimaryLogPG::stop_coroutine()
   dout(20) << __func__ << ": Stopping active coroutine" << dendl;
   // a suspended coroutine is unwound and its stack freed here, on our
   // stack; its pending read completion finds the token gone and skips
-  // the resume
+  // the resume. The op, which on_change() requeues, keeps no handles
+  // into that stack.
+  if (active_coro_op) {
+    active_coro_op->coro_handles.reset();
+  }
+  coro_awaits_reads = false;
   coro_resumer = nullptr;
   coro_op_in_flight = false;
 

@@ -8,11 +8,12 @@
  * a read completion resumes it through a weak reference
  * (ECBackend::objects_read_sync()). Every path must free the
  * coroutine's stack; a stack allocator that counts live stacks checks
- * that.
+ * that. And no path may leave the op handles into that stack.
  */
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <optional>
 
 #include <boost/context/fixedsize_stack.hpp>
@@ -42,7 +43,8 @@ struct witness {
 
 struct FakePG {
   std::shared_ptr<resume_token_t> coro_resumer;
-  std::optional<CoroHandles> handles;
+  std::optional<CoroHandles> handles;  // OpRequest::coro_handles
+  std::weak_ptr<resume_token_t> pending;  // a read's completion holds it
   int finished = 0;
   int locals_destroyed = 0;
 
@@ -53,16 +55,33 @@ struct FakePG {
         witness w{&locals_destroyed};
         handles.emplace(CoroHandles{yield, coro_resumer});
         if (yields) {
-          handles->yield();
+          sync_read();
         }
         ++finished;
-        coro_resumer = nullptr;  // on_coroutine_complete()
+        // on_coroutine_complete()
+        handles.reset();
+        coro_resumer = nullptr;
       });
     resume_coroutine(coro_resumer);
   }
+  // PrimaryLogPG::stop_coroutine()
+  void stop() {
+    handles.reset();
+    coro_resumer = nullptr;
+  }
+  // a read of the op: ECSwitch::objects_read_sync(), which yields on the
+  // handles, or fails without them
+  int sync_read() {
+    if (!handles) {
+      return -EOPNOTSUPP;
+    }
+    pending = handles->resume;
+    handles->yield();
+    return 0;
+  }
   // the read completion of ECBackend::objects_read_sync()
   void read_completes() {
-    if (auto locked = handles->resume.lock(); locked) {
+    if (auto locked = pending.lock(); locked) {
       (*locked)();
     }
   }
@@ -98,7 +117,7 @@ TEST(ECCoroutines, StoppedWhileSuspendedFreesStack)
   FakePG pg;
   pg.start(true);
   EXPECT_EQ(1, live_stacks);
-  pg.coro_resumer = nullptr;  // PrimaryLogPG::stop_coroutine()
+  pg.stop();
   EXPECT_EQ(0, live_stacks);
   EXPECT_EQ(1, pg.locals_destroyed);  // unwound, not abandoned
   pg.read_completes();  // a late completion finds the token gone
@@ -120,4 +139,33 @@ TEST(ECCoroutines, ManyOpsKeepNoStacks)
   EXPECT_EQ(10000, pg.finished);
   EXPECT_EQ(10000, pg.locals_destroyed);
   EXPECT_EQ(0, live_stacks);
+}
+
+TEST(ECCoroutines, NoHandlesOutliveTheCoroutine)
+{
+  // the op's OpContext can run again on the op thread after the
+  // coroutine ended (an async read of the same op completed): its reads
+  // must not yield on the freed stack
+  live_stacks = 0;
+  FakePG pg;
+  pg.start(true);
+  EXPECT_TRUE(pg.handles.has_value());
+  pg.read_completes();
+  EXPECT_EQ(1, pg.finished);
+  EXPECT_EQ(0, live_stacks);
+  EXPECT_FALSE(pg.handles.has_value());
+  EXPECT_EQ(-EOPNOTSUPP, pg.sync_read());
+
+  pg.start(false);
+  EXPECT_EQ(2, pg.finished);
+  EXPECT_FALSE(pg.handles.has_value());
+  EXPECT_EQ(-EOPNOTSUPP, pg.sync_read());
+
+  pg.start(true);
+  pg.stop();
+  EXPECT_EQ(0, live_stacks);
+  EXPECT_FALSE(pg.handles.has_value());
+  EXPECT_EQ(-EOPNOTSUPP, pg.sync_read());
+  pg.read_completes();
+  EXPECT_EQ(2, pg.finished);
 }

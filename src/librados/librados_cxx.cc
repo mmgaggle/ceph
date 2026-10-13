@@ -224,6 +224,23 @@ void librados::ObjectReadOperation::sparse_read(uint64_t off, uint64_t len,
   o->sparse_read(off, len, m, data_bl, prval, truncate_size, truncate_seq);
 }
 
+namespace {
+/// the wire result, as a librados caller sees it
+void copy_rdma_result(const ceph::rdma::oob_result_t& r,
+		      librados::ObjectOperation::rdma_delivery_result* out)
+{
+  out->bytes = r.bytes;
+  out->crc64 = r.crc64;
+  out->crc32c = r.crc32c;
+  out->flags = r.flags;
+  out->ranges.clear();
+  out->ranges.reserve(r.ranges.size());
+  for (const auto& x : r.ranges) {
+    out->ranges.push_back({x.ofs, x.len, x.crc64, x.crc32c});
+  }
+}
+} // anonymous namespace
+
 void librados::ObjectReadOperation::set_rdma_delivery(
     const std::string& token, uint64_t base_offset, uint32_t flags,
     rdma_delivery_result *result)
@@ -252,15 +269,8 @@ void librados::ObjectReadOperation::set_rdma_delivery(
 		ceph::rdma::oob_result_t::FLAG_RESENT);
   o->set_rdma_delivery(token, base_offset, flags,
 		       [result](const ceph::rdma::oob_result_t& r) {
-			 result->bytes = r.bytes;
-			 result->crc64 = r.crc64;
-			 result->crc32c = r.crc32c;
-			 result->flags = r.flags;
-			 result->ranges.clear();
-			 result->ranges.reserve(r.ranges.size());
-			 for (const auto& x : r.ranges) {
-			   result->ranges.push_back(
-			     {x.ofs, x.len, x.crc64, x.crc32c});
+			 if (result) {
+			   copy_rdma_result(r, result);
 			 }
 		       });
 }
@@ -522,23 +532,6 @@ void librados::ObjectWriteOperation::write_full(const bufferlist& bl)
   bufferlist c = bl;
   o->write_full(c);
 }
-
-namespace {
-/// the wire result, as a librados caller sees it
-void copy_rdma_result(const ceph::rdma::oob_result_t& r,
-		      librados::ObjectOperation::rdma_delivery_result* out)
-{
-  out->bytes = r.bytes;
-  out->crc64 = r.crc64;
-  out->crc32c = r.crc32c;
-  out->flags = r.flags;
-  out->ranges.clear();
-  out->ranges.reserve(r.ranges.size());
-  for (const auto& x : r.ranges) {
-    out->ranges.push_back({x.ofs, x.len, x.crc64, x.crc32c});
-  }
-}
-} // anonymous namespace
 
 void librados::ObjectWriteOperation::write_full_pulled(
     uint64_t len, const std::string& token, uint64_t base_offset,

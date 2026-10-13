@@ -148,8 +148,9 @@ struct delivery_t {
   /// FLAG_RANGES)
   static constexpr uint32_t FLAG_CRC64NVME = 1u << 0;
   /// set by the client library on a resent op: every earlier attempt
-  /// got a reply whose result for this op was declined or landed, so
-  /// none of them can still write the window, and the OSD may deliver
+  /// got a reply whose result for this op was declined or landed, or went
+  /// out without its descriptors, so none of them can still write the
+  /// window, and the OSD may deliver
   /// this attempt out of band as it would a first one. An OSD that
   /// does not know the bit delivers inline, as it does any resend.
   static constexpr uint32_t FLAG_PRIOR_SETTLED = 1u << 1;
@@ -290,9 +291,11 @@ struct oob_result_t {
   /// ranges holds one crc_range_t per contiguous placed extent
   static constexpr uint32_t FLAG_RANGES = 1u << 2;
   static constexpr uint32_t FLAG_CRC64_RANGES = FLAG_RANGES;
-  /// set by the OSD: no transfer was started for this op, so nothing of
-  /// it reached the window, and its data is inline. Older OSDs never set
-  /// it, and a reader that does not know it treats the op as inline.
+  /// set by the OSD, or by the client library for an op whose descriptor
+  /// it withheld (require_osd_release below umbrella): no transfer was
+  /// started for this op, so nothing of it reached the window; a read's
+  /// data is inline, and a withheld pull fails. Older OSDs never set it,
+  /// and a reader that does not know it treats the op as inline.
   static constexpr uint32_t FLAG_DECLINED = 1u << 3;
   /// set by the OSD: every write of this op completed, delivery-complete,
   /// before the OSD replied, so nothing of it lands after the reply (bar a

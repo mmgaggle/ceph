@@ -109,7 +109,10 @@ struct ObjectOperation {
   /// means inline for that op): an OSD that can honor one RDMA-writes
   /// that op's read data straight into the client window and returns
   /// only a byte count (plus, on request, a CRC64-NVME of the
-  /// delivered bytes); any other OSD returns the data inline as usual
+  /// delivered bytes); any other OSD returns the data inline as usual.
+  /// While the cluster's require_osd_release is below umbrella the
+  /// Objecter withholds them, as OSDs that cannot honor them may
+  /// remain, and those ops' results read declined
   boost::container::small_vector<ceph::rdma::delivery_t, osdc_opvec_len>
     rdma_delivery;
   /// out: per-op out-of-band delivery result (bytes 0 = inline)
@@ -118,10 +121,12 @@ struct ObjectOperation {
   /// results a caller takes through a callback rather than a pointer:
   /// one handler per op, indexed like ops, that the Objecter invokes
   /// from the reply's out-of-band copy (after the pointer form's copy,
-  /// before the op's completion) with the wire result, or an all-zero
-  /// one when the reply carries none for that op; allocated only when
-  /// that form is used so the common case pays one pointer (neorados
-  /// embeds this struct in fixed storage)
+  /// before the op's completion) with the wire result; when the reply
+  /// carries none for that op, an all-zero one, or a declined one when
+  /// the attempt went out with its descriptors withheld (see
+  /// rdma_delivery); allocated only when that form is used so the
+  /// common case pays one pointer (neorados embeds this struct in
+  /// fixed storage)
   using rdma_oob_handler_t =
     fu2::unique_function<void(const ceph::rdma::oob_result_t&) &&>;
   std::unique_ptr<std::vector<rdma_oob_handler_t>> rdma_oob_handler;
@@ -1733,6 +1738,10 @@ struct ObjectOperation {
     out_handler.resize(sops.size());
     out_rval.resize(sops.size());
     out_ec.resize(sops.size());
+    // the copied ops go inline: no out-of-band delivery is carried over
+    rdma_delivery.assign(sops.size(), ceph::rdma::delivery_t{});
+    rdma_oob_result.assign(sops.size(), nullptr);
+    rdma_oob_handler.reset();
     for (uint32_t i = 0; i < sops.size(); i++) {
       out_bl[i] = &sops[i].outdata;
       out_rval[i] = &sops[i].rval;
@@ -2146,6 +2155,10 @@ public:
     /// set by a split read that ends in EAGAIN: every sub-read was
     /// answered declined or landed, so the retry is a first attempt
     bool rdma_split_settled = false;
+    /// the attempt in flight went out without its descriptors (the
+    /// cluster may hold OSDs that cannot honor them); its results read
+    /// declined, as nothing of it can go out of band
+    bool rdma_withheld = false;
     boost::container::small_vector<ceph::rdma::oob_result_t*, osdc_opvec_len>
       rdma_oob_result;
     /// callback-form results, taken over from the ObjectOperation at
@@ -2699,6 +2712,17 @@ public:
   /// that nothing was delivered.
   static void deliver_rdma_oob_result(Op *op, unsigned i,
                                       const ceph::rdma::oob_result_t& r);
+  /// hand every op's out-of-band delivery result from a reply's
+  /// oob_results (aligned with the ops, or empty) to its caller; the
+  /// descriptor-bearing ops of a withheld attempt read declined
+  static void deliver_rdma_oob_results(
+    Op *op, const std::vector<ceph::rdma::oob_result_t>& oob);
+  /// the descriptors the attempt about to be sent carries (call once
+  /// per attempt, after counting it in attempts): none when op requests
+  /// no delivery, and none when send is false - the cluster may hold
+  /// OSDs that cannot honor them - which marks the attempt withheld
+  static std::vector<ceph::rdma::delivery_t> stamp_rdma_attempt(
+    Op *op, bool send);
 private:
   void complete_op_reply(Op *op, boost::system::error_code handler_error, OSDSession *s, std::unique_lock<std::shared_mutex> &sl, int rc);
   static bool is_pg_changed(

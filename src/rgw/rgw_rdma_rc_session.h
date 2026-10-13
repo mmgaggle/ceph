@@ -17,7 +17,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,7 +27,7 @@
 #include "acconfig.h"
 #include "include/common_fwd.h"
 
-namespace ceph::oob { class Arena; }
+#include "common/oob_arena.h"
 #include "rgw_rdma_rc_transport.h"
 #include "rgw_rdma_rc_wire.h"
 
@@ -40,11 +39,12 @@ namespace rgw::rdma::dc { class Target; }
  *
  * A session is one transfer: created by PREPARE, driven by READY,
  * destroyed by the FINAL reply, CANCEL, or the expiry reaper. Each
- * session owns an RC Connection and one buffer from the registered
- * pool. For a GET the buffer is where the object lands (pushed by the
- * OSDs straight into it when the gateway's DC target is available,
- * copied in otherwise) before the RC push to the client; for a PUT it
- * is the staging region the client writes into.
+ * session owns an RC Connection and one buffer of the arena, registered
+ * for that session alone. For a GET the buffer is where the object
+ * lands (pushed by the OSDs straight into it when the gateway's DC
+ * target or a libfabric window is available, copied in otherwise)
+ * before the RC push to the client; for a PUT it is the staging region
+ * the client writes into.
  *
  * The REST handlers call in on radosgw request threads; the reaper
  * runs on its own thread. The service mutex covers the session table
@@ -55,9 +55,16 @@ namespace rgw::rdma::rc {
 
 using clock = std::chrono::steady_clock;
 
+/// a session's buffer: a slice of the arena, which goes back to the
+/// arena when the session ends, once nothing can write into it
 struct Buffer {
+  ceph::oob::Arena::slice_t slice;
   void* ptr = nullptr;
+  /// the session's size, which every registration covers exactly
   size_t size = 0;
+  /// a PUT's own protection domain, which only mr and the session's
+  /// queue pair are on; null for a GET, whose mr is on the device's
+  ibv_pd* pd = nullptr;
   ibv_mr* mr = nullptr;
   /// delivery descriptor OSDs write this window through: a cuObject DC
   /// descriptor or a libfabric one; empty when OSD-direct is off
@@ -65,11 +72,10 @@ struct Buffer {
   /// the buffer's libfabric window, when osd_token is a libfabric one
   uint64_t ofi_window = 0;
   bool ofi_registered = false;
-  bool in_use = false;
   /// an OSD may still push into a window after its relay ended (see
-  /// Service::finish()); the window stays out of the pool until this
+  /// Service::finish()); the buffer stays out of the arena until this
   /// passes
-  clock::time_point quarantined_until = clock::time_point::min();
+  clock::time_point held_until = clock::time_point::min();
 };
 
 enum class Op : uint8_t { GET = 0, PUT = 1 };
@@ -110,7 +116,7 @@ struct Session {
   uint32_t client_mr_rkey = 0;
 
   Connection conn;
-  Buffer* buf = nullptr;
+  std::unique_ptr<Buffer> buf;
 
   State state = State::PREPARED;
   clock::time_point created = clock::now();
@@ -133,8 +139,8 @@ enum class Error {
   STALE,        ///< session gone or already terminal (404)
   NO_SESSION,   ///< unknown id (404)
   LIMIT,        ///< session or per-user limit reached (503)
-  NO_BUFFER,    ///< no pool buffer free (503)
-  TOO_LARGE,    ///< transfer exceeds the pool buffer size (413)
+  NO_BUFFER,    ///< no room in the arena (503)
+  TOO_LARGE,    ///< transfer exceeds the largest buffer (413)
   WIRE,         ///< verbs failure (500)
   UNSUPPORTED,  ///< no RDMA device (501)
   INTERNAL,
@@ -186,7 +192,7 @@ class Service {
 
   ~Service();
 
-  /// true once the device is open and the pool registered
+  /// true once the device is open
   bool available() const { return dev.is_open(); }
   /// true when the gateway exposes its windows to the OSDs, over a DC
   /// target or libfabric
@@ -213,11 +219,12 @@ class Service {
   /// end the data phase. OK moves to COMPLETING and tears the session
   /// down once the handler is done with it; BUSY re-arms the queue pair
   /// and returns to PREPARED for another READY; anything else reaps.
-  /// quarantine keeps the buffer out of the pool for that long after
+  /// quarantine keeps the buffer out of the arena for that long after
   /// teardown (a relay that may still have OSD writes in flight), and
-  /// the libfabric key quarantine at least when the buffer is re-keyed.
-  /// A BUSY with a quarantine reaps too: another READY would relay
-  /// through the same buffer while those writes may still land in it.
+  /// the libfabric key quarantine at least when it had a libfabric
+  /// window. A BUSY with a quarantine reaps too: another READY would
+  /// relay through the same buffer while those writes may still land in
+  /// it.
   void finish(Session* s, Outcome outcome, uint64_t bytes,
               std::chrono::milliseconds quarantine = {});
 
@@ -231,14 +238,27 @@ class Service {
   int do_init(CephContext* cct);
   void do_shutdown();
 
-  /// a free buffer of at least needed bytes: the smallest that the pool
-  /// has, or a new one from the arena, registered for remote access and,
-  /// with OSD-direct relay, exposed to the OSDs. Buffers stay in the
-  /// pool once made, and get a new key when released.
-  Buffer* acquire_buffer(size_t needed);
-  /// register a new buffer of the arena; null when the arena has no room
-  Buffer* make_buffer(size_t needed);
-  void release_buffer(Buffer* b, std::chrono::milliseconds quarantine);
+  /// a buffer of the arena for one session of op and size bytes,
+  /// registered for that session alone: writable from the network only
+  /// by whoever writes into it (the client of a PUT, through the queue
+  /// pair that shares the buffer's own protection domain; the OSDs of a
+  /// relay through the DC target), and, for a GET with OSD-direct relay,
+  /// exposed to the OSDs. Null when the arena has no room. Takes no lock
+  /// of the service.
+  std::unique_ptr<Buffer> make_buffer(Op op, size_t size);
+  /// close what exposes the buffer of a session whose queue pair is gone,
+  /// and give it back to the arena; or, when an OSD write may still land
+  /// in it, return it to be held until its held_until. Takes no lock of
+  /// the service.
+  std::unique_ptr<Buffer> release_buffer(std::unique_ptr<Buffer> b,
+                                         std::chrono::milliseconds quarantine);
+  /// deregister the buffer and give its slice back to the arena; a slice
+  /// whose registration does not go away never goes back
+  void free_buffer(Buffer& b);
+#ifdef WITH_OOB_OFI
+  /// whether closing a libfabric window revokes its key
+  bool ofi_close_revokes_key();
+#endif
   bool limits_take(const std::string& principal);
   void limits_release(const std::string& principal);
   std::string new_session_id();
@@ -254,10 +274,12 @@ class Service {
 #endif
 #ifdef WITH_OOB_OFI
   std::unique_ptr<ceph::ofi::Endpoint> ofi_ep;
+  /// false when a closed window's key keeps working, as with a
+  /// provider's registration cache; every relay buffer is then held for
+  /// the key quarantine
+  bool ofi_revokes_keys = false;
 #endif
   ceph::oob::Arena* arena = nullptr;
-  /// a deque, so that a buffer stays where it is while the pool grows
-  std::deque<Buffer> pool;
   size_t buf_size = 0;
 
   uint32_t max_sessions = 0;
@@ -269,6 +291,9 @@ class Service {
   mutable std::mutex mtx;
   std::map<std::string, std::unique_ptr<Session>> sessions;
   std::map<std::string, uint32_t> per_user;
+  /// buffers of ended sessions that an OSD write may still land in; the
+  /// reaper gives each back to the arena once its held_until passes
+  std::vector<std::unique_ptr<Buffer>> held;
   std::atomic<bool> closing{false};
 
   std::thread reaper;

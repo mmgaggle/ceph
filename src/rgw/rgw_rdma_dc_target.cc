@@ -85,7 +85,8 @@ int Target::open(CephContext* cct, rc::Device& dev, uint64_t dc_key)
   qpa.qp_state = IBV_QPS_INIT;
   qpa.pkey_index = 0;
   qpa.port_num = dev.port_num();
-  qpa.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+  // the OSDs only write into relay buffers
+  qpa.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
   if (ibv_modify_qp(dct, &qpa, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
                     IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
     lderr(cct) << "rgw_rdma_dc: DCT -> INIT failed: " << cpp_strerror(errno)

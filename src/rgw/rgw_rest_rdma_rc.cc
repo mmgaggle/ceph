@@ -121,47 +121,12 @@ std::string principal_of(const req_state* s)
   return os.str();
 }
 
-/// every x-amz-rdma-* request header must be covered by the signature,
-/// or something on the path could rewrite the target or endpoint
-/// without invalidating it
-int check_signed(const DoutPrefixProvider* dpp, const req_state* s)
-{
-  std::vector<std::string> names;
-  for (const auto& [k, v] : s->info.env->get_map()) {
-    if (k.rfind("HTTP_X_AMZ_RDMA_", 0) == 0) {
-      std::string n = k.substr(5);
-      for (auto& c : n) {
-        c = c == '_' ? '-' : static_cast<char>(std::tolower(c));
-      }
-      names.push_back(std::move(n));
-    }
-  }
-  if (const char* auth = s->info.env->get("HTTP_AUTHORIZATION"); auth) {
-    const std::string_view a{auth};
-    if (a.rfind("AWS ", 0) == 0) {
-      return 0;  // SigV2 signs every x-amz-* header
-    }
-    if (auto list = sigv4_signed_headers(a); list && all_signed(*list, names)) {
-      return 0;
-    }
-  } else if (s->info.args.exists("x-amz-signedheaders")) {
-    if (all_signed(s->info.args.get("x-amz-signedheaders"), names)) {
-      return 0;
-    }
-  } else if (s->info.args.exists("AWSAccessKeyId")) {
-    return 0;  // presigned SigV2
-  }
-  ldpp_dout(dpp, 4) << "hipobj-rc: request carries unsigned x-amz-rdma-* headers"
-                    << dendl;
-  return -EACCES;
-}
-
 int check_requester(const DoutPrefixProvider* dpp, req_state* s)
 {
   if (s->auth.identity->is_anonymous()) {
     return -EACCES;
   }
-  return check_signed(dpp, s);
+  return check_signed(dpp, s->info);
 }
 
 /// PREPARE fields shared by GET and PUT
@@ -356,7 +321,7 @@ bool GetOp::eligible()
 int GetOp::reap_one()
 {
   ibv_wc wc{};
-  switch (sess->conn.poll_one(wc, sess->deadline)) {
+  switch (sess->conn.poll_one(wc, sess->deadline, s->yield)) {
   case Completion::OK:
     sess->conn.reaped();
     return 0;
@@ -732,10 +697,13 @@ void PutOp::execute(optional_yield y)
   sess = claimed;
 
   // the receive was armed at PREPARE; the client writes once the pair
-  // is up and signals the session cookie in the immediate
+  // is up and signals the session cookie in the immediate. The queue
+  // pair shares a protection domain with the staging buffer alone, so a
+  // write that it took landed there, and one of the session's size
+  // filled it; PREPARE zeroed it besides (see Service::make_buffer())
   ibv_wc wc{};
   Outcome outcome = Outcome::OK;
-  switch (sess->conn.poll_one(wc, sess->deadline)) {
+  switch (sess->conn.poll_one(wc, sess->deadline, y)) {
   case Completion::OK:
     if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM ||
         !(wc.wc_flags & IBV_WC_WITH_IMM) ||

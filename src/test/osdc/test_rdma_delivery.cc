@@ -3,6 +3,7 @@
 
 #include "common/rdma_token.h"
 #include "common/crc64nvme.h"
+#include "messages/MOSDOpReply.h"
 #include "osdc/Objecter.h"
 #include "rgw/rgw_rdma_fence.h"
 
@@ -11,10 +12,9 @@
 
 #include "gtest/gtest.h"
 
-// Pin the rdma delivery descriptor wire format (carried as a trailing
-// per-op vector on the MOSDOp for header.version >= 10, aligned with
-// the ops). Any change here is a wire format change and needs a struct
-// version bump.
+// Pin the rdma delivery descriptor wire format (carried as a per-op
+// vector after the v9 MOSDOp fields, aligned with the ops). Any change
+// here is a wire format change and needs a struct version bump.
 TEST(RdmaDelivery, WireFormat)
 {
   ceph::rdma::delivery_t d;
@@ -217,6 +217,171 @@ TEST(RdmaDelivery, PerOpVectorRoundTrip)
   EXPECT_EQ(4096u, out2[2].base_offset);
   EXPECT_EQ(ceph::rdma::delivery_t::FLAG_CRC64NVME, out2[2].flags);
   EXPECT_TRUE(p.end());
+}
+
+// The descriptors ride on a v9 MOSDOp after its v9 fields, and only
+// when some op carries one: an OSD that does not know them (upstream
+// Umbrella, which advertises SERVER_UMBRELLA too) stops decoding before
+// them and serves the request inline, and a request without any is the
+// plain v9 encoding. The reply's results trail a v8 MOSDOpReply alike.
+TEST(RdmaDelivery, MessagesCarryRdmaFieldsAsSuffix)
+{
+  const hobject_t hobj(object_t("obj"), "", CEPH_NOSNAP, 0x1234, 1, "");
+  spg_t pgid(pg_t(0x1234, 1));
+  const std::vector<ceph::rdma::delivery_t> deliveries = {
+    ceph::rdma::delivery_t{},                          // op 0: inline
+    ceph::rdma::delivery_t{"aa:bb:opaque", 4096,
+                           ceph::rdma::delivery_t::FLAG_CRC64NVME},
+  };
+
+  // what a client sends, with and without descriptors (the Objecter's
+  // MOSDOp; an OSD decodes into the std::vector one)
+  using ClientMOSDOp = _mosdop::MOSDOp<osdc_opvec>;
+  auto encode_op = [&](bool with_deliveries) {
+    auto m = ceph::make_message<ClientMOSDOp>(
+      1, 42, hobj, pgid, 10, CEPH_OSD_FLAG_READ, CEPH_FEATURES_ALL);
+    m->ops.resize(2);
+    m->ops[0].op.op = CEPH_OSD_OP_STAT;
+    m->ops[1].op.op = CEPH_OSD_OP_READ;
+    m->ops[1].op.extent.offset = 0;
+    m->ops[1].op.extent.length = 4096;
+    if (with_deliveries) {
+      m->set_rdma_deliveries(std::vector(deliveries));
+    }
+    m->encode_payload(CEPH_FEATURES_ALL);
+    return m;
+  };
+  auto plain = encode_op(false);
+  auto with = encode_op(true);
+  EXPECT_EQ(9, plain->get_header().version);
+  EXPECT_EQ(9, with->get_header().version);
+
+  // the plain request, then the descriptors and nothing else
+  bufferlist tail;
+  encode(deliveries, tail);
+  const auto plain_len = plain->get_payload().length();
+  ASSERT_EQ(plain_len + tail.length(), with->get_payload().length());
+  bufferlist prefix, suffix;
+  prefix.substr_of(with->get_payload(), 0, plain_len);
+  suffix.substr_of(with->get_payload(), plain_len, tail.length());
+  EXPECT_TRUE(prefix.contents_equal(plain->get_payload()));
+  EXPECT_TRUE(suffix.contents_equal(tail));
+
+  // an OSD of this release decodes them back, and finds none in a
+  // plain request
+  auto decode_op = [](const ClientMOSDOp& sent) {
+    auto m = ceph::make_message<MOSDOp>();
+    m->set_header(sent.get_header());
+    bufferlist bl = sent.get_payload();
+    m->set_payload(bl);
+    m->decode_payload();
+    m->finish_decode();
+    return m;
+  };
+  EXPECT_FALSE(decode_op(*plain)->has_rdma_delivery());
+  auto req = decode_op(*with);
+  ASSERT_EQ(2u, req->ops.size());
+  EXPECT_EQ(4096u, req->ops[1].op.extent.length);
+  ASSERT_EQ(2u, req->get_rdma_deliveries().size());
+  EXPECT_TRUE(req->get_rdma_deliveries()[0].empty());
+  EXPECT_EQ("aa:bb:opaque", req->get_rdma_deliveries()[1].token);
+  EXPECT_EQ(4096u, req->get_rdma_deliveries()[1].base_offset);
+  EXPECT_EQ(ceph::rdma::delivery_t::FLAG_CRC64NVME,
+            req->get_rdma_deliveries()[1].flags);
+
+  // and its reply
+  std::vector<ceph::rdma::oob_result_t> results(2);
+  results[1].bytes = 4096;
+  results[1].crc64 = 0x1234;
+  results[1].flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME |
+                     ceph::rdma::oob_result_t::FLAG_LANDED;
+  auto encode_reply = [&](bool with_results) {
+    auto r = ceph::make_message<MOSDOpReply>(
+      req.get(), 0, 10, CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK, false);
+    if (with_results) {
+      r->set_oob_results(std::vector(results));
+    }
+    r->encode_payload(CEPH_FEATURES_ALL);
+    return r;
+  };
+  auto plain_reply = encode_reply(false);
+  auto with_reply = encode_reply(true);
+  EXPECT_EQ(8, plain_reply->get_header().version);
+  EXPECT_EQ(8, with_reply->get_header().version);
+
+  bufferlist rtail;
+  encode(results, rtail);
+  const auto plain_reply_len = plain_reply->get_payload().length();
+  ASSERT_EQ(plain_reply_len + rtail.length(),
+            with_reply->get_payload().length());
+  bufferlist rprefix, rsuffix;
+  rprefix.substr_of(with_reply->get_payload(), 0, plain_reply_len);
+  rsuffix.substr_of(with_reply->get_payload(), plain_reply_len,
+                    rtail.length());
+  EXPECT_TRUE(rprefix.contents_equal(plain_reply->get_payload()));
+  EXPECT_TRUE(rsuffix.contents_equal(rtail));
+
+  auto decode_reply = [](const MOSDOpReply& sent) {
+    auto r = ceph::make_message<MOSDOpReply>();
+    r->set_header(sent.get_header());
+    bufferlist bl = sent.get_payload();
+    r->set_payload(bl);
+    r->decode_payload();
+    return r;
+  };
+  EXPECT_TRUE(decode_reply(*plain_reply)->get_oob_results().empty());
+  auto reply = decode_reply(*with_reply);
+  ASSERT_EQ(2u, reply->get_oob_results().size());
+  EXPECT_EQ(0u, reply->get_oob_results()[0].bytes);
+  EXPECT_EQ(4096u, reply->get_oob_results()[1].bytes);
+  EXPECT_EQ(0x1234u, reply->get_oob_results()[1].crc64);
+  EXPECT_EQ(results[1].flags, reply->get_oob_results()[1].flags);
+}
+
+// Earlier development builds sent every request to a SERVER_UMBRELLA
+// peer as v10: the v9 encoding with the descriptor vector always
+// appended. Such a request still decodes, so that those daemons can be
+// restarted one at a time, but is served inline: its sender reads
+// results only from a v9 reply, and an OSD of this release replies v8.
+TEST(RdmaDelivery, EarlierV10RequestIsServedInline)
+{
+  const hobject_t hobj(object_t("obj"), "", CEPH_NOSNAP, 0x1234, 1, "");
+  spg_t pgid(pg_t(0x1234, 1));
+  const osd_reqid_t reqid(entity_name_t::CLIENT(7), 1, 42);
+  using ClientMOSDOp = _mosdop::MOSDOp<osdc_opvec>;
+  auto sent = ceph::make_message<ClientMOSDOp>(
+    1, 42, hobj, pgid, 10, CEPH_OSD_FLAG_READ, CEPH_FEATURES_ALL);
+  sent->set_reqid(reqid);
+  sent->ops.resize(1);
+  sent->ops[0].op.op = CEPH_OSD_OP_READ;
+  sent->ops[0].op.extent.offset = 0;
+  sent->ops[0].op.extent.length = 4096;
+  sent->encode_payload(CEPH_FEATURES_ALL);
+  ASSERT_EQ(9, sent->get_header().version);
+
+  for (const auto& deliveries : {
+	 std::vector<ceph::rdma::delivery_t>{},
+	 std::vector<ceph::rdma::delivery_t>{
+	   ceph::rdma::delivery_t{"aa:bb:opaque", 0, 0}}}) {
+    bufferlist bl = sent->get_payload();
+    encode(deliveries, bl);
+    auto header = sent->get_header();
+    header.version = 10;
+    auto m = ceph::make_message<MOSDOp>();
+    m->set_header(header);
+    m->set_payload(bl);
+    m->decode_payload();
+    EXPECT_EQ(pgid, m->get_spg());
+    EXPECT_EQ(10u, m->get_map_epoch());
+    EXPECT_EQ(CEPH_OSD_FLAG_READ, m->get_flags());
+    EXPECT_EQ(reqid, m->get_reqid());
+    m->finish_decode();
+    EXPECT_EQ(object_t("obj"), m->get_oid());
+    ASSERT_EQ(1u, m->ops.size());
+    EXPECT_EQ(CEPH_OSD_OP_READ, m->ops[0].op.op);
+    EXPECT_EQ(4096u, m->ops[0].op.extent.length);
+    EXPECT_FALSE(m->has_rdma_delivery());
+  }
 }
 
 TEST(RdmaDelivery, Crc64ValidityIsSeparateFromCombinability)
@@ -496,6 +661,104 @@ TEST(RdmaDelivery, ResentResultsAreMarked)
   Objecter::deliver_rdma_oob_result(o, 0, declined);
   EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_DECLINED, got.flags);
   o->put();
+}
+
+// An attempt that went out without its descriptors - withheld while the
+// cluster's require_osd_release is below umbrella - moved nothing out of
+// band, and its results say declined, so a caller need not fence its
+// window. A resend withheld again is not resent; one withheld after an
+// attempt that went out unanswered is.
+TEST(RdmaDelivery, WithheldDescriptorsReadDeclined)
+{
+  using R = ceph::rdma::oob_result_t;
+  ::ObjectOperation op;
+  ceph::buffer::list bl0, bl1;
+  int rv0 = 0, rv1 = 0;
+  R got;
+  op.read(0, 4096, &bl0, &rv0, nullptr);
+  op.set_rdma_delivery("t0", 0, 0, &got);
+  op.read(4096, 4096, &bl1, &rv1, nullptr);  // no descriptor
+  auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                             std::move(op.ops), 0, (Context*)nullptr,
+                             nullptr);
+  Objecter::take_rdma(o, op);
+
+  // attempts as _prepare_osd_op() counts them before stamping
+  o->attempts = 1;
+  EXPECT_TRUE(Objecter::stamp_rdma_attempt(o, false).empty());
+  EXPECT_TRUE(o->rdma_withheld);
+  // the OSD saw no descriptors, so its reply carries no results
+  Objecter::deliver_rdma_oob_results(o, {});
+  EXPECT_EQ(R::FLAG_DECLINED, got.flags);
+  EXPECT_EQ(0u, got.bytes);
+
+  o->attempts = 2;
+  EXPECT_TRUE(Objecter::stamp_rdma_attempt(o, false).empty());
+  Objecter::deliver_rdma_oob_results(o, {});
+  EXPECT_EQ(R::FLAG_DECLINED, got.flags);
+
+  // once every OSD may honor them, the descriptors go out, vouched for
+  // as no earlier attempt carried any, and a reply without results
+  // reads as before
+  o->attempts = 3;
+  auto d = Objecter::stamp_rdma_attempt(o, true);
+  EXPECT_FALSE(o->rdma_withheld);
+  ASSERT_EQ(2u, d.size());
+  EXPECT_EQ("t0", d[0].token);
+  EXPECT_TRUE(d[0].flags & ceph::rdma::delivery_t::FLAG_PRIOR_SETTLED);
+  EXPECT_TRUE(d[1].empty());
+  Objecter::deliver_rdma_oob_results(o, {});
+  EXPECT_EQ(0u, got.flags);
+
+  // that attempt had no settled reply: a later withheld one is declined
+  // for itself, but resent
+  o->attempts = 4;
+  EXPECT_TRUE(Objecter::stamp_rdma_attempt(o, false).empty());
+  Objecter::deliver_rdma_oob_results(o, {});
+  EXPECT_EQ(R::FLAG_DECLINED | R::FLAG_RESENT, got.flags);
+
+  // an op without a descriptor carries nothing to withhold
+  ::ObjectOperation plain;
+  plain.read(0, 4096, &bl0, &rv0, nullptr);
+  auto* p = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                             std::move(plain.ops), 0, (Context*)nullptr,
+                             nullptr);
+  Objecter::take_rdma(p, plain);
+  p->attempts = 1;
+  EXPECT_TRUE(Objecter::stamp_rdma_attempt(p, false).empty());
+  EXPECT_FALSE(p->rdma_withheld);
+  p->put();
+  o->put();
+}
+
+// ObjectOperation::dup() takes over another request's ops, as an OSD
+// does when it proxies a read or copies a manifest object's chunks, and
+// keeps every per-op vector aligned with them, so that an op added
+// afterwards passes add_op()'s checks. The copied ops go inline.
+TEST(RdmaDelivery, DupKeepsPerOpVectorsAligned)
+{
+  std::vector<OSDOp> sops(2);
+  sops[0].op.op = CEPH_OSD_OP_READ;
+  sops[0].op.extent.length = 4096;
+  sops[1].op.op = CEPH_OSD_OP_STAT;
+
+  ::ObjectOperation op;
+  ceph::buffer::list bl;
+  int rv = 0;
+  ceph::rdma::oob_result_t got;
+  op.read(0, 8192, &bl, &rv, nullptr);
+  op.set_rdma_delivery("t0", 0, 0, &got);
+  op.dup(sops);
+  ASSERT_EQ(2u, op.ops.size());
+  EXPECT_EQ(2u, op.rdma_delivery.size());
+  EXPECT_EQ(2u, op.rdma_oob_result.size());
+  EXPECT_FALSE(op.has_rdma_delivery());
+  EXPECT_EQ(nullptr, op.rdma_oob_result[0]);
+
+  op.assert_version(1);
+  ASSERT_EQ(3u, op.ops.size());
+  EXPECT_EQ(3u, op.rdma_delivery.size());
+  EXPECT_EQ(3u, op.rdma_oob_result.size());
 }
 
 // An attempt is settled - nothing of it can land after its reply - when

@@ -35,7 +35,7 @@
 
 class MOSDOpReply final : public Message {
 private:
-  static constexpr int HEAD_VERSION = 9;
+  static constexpr int HEAD_VERSION = 8;
   static constexpr int COMPAT_VERSION = 2;
 
   object_t oid;
@@ -54,7 +54,8 @@ private:
   /// per-op out-of-band delivery results (RDMA); empty when no op was
   /// delivered out of band. When ops[i] went out of band its outdata
   /// is empty and oob_results[i] holds the pushed byte count plus the
-  /// optional CRC64-NVME of those bytes.
+  /// optional CRC64-NVME of those bytes. Encoded after the v8 fields
+  /// only when non-empty, and decoded when bytes remain there.
   std::vector<ceph::rdma::oob_result_t> oob_results;
 
 public:
@@ -239,12 +240,11 @@ public:
         }
       }
       encode_trace(payload, features);
-      if (HAVE_FEATURE(features, SERVER_UMBRELLA)) {
+      if (header.version == HEAD_VERSION && !oob_results.empty()) {
+        // the results trail the v8 fields, where a client that does
+        // not know them stops decoding; only a client that sent
+        // delivery descriptors is answered with any
         encode(oob_results, payload);
-      } else if (header.version > 8) {
-        // no out-of-band delivery to pre-umbrella peers; drop the
-        // trailing field and downgrade
-        header.version = 8;
       }
     }
   }
@@ -253,8 +253,7 @@ public:
     auto p = payload.cbegin();
 
     // Always keep here the newest version of decoding order/rule
-    if (header.version >= 8) {
-      // v9 == v8 plus the trailing oob_results vector
+    if (header.version == HEAD_VERSION) {
       decode(oid, p);
       decode(pgid, p);
       decode(flags, p);
@@ -280,7 +279,7 @@ public:
       if (do_redirect)
 	decode(redirect, p);
       decode_trace(p);
-      if (header.version >= 9) {
+      if (!p.end()) {
 	decode(oob_results, p);
       }
     } else if (header.version < 2) {

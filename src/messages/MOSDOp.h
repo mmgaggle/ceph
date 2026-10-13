@@ -42,7 +42,7 @@ namespace _mosdop {
 template<typename V>
 class MOSDOp final : public MOSDFastDispatchOp {
 private:
-  static constexpr int HEAD_VERSION = 10;
+  static constexpr int HEAD_VERSION = 9;
   static constexpr int COMPAT_VERSION = 3;
 
 private:
@@ -74,7 +74,8 @@ private:
   /// per-op advisory out-of-band delivery descriptors (see
   /// common/rdma_token.h): empty when no op requests delivery,
   /// otherwise aligned with ops (mirroring the reply's oob_results);
-  /// decoded in the finish_decode() tail for header.version >= 10
+  /// encoded after the v9 fields only when non-empty, and decoded in
+  /// the finish_decode() tail of a v9 request when bytes remain there
   std::vector<ceph::rdma::delivery_t> rdma_deliveries;
 
 public:
@@ -416,43 +417,8 @@ struct ceph_osd_request_head {
 
       encode(retry_attempt, payload);
       encode(features, payload);
-    } else if (!HAVE_FEATURE(features, SERVER_UMBRELLA)) {
-      // v9 opentelemetry trace, no rdma delivery descriptors. Peers
-      // without SERVER_UMBRELLA silently lose the descriptors, which
-      // is safe because they are advisory (data comes back inline);
-      // the Objecter additionally refuses to attach them unless
-      // require_osd_release >= umbrella.
-      header.version = 9;
-
-      encode(pgid, payload);
-      encode(hobj.get_hash(), payload);
-      encode(osdmap_epoch, payload);
-      encode(flags, payload);
-      encode(reqid, payload);
-      encode_trace(payload, features);
-      encode_otel_trace(payload, features);
-
-      // -- above decoded up front; below decoded post-dispatch thread --
-
-      encode(client_inc, payload);
-      encode(mtime, payload);
-      encode(get_object_locator(), payload);
-      encode(hobj.oid, payload);
-
-      __u16 num_ops = ops.size();
-      encode(num_ops, payload);
-      for (unsigned i = 0; i < ops.size(); i++)
-	encode(ops[i].op, payload);
-
-      encode(hobj.snap, payload);
-      encode(snap_seq, payload);
-      encode(snaps, payload);
-
-      encode(retry_attempt, payload);
-      encode(features, payload);
     } else {
-      // latest v10: v9 plus the trailing per-op rdma delivery
-      // descriptor vector
+      // latest v9 opentelemetry trace
       header.version = HEAD_VERSION;
 
       encode(pgid, payload);
@@ -480,9 +446,15 @@ struct ceph_osd_request_head {
       encode(snaps, payload);
 
       encode(retry_attempt, payload);
-      encode(features, payload);  // NB: the connection-features parameter
+      encode(features, payload);
 
-      encode(rdma_deliveries, payload);
+      if (!rdma_deliveries.empty()) {
+	// the per-op rdma delivery descriptors trail the v9 fields: an
+	// OSD that does not know them stops decoding before them and
+	// serves the request inline, which is always correct as they
+	// are advisory
+	encode(rdma_deliveries, payload);
+      }
     }
   }
 
@@ -492,10 +464,13 @@ struct ceph_osd_request_head {
     p = std::cbegin(payload);
 
     // Always keep here the newest version of decoding order/rule
-    if (header.version == HEAD_VERSION || header.version == 9) {
-      // v10 differs from v9 only in the finish_decode() tail (the
-      // trailing per-op rdma delivery descriptors); the up-front
-      // section is identical
+    if (header.version == HEAD_VERSION || header.version == 10) {
+      // v10 is what earlier development builds of S3 over RDMA send to
+      // every SERVER_UMBRELLA peer: v9 with the rdma delivery
+      // descriptors always appended (see finish_decode()). It is taken
+      // only so that those daemons can be restarted one at a time;
+      // drop it once none remain, and before upstream gives v10 a
+      // meaning of its own.
       decode(pgid, p);
       uint32_t hash;
       decode(hash, p);
@@ -665,7 +640,12 @@ struct ceph_osd_request_head {
 
     decode(features, p);
 
-    if (header.version >= 10) {
+    if (header.version == 9 && !p.end()) {
+      // per-op rdma delivery descriptors, present when some op
+      // requests delivery (see encode_payload()). A v10 request's are
+      // left undecoded and it is served inline: its sender reads
+      // results only from a v9 reply, and replies are v8, so data
+      // pushed for it would read as an empty inline result.
       decode(rdma_deliveries, p);
     }
 

@@ -381,9 +381,12 @@ inline namespace v14_2_0 {
     static constexpr uint32_t RDMA_DELIVERY_RANGES = 4;
     static constexpr uint32_t RDMA_DELIVERY_CRC64_RANGES =
       RDMA_DELIVERY_RANGES;
-    /// result flag: the OSD started no transfer for this read, so nothing
-    /// of it reached the window; its data came back inline. An older OSD
-    /// never sets it.
+    /// result flag: no transfer was started for this operation, so
+    /// nothing of it reached the window; a read's data came back inline.
+    /// The OSD sets it, and so does the client library for an operation
+    /// whose descriptor it withheld because the cluster's
+    /// require_osd_release is below Umbrella. An older OSD never sets
+    /// it.
     static constexpr uint32_t RDMA_DELIVERY_DECLINED = 8;
     /// result flag: every byte was in the window before the OSD replied,
     /// so nothing of this read lands after the reply (bar a transport's
@@ -503,9 +506,13 @@ inline namespace v14_2_0 {
      * Not advisory: the operation has no other data. An OSD that cannot
      * pull fails the operation, and nothing is written: -EOPNOTSUPP when
      * it has no way to read the window, -EIO when the read failed, and
-     * -EINVAL from an OSD that predates pulls. RDMA_DELIVERY_WANT_CRC64
+     * -EINVAL from an OSD that predates pulls. While the cluster's
+     * require_osd_release is below Umbrella, the client library withholds
+     * the pull descriptor: the OSD fails the write with -EINVAL, and
+     * *result reports RDMA_DELIVERY_DECLINED. RDMA_DELIVERY_WANT_CRC64
      * in flags asks for the CRC-64/NVME of the pulled bytes in *result,
-     * valid when result->flags has RDMA_DELIVERY_CRC64_VALID.
+     * valid when result->flags has RDMA_DELIVERY_CRC64_VALID. result may
+     * be NULL.
      */
     void write_full_pulled(uint64_t len, const std::string& token,
 			   uint64_t base_offset, uint32_t flags,
@@ -690,8 +697,11 @@ inline namespace v14_2_0 {
      * at the token's base address plus base_offset, and reports only
      * byte counts through *result. The request is advisory - an OSD
      * that cannot or will not push (no RDMA support, expired lease,
-     * retransmitted op) returns the data inline as usual with
-     * result->bytes = 0, so degradation is always plain in-band data.
+     * retransmitted op) returns the data inline as usual and reports
+     * bytes = 0, so degradation is always plain in-band data. While the
+     * cluster's require_osd_release is below Umbrella, the client library
+     * withholds the descriptor, and the result reports
+     * RDMA_DELIVERY_DECLINED. result may be NULL.
      * An OSD will not initiate a transfer against the descriptor
      * later than the pool's rdma_delivery_lease after receiving the
      * op, and every write it started has landed or been cut off by

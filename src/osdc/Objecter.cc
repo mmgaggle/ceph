@@ -3597,32 +3597,16 @@ Objecter::MOSDOp *Objecter::_prepare_osd_op(Op *op)
      m->otel_trace = jspan_context(*op->otel_trace);
   }
 
-  if (op->has_rdma_delivery() &&
-      osdmap->require_osd_release >= ceph_release_t::umbrella) {
-    // advisory out-of-band delivery: never emit the descriptors to a
-    // cluster that may not decode them (an unknown-version MOSDOp is
-    // garbage-decoded by old OSDs). When the gate fails the data
-    // simply returns inline, which is always correct.
-    ceph_assert(op->rdma_delivery.size() == op->ops.size());
-    std::vector<ceph::rdma::delivery_t> deliveries(
-      op->rdma_delivery.begin(), op->rdma_delivery.end());
-    if (op->rdma_attempt_unsettled) {
-      // the attempt this one supersedes had no settled reply: a write
-      // of it may still land, now and for every later attempt
-      op->rdma_history_unsettled = true;
-    }
-    // a resend whose earlier attempts were all answered declined or
-    // landed may be delivered like a first attempt; say so
-    op->rdma_retry_settled = op->attempts > 1 && !op->rdma_history_unsettled;
-    if (op->rdma_retry_settled) {
-      for (auto& d : deliveries) {
-	if (!d.empty()) {
-	  d.flags |= ceph::rdma::delivery_t::FLAG_PRIOR_SETTLED;
-	}
-      }
-    }
+  // advisory out-of-band delivery: an OSD that does not know the
+  // descriptors skips them and replies inline with no results, which
+  // reads as a transfer that may have started. A cluster below
+  // umbrella may hold such OSDs, so withhold the descriptors there;
+  // the ops' results then read declined, and the data simply returns
+  // inline, which is always correct.
+  if (auto deliveries = stamp_rdma_attempt(
+	op, osdmap->require_osd_release >= ceph_release_t::umbrella);
+      !deliveries.empty()) {
     m->set_rdma_deliveries(std::move(deliveries));
-    op->rdma_attempt_unsettled = true;
   }
 
   logger->inc(l_osdc_op_send);
@@ -4023,21 +4007,9 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 		  << " != request ops " << op->ops
 		  << " from " << m->get_source_inst() << dendl;
 
-  {
-    // per-op out-of-band delivery results: an OSD that pushed fills
-    // oob_results aligned with the ops; an inline reply (old OSD,
-    // refusal, or nothing requested) carries none, which reads back
-    // as all-zero results. Both result forms are served here, so a
-    // caller learns "nothing delivered" even for an op the reply
-    // left out (the per-op handlers below stop at out_ops.end()).
-    const auto& oob = m->get_oob_results();
-    const ceph::rdma::oob_result_t none;
-    for (unsigned i = 0; i < op->rdma_oob_result.size(); ++i) {
-      if (rdma_oob_wanted(op, i)) {
-	deliver_rdma_oob_result(op, i, i < oob.size() ? oob[i] : none);
-      }
-    }
-  }
+  // per-op out-of-band delivery results, served before the per-op
+  // handlers below, which stop at out_ops.end()
+  deliver_rdma_oob_results(op, m->get_oob_results());
 
   bs::error_code handler_error = process_op_reply_handlers(op, out_ops);
 
@@ -4079,6 +4051,67 @@ void Objecter::deliver_rdma_oob_result(Op *op, unsigned i,
     std::move(handler)(r);
     handler = nullptr;
   }
+}
+
+void Objecter::deliver_rdma_oob_results(
+  Op *op, const std::vector<ceph::rdma::oob_result_t>& oob)
+{
+  // An OSD that pushed fills oob aligned with the ops; an inline reply
+  // (old OSD, refusal, or nothing requested) carries none, which reads
+  // back as all-zero results - except for an attempt that went out
+  // without its descriptors, whose descriptor-bearing ops read
+  // declined. Both result forms are served, so a caller learns
+  // "nothing delivered" even for an op the reply left out.
+  const ceph::rdma::oob_result_t none;
+  ceph::rdma::oob_result_t withheld;
+  withheld.flags = ceph::rdma::oob_result_t::FLAG_DECLINED;
+  for (unsigned i = 0; i < op->rdma_oob_result.size(); ++i) {
+    if (!rdma_oob_wanted(op, i)) {
+      continue;
+    }
+    if (op->rdma_withheld && i < op->rdma_delivery.size() &&
+	!op->rdma_delivery[i].empty()) {
+      deliver_rdma_oob_result(op, i, withheld);
+    } else {
+      deliver_rdma_oob_result(op, i, i < oob.size() ? oob[i] : none);
+    }
+  }
+}
+
+std::vector<ceph::rdma::delivery_t>
+Objecter::stamp_rdma_attempt(Op *op, bool send)
+{
+  std::vector<ceph::rdma::delivery_t> deliveries;
+  op->rdma_withheld = false;
+  if (!op->has_rdma_delivery()) {
+    return deliveries;
+  }
+  if (op->rdma_attempt_unsettled) {
+    // the attempt this one supersedes had no settled reply: a write
+    // of it may still land, now and for every later attempt
+    op->rdma_history_unsettled = true;
+  }
+  // a resend whose earlier attempts were all answered declined or
+  // landed, or went out without descriptors, may be delivered like a
+  // first attempt; say so
+  op->rdma_retry_settled = op->attempts > 1 && !op->rdma_history_unsettled;
+  if (!send) {
+    // nothing of this attempt goes out of band
+    op->rdma_withheld = true;
+    op->rdma_attempt_unsettled = false;
+    return deliveries;
+  }
+  ceph_assert(op->rdma_delivery.size() == op->ops.size());
+  deliveries.assign(op->rdma_delivery.begin(), op->rdma_delivery.end());
+  if (op->rdma_retry_settled) {
+    for (auto& d : deliveries) {
+      if (!d.empty()) {
+	d.flags |= ceph::rdma::delivery_t::FLAG_PRIOR_SETTLED;
+      }
+    }
+  }
+  op->rdma_attempt_unsettled = true;
+  return deliveries;
 }
 
 void Objecter::complete_op_reply(Op *op, bs::error_code handler_error, OSDSession *s, unique_lock<std::shared_mutex> &sl, int rc) {

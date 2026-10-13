@@ -929,6 +929,31 @@ TEST_P(LibRadosMiscPP, RdmaDeliveryInlineFallbackPP) {
   ASSERT_TRUE(read_bl2.contents_equal(expected2));
 }
 
+TEST_P(LibRadosMiscPP, RdmaDeliveryNullResultPP) {
+  // the result is optional, as it is for write_pulled() and
+  // write_full_pulled(): a read that asks for delivery without one
+  // completes like any other when its reply is processed
+  const std::string payload = "0123456789";
+  bufferlist write_bl;
+  write_bl.append(payload);
+  ASSERT_EQ(0, ioctx.write_full("rdma_delivery_null_obj", write_bl));
+
+  const std::string token =
+    "0102030405060708:01020304:0102aabb:0102:010203:1:"
+    "0102030405060708090a0b0c0d0e0f10";
+  int rval = -1;
+  bufferlist read_bl;
+  ObjectReadOperation op;
+  op.read(0, payload.size(), &read_bl, &rval);
+  op.set_rdma_delivery(token, 0,
+                       ObjectReadOperation::RDMA_DELIVERY_WANT_CRC64, nullptr);
+  ASSERT_EQ(0, ioctx.operate("rdma_delivery_null_obj", &op, nullptr));
+  ASSERT_EQ(0, rval);
+  bufferlist expected;
+  expected.append(payload);
+  ASSERT_TRUE(read_bl.contents_equal(expected));
+}
+
 TEST_P(LibRadosMiscPP, RdmaDeliveryLeasePP) {
   // the lease an OSD enforces on out-of-band delivery is a pool option
   // the client reads from its OSDMap: the built-in default when unset,

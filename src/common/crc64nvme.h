@@ -21,8 +21,9 @@ namespace ceph {
  *
  * Computed with ISA-L's carry-less multiply kernels when ceph-common is
  * built with ISA-L and the CPU has PCLMUL and SSE4.1 (x86-64) or PMULL
- * (aarch64), else with madler's slicing-by-8 tables; the values are the
- * same.
+ * (aarch64), else with madler's tables, eight bytes at a time on a
+ * little-endian host and one at a time on a big-endian one; the values
+ * are the same.
  */
 uint64_t crc64nvme(uint64_t crc, const void* data, size_t len);
 uint64_t crc64nvme(const ceph::buffer::list& bl);

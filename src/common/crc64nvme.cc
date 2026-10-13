@@ -3,6 +3,8 @@
 
 #include "common/crc64nvme.h"
 
+#include <bit>
+
 #include "acconfig.h"
 #include "arch/arm.h"
 #include "arch/intel.h"
@@ -10,12 +12,14 @@
 #include "include/buffer.h"
 
 // the ISA-L that src/erasure-code/isa builds is linked into ceph-common.
-// Its CRC-64 beats madler only on x86-64 and aarch64. On ppc64le it is a
-// byte-at-a-time table; on riscv64 its vclmul kernel depends on the
-// assembler ISA-L was built with and, at run time, on Zbb, which
-// arch/riscv does not probe
+// Its CRC-64 beats madler only on x86-64 and little-endian aarch64. On
+// ppc64le, and on aarch64_be, which its configure gives none of its
+// aarch64 kernels, it is a byte-at-a-time table; on riscv64 its vclmul
+// kernel depends on the assembler ISA-L was built with and, at run time,
+// on Zbb, which arch/riscv does not probe
 #if defined(WITH_EC_ISA_PLUGIN) && \
-    (defined(__x86_64__) || defined(__aarch64__))
+    (defined(__x86_64__) || \
+     (defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__))
 #define CRC64NVME_ISAL
 #endif
 
@@ -35,7 +39,14 @@ using crc64nvme_func_t = uint64_t (*)(uint64_t crc, const void* data,
 
 uint64_t crc64nvme_madler(uint64_t crc, const void* data, size_t len)
 {
-  return crc64nvme_word(crc, data, len);
+  // the slicing-by-8 routine loads 8 bytes at a time as a native
+  // uint64_t, which its tables take to be little-endian; a big-endian
+  // host takes the byte-at-a-time routine
+  if constexpr (std::endian::native == std::endian::little) {
+    return crc64nvme_word(crc, data, len);
+  } else {
+    return crc64nvme_byte(crc, data, len);
+  }
 }
 
 #ifdef CRC64NVME_ISAL

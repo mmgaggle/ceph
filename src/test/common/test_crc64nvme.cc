@@ -4,6 +4,7 @@
 #include "common/crc64nvme.h"
 
 #include <algorithm>
+#include <bit>
 #include <random>
 #include <vector>
 
@@ -24,11 +25,21 @@ extern "C" {
 // 11199E50_6128D175h)
 static constexpr uint64_t CHECK_123456789 = 0xae8b14860a799888ull;
 
+// madler's slicing-by-8 routine loads native words that its tables take
+// to be little-endian; its byte-at-a-time routine, the reference here,
+// is right on either byte order
+static constexpr bool LITTLE_ENDIAN_HOST =
+  std::endian::native == std::endian::little;
+
 TEST(Crc64Nvme, Canonical)
 {
   const char* s = "123456789";
   EXPECT_EQ(CHECK_123456789, ceph::crc64nvme(0, s, 9));
-  EXPECT_EQ(CHECK_123456789, crc64nvme_word(0, s, 9));
+  EXPECT_EQ(CHECK_123456789, crc64nvme_byte(0, s, 9));
+  EXPECT_EQ(CHECK_123456789, crc64nvme_bit(0, s, 9));
+  if constexpr (LITTLE_ENDIAN_HOST) {
+    EXPECT_EQ(CHECK_123456789, crc64nvme_word(0, s, 9));
+  }
   // empty input
   EXPECT_EQ(0u, ceph::crc64nvme(0, s, 0));
   EXPECT_EQ(CHECK_123456789, ceph::crc64nvme(CHECK_123456789, s, 0));
@@ -65,8 +76,12 @@ TEST(Crc64Nvme, NvmGuardTestCases)
     }
     EXPECT_EQ(c.guard, ceph::crc64nvme(0, block.data(), block.size()))
       << c.contents;
-    EXPECT_EQ(c.guard, crc64nvme_word(0, block.data(), block.size()))
+    EXPECT_EQ(c.guard, crc64nvme_byte(0, block.data(), block.size()))
       << c.contents;
+    if constexpr (LITTLE_ENDIAN_HOST) {
+      EXPECT_EQ(c.guard, crc64nvme_word(0, block.data(), block.size()))
+        << c.contents;
+    }
     EXPECT_EQ(c.guard, spdk_crc64_nvme(block.data(), block.size(), 0))
       << c.contents;
 #ifdef WITH_EC_ISA_PLUGIN
@@ -88,8 +103,9 @@ TEST(Crc64Nvme, NvmGuardTestCases)
 TEST(Crc64Nvme, MatchesMadler)
 {
   // whichever implementation ceph::crc64nvme() chose, it agrees with
-  // madler at every length across the kernels' block boundaries, at
-  // every alignment, and with a nonzero seed
+  // madler's byte-at-a-time routine at every length across the kernels'
+  // block boundaries, at every alignment, and with a nonzero seed; so
+  // does madler's slicing-by-8 routine on a little-endian host
   std::mt19937_64 rng(1234);
   std::vector<unsigned char> buf(16 + (1 << 20));
   for (auto& c : buf) {
@@ -97,9 +113,13 @@ TEST(Crc64Nvme, MatchesMadler)
   }
   auto check = [&](size_t off, size_t len, uint64_t seed) {
     const unsigned char* p = buf.data() + off;
-    const uint64_t want = crc64nvme_word(seed, p, len);
+    const uint64_t want = crc64nvme_byte(seed, p, len);
     EXPECT_EQ(want, ceph::crc64nvme(seed, p, len))
       << "off=" << off << " len=" << len << " seed=" << seed;
+    if constexpr (LITTLE_ENDIAN_HOST) {
+      EXPECT_EQ(want, crc64nvme_word(seed, p, len))
+        << "off=" << off << " len=" << len << " seed=" << seed;
+    }
 #ifdef WITH_EC_ISA_PLUGIN
     EXPECT_EQ(want, crc64_rocksoft_refl(seed, p, len))
       << "off=" << off << " len=" << len << " seed=" << seed;
@@ -181,7 +201,7 @@ TEST(Crc64Nvme, ChainedSegments)
     for (auto& c : src) {
       c = static_cast<char>(rng());
     }
-    const uint64_t want = crc64nvme_word(0, src.data(), n);
+    const uint64_t want = crc64nvme_byte(0, src.data(), n);
     const ceph::buffer::ptr whole = ceph::buffer::copy(src.data(), n);
     bufferlist bl;
     uint64_t chained = 0;

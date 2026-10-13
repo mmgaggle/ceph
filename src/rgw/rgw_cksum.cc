@@ -15,6 +15,7 @@
 
 #include "rgw_cksum.h"
 #include "rgw_cksum_digest.h"
+#include <bit>
 #include <cstdint>
 #include <memory>
 #include "rgw_crc_digest.h"
@@ -27,6 +28,18 @@ extern "C" {
 } // extern "C"
 
 namespace rgw::cksum {
+
+  /* a stored CRC holds the big-endian bytes of the CRC, as Final()
+   * lays them out: swap between that and the CRC on little-endian
+   * hosts only */
+  template <std::integral T>
+  static T stored_crc_order(T value)
+  {
+    if constexpr (std::endian::native != std::endian::big) {
+      value = rgw::digest::byteswap(value);
+    }
+    return value;
+  }
 
   std::optional<Cksum>
   combine_crc_cksum(const Cksum& ck1, const Cksum& ck2, uintmax_t len1)
@@ -43,14 +56,12 @@ namespace rgw::cksum {
 	/* due to AWS (and other) convention, the at-rest
 	 * digest is byteswapped (on LE?);  restore the
 	 * defined byte order before combining */
-	auto cck1 =
-	  rgw::digest::byteswap(std::get<uint64_t>(*ck1.get_crc()));
-	auto cck2 =
-	  rgw::digest::byteswap(std::get<uint64_t>(*ck2.get_crc()));
+	auto cck1 = stored_crc_order(std::get<uint64_t>(*ck1.get_crc()));
+	auto cck2 = stored_crc_order(std::get<uint64_t>(*ck2.get_crc()));
 	/* madler crcany */
 	auto cck3 = crc64nvme_comb(cck1, cck2, len1);
 	/* and byteswap */
-	cck3 = rgw::digest::byteswap(cck3);
+	cck3 = stored_crc_order(cck3);
 	/* convert to a Cksum, no ascii armor */
 	ck3 = Cksum(ck1.type, (char*) &cck3, Cksum::CtorStyle::raw);
       }
@@ -59,10 +70,8 @@ namespace rgw::cksum {
     case cksum::Type::crc32c:
       {
 	uint32_t cck3;
-	auto cck1 =
-	  rgw::digest::byteswap(std::get<uint32_t>(*ck1.get_crc()));
-	auto cck2 =
-	  rgw::digest::byteswap(std::get<uint32_t>(*ck2.get_crc()));
+	auto cck1 = stored_crc_order(std::get<uint32_t>(*ck1.get_crc()));
+	auto cck2 = stored_crc_order(std::get<uint32_t>(*ck2.get_crc()));
 	/* madler crcany */
 	switch (ck1.type) {
 	case cksum::Type::crc32:
@@ -77,7 +86,7 @@ namespace rgw::cksum {
 	  goto out;
 	}
         /* and byteswap */
-	cck3 = rgw::digest::byteswap(cck3);
+	cck3 = stored_crc_order(cck3);
 	/* convert to a Cksum, no ascii armor */
 	ck3 = Cksum(ck1.type, (char*) &cck3, Cksum::CtorStyle::raw);
       }

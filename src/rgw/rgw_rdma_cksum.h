@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <cstdint>
 #include <optional>
@@ -57,21 +58,26 @@ inline int parse_checksum_algorithm(const char* value, cksum_want* want)
 }
 
 /// S3's rendering of a canonical CRC-64/NVME: base64 of its big-endian
-/// bytes, as combine_crc_cksum() keeps them
+/// bytes, as rgw::digest::Crc64Nvme::Final() lays out a stored checksum
+/// on either byte order
 inline rgw::cksum::Cksum cksum_crc64nvme(uint64_t canonical)
 {
-  uint64_t swapped = rgw::digest::byteswap(canonical);
+  if constexpr (std::endian::native != std::endian::big) {
+    canonical = rgw::digest::byteswap(canonical);
+  }
   return rgw::cksum::Cksum(rgw::cksum::Type::crc64nvme,
-                           reinterpret_cast<char*>(&swapped),
+                           reinterpret_cast<char*>(&canonical),
                            rgw::cksum::Cksum::CtorStyle::raw);
 }
 
-/// the same for a canonical CRC-32C
+/// the same for a canonical CRC-32C, as rgw::digest::Crc32c::Final()
 inline rgw::cksum::Cksum cksum_crc32c(uint32_t canonical)
 {
-  uint32_t swapped = rgw::digest::byteswap(canonical);
+  if constexpr (std::endian::native != std::endian::big) {
+    canonical = rgw::digest::byteswap(canonical);
+  }
   return rgw::cksum::Cksum(rgw::cksum::Type::crc32c,
-                           reinterpret_cast<char*>(&swapped),
+                           reinterpret_cast<char*>(&canonical),
                            rgw::cksum::Cksum::CtorStyle::raw);
 }
 

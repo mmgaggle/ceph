@@ -22,6 +22,7 @@
 #include "osd/Coroutines.h"
 #ifdef HAVE_OSD_OOB_DELIVERY
 #include "common/rdma_token.h"
+class Throttle;
 #endif
 
 /**
@@ -43,6 +44,16 @@ public:
   /// op that waits and runs again neither pulls again nor loses what it
   /// reports.
   std::vector<ceph::rdma::oob_result_t> oob_pulled;
+  /// the throttle the pulled payloads are charged to, and how much; the
+  /// request gives it back when it is done, with the ops' data that holds
+  /// them (_unregistered())
+  Throttle* oob_throttle = nullptr;
+  uint64_t oob_throttled = 0;
+  /// reserve len bytes of t, the throttle of the client's messages, for
+  /// a payload about to be pulled: false, with nothing reserved, when t
+  /// has no room for them, as the messenger would not read a message of
+  /// that size now
+  bool reserve_pulled(Throttle* t, uint64_t len);
 #endif
 
   int maybe_init_op_info(const OSDMap &osdmap);

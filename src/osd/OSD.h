@@ -144,9 +144,16 @@ public:
   /// that registered any: the executor of oob_cluster_transport; null
   /// when none does
   OSDOobExecutor* oob_lender = nullptr;
+  /// OSD::init adds the executors while the tick and the op threads
+  /// already run; those see none of them until it publishes them all
+  std::atomic<bool> oob_published = false;
   /// an executor that started; lends when its transport is the cluster
-  /// transport
+  /// transport. Only before publish_oob_executors().
   void add_oob_executor(OSDOobExecutor* e, bool lends);
+  /// let the other threads use the executors added; none is added after
+  void publish_oob_executors();
+  /// oob_executors once published, else none
+  const std::vector<OSDOobExecutor*>& published_oob_executors() const;
   /// the executor that serves a delivery token's transport, or null
   OSDOobExecutor* oob_executor_for(const std::string& token) const;
   /// the executor that can pull a write's payload out of a token's

@@ -518,7 +518,8 @@ void ECCommon::ReadPipeline::start_read_op(
     map<hobject_t, read_request_t> &to_read,
     const bool do_redundant_reads,
     const bool for_recovery,
-    std::unique_ptr<ReadCompleter> on_complete) {
+    std::unique_ptr<ReadCompleter> on_complete,
+    const bool lend_windows) {
   ceph_tid_t tid = get_parent()->get_tid();
   ceph_assert(!tid_to_read_map.contains(tid));
   auto &op = tid_to_read_map.emplace(
@@ -530,6 +531,7 @@ void ECCommon::ReadPipeline::start_read_op(
       for_recovery,
       std::move(on_complete),
       std::move(to_read))).first->second;
+  op.lends_windows = lend_windows;
   dout(10) << __func__ << ": starting " << op << dendl;
   if (op.op) {
 #ifndef WITH_CRIMSON
@@ -615,7 +617,7 @@ void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
   // a client read may have its peer shards push their data into windows
   // of this OSD's memory instead of returning it in the reply
   OSDOobExecutor* gather_exec =
-    rop.for_recovery ? nullptr : get_parent()->oob_gather_executor();
+    rop.lends_windows ? get_parent()->oob_gather_executor() : nullptr;
   if (gather_exec) {
     rop.gather.exec = gather_exec;
     // a shard holding the window's token may start a push within the
@@ -876,7 +878,8 @@ void ECCommon::ReadPipeline::objects_read_and_reconstruct(
     fast_read,
     false,
     std::make_unique<ClientReadCompleter>(
-      *this, &(in_progress_client_reads.back())));
+      *this, &(in_progress_client_reads.back())),
+    true);
 }
 
 void ECCommon::ReadPipeline::objects_read_and_reconstruct_for_rmw(

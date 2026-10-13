@@ -12,6 +12,9 @@
 #include "messages/MOSDRepOpReply.h"
 #include "include/ceph_assert.h"
 #include "osd/osd_types.h"
+#ifdef HAVE_OSD_OOB_DELIVERY
+#include "common/Throttle.h"
+#endif
 
 #ifdef WITH_LTTNG
 #define TRACEPOINT_DEFINE
@@ -97,8 +100,34 @@ void OpRequest::_unregistered() {
   request->clear_data();
   request->clear_payload();
   request->release_message_throttle();
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // the pulled payloads went with the ops' data
+  if (oob_throttle) {
+    oob_throttle->put(oob_throttled);
+    oob_throttle = nullptr;
+    oob_throttled = 0;
+  }
+#endif
   request->set_connection(nullptr);
 }
+
+#ifdef HAVE_OSD_OOB_DELIVERY
+bool OpRequest::reserve_pulled(Throttle* t, uint64_t len)
+{
+  if (!t || !len) {
+    return true;
+  }
+  // get_or_fail() counts under no limit too, as put() uncounts, so that
+  // a limit set while the payload is held gets back what was taken
+  if (!t->get_or_fail(len)) {
+    return false;
+  }
+  ceph_assert(!oob_throttle || oob_throttle == t);
+  oob_throttle = t;
+  oob_throttled += len;
+  return true;
+}
+#endif
 
 int OpRequest::maybe_init_op_info(const OSDMap &osdmap) {
   if (op_info.get_flags())

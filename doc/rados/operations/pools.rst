@@ -596,19 +596,21 @@ You may set values for the following keys:
 
 .. describe:: rdma_delivery_lease
    
-   :Description: Sets how long (in seconds) after receiving an operation that carries an out-of-band RDMA delivery descriptor an OSD may still *initiate* a transfer against that descriptor; a transfer that would start later is delivered inline instead. The value bounds the OSD's side only, and must be visible to both sides, which is why it is a pool option rather than a daemon option. On the read path it also tells a client that gave up on a request when its memory window is quiescent: once the lease plus the client's transport drain bound have elapsed, nothing will write the window again. It is not a bound on how long a client must keep a window registered in general. Setting ``0`` restores the built-in default.
+   :Description: Sets how long (in seconds) after receiving an operation that carries an out-of-band RDMA delivery descriptor an OSD may still *initiate* a transfer against that descriptor; a transfer that would start later is delivered inline instead. The value bounds the OSD's side only, and must be visible to both sides, which is why it is a pool option rather than a daemon option. On the read path it also tells a client that gave up on a request when its memory window is quiescent: once the lease plus the client's transport drain bound have elapsed, nothing will write the window again. It is not a bound on how long a client must keep a window registered in general. Setting ``0`` restores the built-in default. The monitor rejects a value above ``6``, a negative value, or one that is not a finite number. It fails the command with ``ERANGE`` and the message ``rdma_delivery_lease must be between 0 and 6 seconds (0 restores the default)``. While an OSD waits on an out-of-band transfer, it holds an op thread and the PG's lock for up to the lease plus the drain. That time must stay well below ``osd_op_thread_timeout`` (15 s).
 
    :Type: Double
    :Default: ``5``
+   :Valid Range: ``0`` to ``6``
 
 .. _rdma_delivery_drain:
 
 .. describe:: rdma_delivery_drain
 
-   :Description: Sets how long (in seconds) after its delivery lease runs out every out-of-band write that an OSD started for a read has landed or been cut off. An OSD stops waiting for its writes at receipt plus ``rdma_delivery_lease`` plus this value, and cuts off any write that is still in flight. A client or daemon that gave up on a request waits the lease plus this value before it writes the memory window again. Make it longer than the time a transport needs to cut off its writes, which is about two seconds for cuObject. Setting ``0`` restores the built-in default.
+   :Description: Sets how long (in seconds) after its delivery lease runs out every out-of-band write that an OSD started for a read has landed or been cut off. An OSD stops waiting for its writes at receipt plus ``rdma_delivery_lease`` plus this value, and cuts off any write that is still in flight. A client or daemon that gave up on a request waits the lease plus this value before it writes the memory window again. Make it longer than the time a transport needs to cut off its writes, which is about two seconds for cuObject. Setting ``0`` restores the built-in default. The monitor rejects a value outside the valid range with ``ERANGE``, as it does for ``rdma_delivery_lease``. The lease plus this value bounds how long an OSD holds an op thread and the PG's lock while it waits on a transfer.
 
    :Type: Double
    :Default: ``3``
+   :Valid Range: ``0`` to ``4``
 
 .. _recovery_priority:
 

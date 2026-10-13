@@ -360,6 +360,22 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
   return RGWGetObj_ObjStore::get_params(y);
 }
 
+bool RGWGetObj_ObjStore_S3::rdma_eligible()
+{
+  // GetObject only: SelectObjectContent, a POST, takes the data through
+  // send_response_data() into its query engine
+  if (s->op != OP_GET) {
+    return false;
+  }
+  // and the website endpoint answers a GET of an object that redirects
+  // with a 301 in place of its data (RGWGetObj_ObjStore_S3Website)
+  if ((s->prot_flags & RGW_REST_WEBSITE) &&
+      attrs.count(RGW_ATTR_AMZ_WEBSITE_REDIRECT_LOCATION)) {
+    return false;
+  }
+  return true;
+}
+
 RGWGetObj_ObjStore_S3::~RGWGetObj_ObjStore_S3()
 {
 #ifdef WITH_CUOBJ
@@ -850,35 +866,16 @@ send_data:
       }
       return 0;
     }
-#ifdef WITH_CUOBJ
     if (rdma_mode == RdmaMode::STAGED) {
-      // the staging buffer was reserved in select_rdma_mode(), before
-      // the response headers were committed
-      auto* entry = static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf);
+      // RGWGetObj stages the data, and wrote it into the client's window
+      // before this response went out (rdma_write_staged())
       if (bl_len > 0) {
-        if (!entry || rdma_buf_offset + bl_len > entry->size) {
-          ldpp_dout(this, 0) << "rgw_cuobj: ERROR: staging buffer overflow at "
-                             << rdma_buf_offset << "+" << bl_len << dendl;
-          return -EIO;
-        }
-        memcpy(static_cast<char*>(entry->ptr) + rdma_buf_offset, bl.c_str() + bl_ofs, bl_len);
-        rdma_buf_offset += bl_len;
-      } else if (entry && rdma_buf_offset > 0) {
-        auto* cuobj = RGWCuObjServer::get_instance();
-        ssize_t ret = cuobj->rdma_write_to_client(
-            s->object->get_name(), entry, 0,
-            rdma_buf_offset, rdma_token);
-        cuobj->release_buffer(entry);
-        rdma_buf = nullptr;
-        if (ret < 0) {
-          ldout(s->cct, 0) << "rgw_cuobj: ERROR: failed to write to client via RDMA: " << cpp_strerror(ret) << dendl;
-          return ret;
-        }
-        s->rdma_bytes_transferred = rdma_buf_offset;
+        ldpp_dout(this, 0) << "ERROR: unexpected inline data in RDMA "
+                           << "staged GET" << dendl;
+        return -EIO;
       }
       return 0;
     }
-#endif
     int r = dump_body(s, bl.c_str() + bl_ofs, bl_len);
     if (r < 0)
       return r;

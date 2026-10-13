@@ -18,12 +18,18 @@
 // attributes follow hipObject's v2 transport (MIT), so that the pairing
 // matches what hipObject clients expect.
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <thread>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 
+#include <boost/asio/cancel_at.hpp>
+#include <boost/asio/posix/stream_descriptor.hpp>
+
+#include "common/async/yield_context.h"
 #include "common/ceph_context.h"
 #include "common/dout.h"
 #include "common/errno.h"
@@ -296,18 +302,25 @@ void Device::close()
   }
 }
 
-ibv_mr* Device::register_memory(void* ptr, size_t len)
+ibv_pd* Device::alloc_pd()
 {
-  return ibv_reg_mr(pd, ptr, len,
-                    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                    IBV_ACCESS_REMOTE_READ);
+  return ibv_alloc_pd(ctx);
 }
 
-void Device::deregister_memory(ibv_mr* mr)
+int Device::dealloc_pd(ibv_pd* pd)
 {
-  if (mr) {
-    ibv_dereg_mr(mr);
-  }
+  return pd ? ibv_dealloc_pd(pd) : 0;
+}
+
+ibv_mr* Device::register_memory(void* ptr, size_t len, int access,
+                                ibv_pd* on)
+{
+  return ibv_reg_mr(on ? on : pd, ptr, len, access);
+}
+
+int Device::deregister_memory(ibv_mr* mr)
+{
+  return mr ? ibv_dereg_mr(mr) : 0;
 }
 
 Connection::~Connection()
@@ -316,14 +329,31 @@ Connection::~Connection()
 }
 
 int Connection::create(CephContext* cct, Device& dev, uint32_t send_depth,
-                       uint32_t recv_depth)
+                       uint32_t recv_depth, int access, ibv_pd* pd)
 {
   this->dev = &dev;
+  this->access = access;
+  // a request waits for its completions on the channel; reading it must
+  // never block the frontend thread
+  channel = ibv_create_comp_channel(dev.context());
+  if (!channel) {
+    lderr(cct) << "rgw_rdma_rc: ibv_create_comp_channel failed: "
+               << cpp_strerror(errno) << dendl;
+    return -EIO;
+  }
+  if (const int fl = fcntl(channel->fd, F_GETFL);
+      fl < 0 || fcntl(channel->fd, F_SETFL, fl | O_NONBLOCK) < 0) {
+    lderr(cct) << "rgw_rdma_rc: making the completion channel non-blocking "
+               << "failed: " << cpp_strerror(errno) << dendl;
+    destroy();
+    return -EIO;
+  }
   const int cq_depth = static_cast<int>(send_depth + recv_depth);
-  cq = ibv_create_cq(dev.context(), cq_depth, nullptr, nullptr, 0);
+  cq = ibv_create_cq(dev.context(), cq_depth, nullptr, channel, 0);
   if (!cq) {
     lderr(cct) << "rgw_rdma_rc: ibv_create_cq failed: " << cpp_strerror(errno)
                << dendl;
+    destroy();
     return -EIO;
   }
   ibv_qp_init_attr init;
@@ -335,7 +365,7 @@ int Connection::create(CephContext* cct, Device& dev, uint32_t send_depth,
   init.cap.max_recv_wr = recv_depth;
   init.cap.max_send_sge = 1;
   init.cap.max_recv_sge = 1;
-  qp = ibv_create_qp(dev.protection_domain(), &init);
+  qp = ibv_create_qp(pd ? pd : dev.protection_domain(), &init);
   if (!qp) {
     lderr(cct) << "rgw_rdma_rc: ibv_create_qp failed: " << cpp_strerror(errno)
                << dendl;
@@ -348,7 +378,7 @@ int Connection::create(CephContext* cct, Device& dev, uint32_t send_depth,
   attr.qp_state = IBV_QPS_INIT;
   attr.pkey_index = 0;
   attr.port_num = dev.port_num();
-  attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+  attr.qp_access_flags = access;
   if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
                     IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
     lderr(cct) << "rgw_rdma_rc: qp -> INIT failed: " << cpp_strerror(errno)
@@ -366,10 +396,17 @@ void Connection::destroy()
     ibv_destroy_qp(qp);
     qp = nullptr;
   }
+  // wait_event() acknowledges each event it reads, which destroying the
+  // queue requires
   if (cq) {
     ibv_destroy_cq(cq);
     cq = nullptr;
   }
+  if (channel) {
+    ibv_destroy_comp_channel(channel);
+    channel = nullptr;
+  }
+  armed = false;
   inflight = 0;
 }
 
@@ -444,7 +481,7 @@ int Connection::rearm(CephContext* cct, Device& dev)
   attr.qp_state = IBV_QPS_INIT;
   attr.pkey_index = 0;
   attr.port_num = dev.port_num();
-  attr.qp_access_flags = IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+  attr.qp_access_flags = access;
   if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
                     IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
     lderr(cct) << "rgw_rdma_rc: qp -> INIT (rearm) failed: "
@@ -508,7 +545,8 @@ int Connection::post_recv(ibv_mr* mr, void* ptr, uint32_t len, uint64_t wr_id)
 }
 
 Completion Connection::poll_one(ibv_wc& wc,
-                                std::chrono::steady_clock::time_point deadline)
+                                std::chrono::steady_clock::time_point deadline,
+                                optional_yield y)
 {
   for (;;) {
     const int n = ibv_poll_cq(cq, 1, &wc);
@@ -527,11 +565,56 @@ Completion Connection::poll_one(ibv_wc& wc,
       }
       return Completion::WIRE_ERROR;
     }
-    if (std::chrono::steady_clock::now() >= deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
       return Completion::TIMEOUT;
     }
-    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    if (!y) {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      continue;
+    }
+    if (!armed) {
+      // ask for an event, then poll once more: a completion that came
+      // before the request raises none
+      if (ibv_req_notify_cq(cq, 0) == 0) {
+        armed = true;
+        continue;
+      }
+      // no event will come; poll again after a short wait instead
+    }
+    const auto until = armed ? deadline :
+      std::min(deadline, now + std::chrono::milliseconds(1));
+    if (wait_event(y, until) < 0) {
+      return Completion::WIRE_ERROR;
+    }
   }
+}
+
+int Connection::wait_event(optional_yield y,
+                           std::chrono::steady_clock::time_point until)
+{
+  auto& yield = y.get_yield_context();
+  // the channel keeps its descriptor: borrow it for this wait only, on
+  // the request's executor, which may change between READYs
+  boost::asio::posix::stream_descriptor fd(yield.get_executor());
+  boost::system::error_code ec;
+  fd.assign(channel->fd, ec);
+  if (ec) {
+    return -ec.value();
+  }
+  fd.async_wait(boost::asio::posix::descriptor_base::wait_read,
+                boost::asio::cancel_at(until, yield[ec]));
+  fd.release();
+  // readable means an event, unless the wait ran out
+  ibv_cq* ev_cq = nullptr;
+  void* ev_ctx = nullptr;
+  if (ibv_get_cq_event(channel, &ev_cq, &ev_ctx) == 0) {
+    ibv_ack_cq_events(ev_cq, 1);
+    armed = false;
+  } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+    return -errno;
+  }
+  return 0;
 }
 
 } // namespace rgw::rdma::rc

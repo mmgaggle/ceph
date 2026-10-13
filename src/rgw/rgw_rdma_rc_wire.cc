@@ -15,9 +15,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cerrno>
 #include <cstring>
 
 #include <fmt/format.h>
+
+#include "common/dout.h"
+#include "common/errno.h"
+#include "rgw_auth_s3.h"
+#include "rgw_common.h"
+
+#define dout_subsys ceph_subsys_rgw
 
 namespace rgw::rdma::rc {
 
@@ -279,25 +288,6 @@ std::string build_target(std::string_view bucket, std::string_view key,
   return t;
 }
 
-std::optional<std::string_view> sigv4_signed_headers(std::string_view auth)
-{
-  constexpr std::string_view scheme = "AWS4-HMAC-SHA256";
-  if (auth.substr(0, scheme.size()) != scheme) {
-    return std::nullopt;
-  }
-  constexpr std::string_view key = "SignedHeaders=";
-  auto pos = auth.find(key);
-  if (pos == std::string_view::npos) {
-    return std::nullopt;
-  }
-  auto list = auth.substr(pos + key.size());
-  list = list.substr(0, list.find(','));
-  while (!list.empty() && (list.back() == ' ' || list.back() == '\t')) {
-    list.remove_suffix(1);
-  }
-  return list;
-}
-
 bool all_signed(std::string_view signed_list,
                 const std::vector<std::string>& names)
 {
@@ -315,6 +305,54 @@ bool all_signed(std::string_view signed_list,
     }
   }
   return true;
+}
+
+int check_signed(const DoutPrefixProvider* dpp, const req_info& info)
+{
+  using rgw::auth::s3::AWS4_HMAC_SHA256_STR;
+  std::vector<std::string> names;
+  for (const auto& [k, v] : info.env->get_map()) {
+    if (k.rfind("HTTP_X_AMZ_RDMA_", 0) == 0) {
+      std::string n = k.substr(5);
+      for (auto& c : n) {
+        c = c == '_' ? '-' : static_cast<char>(std::tolower(c));
+      }
+      names.push_back(std::move(n));
+    }
+  }
+  // the signature version, as the S3 authenticator tells it
+  const char* auth = info.env->get("HTTP_AUTHORIZATION");
+  const bool in_header = auth && auth[0];
+  bool v4 = false;
+  if (in_header) {
+    const std::string_view a{auth};
+    if (a.starts_with("AWS ")) {
+      return 0;  // SigV2 signs every x-amz-* header
+    }
+    v4 = a.starts_with(AWS4_HMAC_SHA256_STR);
+  } else {
+    v4 = info.args.get("x-amz-algorithm") == AWS4_HMAC_SHA256_STR;
+    if (!v4 && !info.args.get("AWSAccessKeyId").empty()) {
+      return 0;  // presigned SigV2
+    }
+  }
+  if (v4) {
+    std::string_view access_key, scope, signed_headers, signature, date,
+      session_token;
+    if (int r = rgw::auth::s3::parse_v4_credentials(
+          info, access_key, scope, signed_headers, signature, date,
+          session_token, !in_header, dpp); r < 0) {
+      ldpp_dout(dpp, 4) << "hipobj-rc: cannot read the signed headers: "
+                        << cpp_strerror(r) << dendl;
+      return -EACCES;
+    }
+    if (all_signed(signed_headers, names)) {
+      return 0;
+    }
+  }
+  ldpp_dout(dpp, 4) << "hipobj-rc: request carries unsigned x-amz-rdma-* headers"
+                    << dendl;
+  return -EACCES;
 }
 
 void landed_ranges::add(uint64_t ofs, uint64_t len)

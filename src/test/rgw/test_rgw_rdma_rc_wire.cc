@@ -4,7 +4,16 @@
 #include "rgw/rgw_rdma_rc_wire.h"
 #include "rgw/rgw_rdma_cksum.h"
 
+#include <cerrno>
+#include <ctime>
+#include <memory>
+#include <optional>
+
 #include <gtest/gtest.h>
+
+#include "common/ceph_context.h"
+#include "common/dout.h"
+#include "rgw/rgw_common.h"
 
 using namespace rgw::rdma::rc;
 
@@ -215,26 +224,92 @@ TEST(RdmaRcWire, ChecksumHeaders)
 
 TEST(RdmaRcWire, SignedHeaders)
 {
-  const std::string auth =
-    "AWS4-HMAC-SHA256 Credential=AK/20260929/us-east-1/s3/aws4_request, "
-    "SignedHeaders=host;x-amz-date;x-amz-rdma-cookie;x-amz-rdma-token, "
-    "Signature=abcd";
-  auto list = sigv4_signed_headers(auth);
-  ASSERT_TRUE(list);
-  EXPECT_EQ("host;x-amz-date;x-amz-rdma-cookie;x-amz-rdma-token", *list);
-  EXPECT_TRUE(all_signed(*list, {"x-amz-rdma-cookie", "x-amz-rdma-token"}));
-  EXPECT_TRUE(all_signed(*list, {}));
-  EXPECT_FALSE(all_signed(*list, {"x-amz-rdma-psn"}));
+  const std::string_view list =
+    "host;x-amz-date;x-amz-rdma-cookie;x-amz-rdma-token";
+  EXPECT_TRUE(all_signed(list, {"x-amz-rdma-cookie", "x-amz-rdma-token"}));
+  EXPECT_TRUE(all_signed(list, {}));
+  EXPECT_FALSE(all_signed(list, {"x-amz-rdma-psn"}));
   // exact entries only, not substrings
-  EXPECT_FALSE(all_signed(*list, {"x-amz-rdma"}));
-  EXPECT_FALSE(all_signed(*list, {"amz-date"}));
+  EXPECT_FALSE(all_signed(list, {"x-amz-rdma"}));
+  EXPECT_FALSE(all_signed(list, {"amz-date"}));
+  // the entry may be the last one
+  EXPECT_TRUE(all_signed("host;x-amz-rdma-op", {"x-amz-rdma-op"}));
+}
 
-  EXPECT_FALSE(sigv4_signed_headers("AWS AK:signature"));
-  EXPECT_FALSE(sigv4_signed_headers("AWS4-HMAC-SHA256 Credential=x, Signature=y"));
-  // the list may be the last component
-  auto last = sigv4_signed_headers("AWS4-HMAC-SHA256 Credential=x,SignedHeaders=host;x-amz-rdma-op");
-  ASSERT_TRUE(last);
-  EXPECT_TRUE(all_signed(*last, {"x-amz-rdma-op"}));
+TEST(RdmaRcWire, CheckSigned)
+{
+  // the control routes check the list that the SigV4 verifier signed
+  // over, as its parser reads it, on the route the S3 authenticator
+  // takes. Each request carries x-amz-rdma-cookie and -token, which the
+  // real list signs, and some x-amz-rdma-offset, which it does not
+  auto cct = std::make_unique<CephContext>(CEPH_ENTITY_TYPE_ANY);
+  const NoDoutPrefix dpp(cct.get(), ceph_subsys_rgw);
+  char date[32];
+  const time_t now = time(nullptr);
+  struct tm tm;
+  gmtime_r(&now, &tm);
+  strftime(date, sizeof(date), "%Y%m%dT%H%M%SZ", &tm);
+
+  const std::string real = "host;x-amz-date;x-amz-rdma-cookie;x-amz-rdma-token";
+  const std::string credential =
+    "Credential=AK/20260929/us-east-1/s3/aws4_request";
+  const std::string v4 = "AWS4-HMAC-SHA256 ";
+  const std::string presigned = std::string{} +
+    "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+    "&X-Amz-Credential=AK%2F20260929%2Fus-east-1%2Fs3%2Faws4_request"
+    "&X-Amz-Date=" + date + "&X-Amz-Expires=300";
+  const std::string presigned_list =
+    "&X-Amz-SignedHeaders=host%3Bx-amz-date%3Bx-amz-rdma-cookie%3Bx-amz-rdma-token";
+
+  struct request_t {
+    const char* label;
+    std::optional<std::string> authorization;
+    std::string query;
+    bool offset;
+    int expected;
+  };
+  const request_t requests[] = {
+    {"header SigV4", v4 + credential + ", SignedHeaders=" + real +
+     ", Signature=abcd", {}, false, 0},
+    {"header SigV4, offset unsigned", v4 + credential + ", SignedHeaders=" +
+     real + ", Signature=abcd", {}, true, -EACCES},
+    // a forged list ahead of the one the signature covers
+    {"header SigV4, forged list", v4 + "SignedHeaders=" + real +
+     ";x-amz-rdma-offset, " + credential + ", SignedHeaders=" + real +
+     ", Signature=abcd", {}, true, -EACCES},
+    {"header SigV4 without a signature", v4 + credential +
+     ", SignedHeaders=" + real, {}, false, -EACCES},
+    {"header SigV2", "AWS AK:c2lnbmF0dXJl", {}, true, 0},
+    // an empty Authorization header leaves the query to authenticate
+    {"presigned SigV4", "", presigned + presigned_list +
+     "&X-Amz-Signature=abcd", false, 0},
+    {"presigned SigV4, offset unsigned", std::nullopt, presigned +
+     presigned_list + "&X-Amz-Signature=abcd", true, -EACCES},
+    {"presigned SigV4 without a signature", std::nullopt, presigned +
+     presigned_list, false, -EACCES},
+    {"presigned SigV2", std::nullopt,
+     "AWSAccessKeyId=AK&Expires=4102444800&Signature=c2lnbmF0dXJl", true, 0},
+    {"not signed", std::nullopt, {}, false, -EACCES},
+  };
+  for (const auto& r : requests) {
+    SCOPED_TRACE(r.label);
+    RGWEnv env;
+    env.set("REQUEST_URI", r.query.empty() ? "/.hipobj-rc/prepare" :
+            "/.hipobj-rc/prepare?" + r.query);
+    if (r.authorization) {
+      env.set("HTTP_AUTHORIZATION", *r.authorization);
+    }
+    env.set("HTTP_X_AMZ_DATE", date);
+    env.set("HTTP_X_AMZ_RDMA_COOKIE", "1a2b3c4d");
+    env.set("HTTP_X_AMZ_RDMA_TOKEN", std::string(TOKEN_HEX_LEN, '0'));
+    if (r.offset) {
+      env.set("HTTP_X_AMZ_RDMA_OFFSET", "2097152");
+    }
+    req_info info(cct.get(), &env);
+    info.args.set(info.request_params);
+    ASSERT_EQ(0, info.args.parse(&dpp));
+    EXPECT_EQ(r.expected, check_signed(&dpp, info));
+  }
 }
 
 TEST(RdmaRcWire, LandedRanges)

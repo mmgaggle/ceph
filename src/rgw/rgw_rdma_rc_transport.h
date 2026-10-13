@@ -25,6 +25,8 @@
 
 #include "include/common_fwd.h"
 
+class optional_yield;
+
 /**
  * Reliable Connection transport for the hipobj-rc-v2 data phase.
  *
@@ -32,10 +34,11 @@
  * domain, and the port topology (GID, LID) that every session shares.
  * Each session owns one Connection: a completion queue and an RC queue
  * pair that PREPARE leaves in INIT and READY pairs against the client's
- * queue pair before the transfer. Memory the sessions transfer from is
- * registered once on the device's protection domain, so the same
- * registration also serves a DC target created on it (see
- * rgw_rdma_dc_target.h).
+ * queue pair before the transfer. Each session's buffer is registered
+ * for that session alone. A GET's goes on the device's protection
+ * domain, so that the same registration also serves a DC target created
+ * on it (see rgw_rdma_dc_target.h); a PUT's buffer and queue pair get a
+ * protection domain of their own, which no other queue pair is on.
  */
 namespace rgw::rdma::rc {
 
@@ -68,9 +71,19 @@ class Device {
   ibv_mtu path_mtu() const { return mtu; }
   const std::string& name() const { return dev_name; }
 
-  /// register [ptr, ptr+len) for local and remote read/write access
-  ibv_mr* register_memory(void* ptr, size_t len);
-  static void deregister_memory(ibv_mr* mr);
+  /// a protection domain apart from the device's: memory registered on
+  /// it is reachable only through queue pairs created on it. Null, with
+  /// errno set, on failure
+  ibv_pd* alloc_pd();
+  /// 0, or the errno ibv_dealloc_pd() gave
+  static int dealloc_pd(ibv_pd* pd);
+
+  /// register [ptr, ptr+len) with access, a mask of IBV_ACCESS_* flags,
+  /// on pd, or on the device's protection domain when pd is null
+  ibv_mr* register_memory(void* ptr, size_t len, int access,
+                          ibv_pd* pd = nullptr);
+  /// 0, or the errno ibv_dereg_mr() gave: the key then still works
+  static int deregister_memory(ibv_mr* mr);
 
   /// ibv_post_send() that works from any thread. See post_proxy.
   int post_send(ibv_qp* qp, ibv_send_wr* wr, ibv_send_wr** bad);
@@ -139,10 +152,12 @@ class Connection {
   Connection(const Connection&) = delete;
   Connection& operator=(const Connection&) = delete;
 
-  /// create the queue pair on dev and move it to INIT; dev must
-  /// outlive the connection
+  /// create the queue pair on dev and move it to INIT, accepting the
+  /// remote operations of access (IBV_ACCESS_REMOTE_* flags). It goes on
+  /// pd, or on the device's protection domain when pd is null; dev and
+  /// pd must outlive the connection
   int create(CephContext* cct, Device& dev, uint32_t send_depth,
-             uint32_t recv_depth);
+             uint32_t recv_depth, int access, ibv_pd* pd = nullptr);
   void destroy();
 
   /// INIT -> RTR against the peer -> RTS with our send PSN
@@ -165,17 +180,30 @@ class Connection {
   /// receive buffer for the peer's write-with-immediate
   int post_recv(ibv_mr* mr, void* ptr, uint32_t len, uint64_t wr_id);
 
-  /// wait for one completion; on OK, wc holds it
-  Completion poll_one(ibv_wc& wc, std::chrono::steady_clock::time_point deadline);
+  /// wait for one completion; on OK, wc holds it. With a yield context
+  /// the wait suspends the request until the completion channel signals
+  /// or the deadline passes, so that the frontend thread serves other
+  /// requests meanwhile; without one it polls.
+  Completion poll_one(ibv_wc& wc, std::chrono::steady_clock::time_point deadline,
+                      optional_yield y);
 
   /// count of signaled sends not yet reaped by poll_one()
   uint32_t outstanding() const { return inflight; }
   void reaped() { if (inflight) --inflight; }
 
  private:
+  /// wait in y until the channel signals or until passes; negative
+  /// errno when reading the channel fails
+  int wait_event(optional_yield y,
+                 std::chrono::steady_clock::time_point until);
+
   Device* dev = nullptr;
+  ibv_comp_channel* channel = nullptr;
   ibv_cq* cq = nullptr;
   ibv_qp* qp = nullptr;
+  int access = 0;
+  /// the completion queue was asked for an event on its next completion
+  bool armed = false;
   uint32_t inflight = 0;
 };
 

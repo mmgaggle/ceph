@@ -169,15 +169,23 @@ int Service::do_init(CephContext* c)
       ceph::oob::ofi_where(loc, oob.cluster, &oc.domain, &oc.node);
       // OSD writes land only while a manual-progress provider is polled
       oc.progress_thread = true;
-      // a relay window gets a new key when its session ends: verbs
-      // caches registrations, and hands back the old key, unless the
-      // cache is off
+      // a relay window is closed when its session ends, which revokes
+      // its key only when the provider does not keep the region: verbs
+      // caches registrations unless the cache is off
       setenv("FI_MR_CACHE_MONITOR", "disabled", 0);
       std::string err;
       ofi_ep = ceph::ofi::Endpoint::open(oc, &err);
       if (ofi_ep) {
         ldout(cct, 1) << "rgw_rdma_rc: OSD-direct relay windows over "
                       << "libfabric: " << ofi_ep->describe() << dendl;
+        ofi_revokes_keys = ofi_close_revokes_key();
+        if (!ofi_revokes_keys) {
+          ldout(cct, 1) << "rgw_rdma_rc: a closed relay window keeps its key "
+                        << "(" << ofi_ep->last_error() << "); each relay "
+                        << "buffer stays out of use for "
+                        << ofi_ep->key_quarantine().count()
+                        << "ms after its session" << dendl;
+        }
       } else {
         ldout(cct, 1) << "rgw_rdma_rc: libfabric relay windows unavailable ("
                       << err << ")" << dendl;
@@ -227,24 +235,24 @@ void Service::do_shutdown()
   {
     std::unique_lock l(mtx);
     // no handler may still hold a session by now; destroy every queue
-    // pair before the memory it references
+    // pair before the memory it references. The arena, which holds the
+    // memory, goes after the service, and nothing takes from it any more
     for (auto& [id, s] : sessions) {
       s->conn.destroy();
+      if (s->buf) {
+        free_buffer(*s->buf);
+      }
     }
     sessions.clear();
+    for (auto& b : held) {
+      free_buffer(*b);
+    }
+    held.clear();
   }
 #ifdef WITH_OOB_OFI
-  // closes the relay windows' regions and stops polling before the
-  // memory goes away
+  // stops polling
   ofi_ep.reset();
 #endif
-  // the arena, which holds the memory, goes after the service
-  for (auto& b : pool) {
-    Device::deregister_memory(b.mr);
-    b.mr = nullptr;
-    b.ptr = nullptr;
-  }
-  pool.clear();
 #ifdef HAVE_MLX5DV
   dct.reset();
 #endif
@@ -265,115 +273,163 @@ bool Service::osd_direct() const
 #endif
 }
 
-Buffer* Service::acquire_buffer(size_t needed)
+std::unique_ptr<Buffer> Service::make_buffer(Op op, size_t size)
 {
-  // caller holds mtx
-  const auto now = clock::now();
-  Buffer* best = nullptr;
-  for (auto& b : pool) {
-    if (!b.in_use && b.size >= needed && now >= b.quarantined_until &&
-        (!best || b.size < best->size)) {
-      best = &b;
-    }
-  }
-  // a buffer of the transfer's own size, rather than a larger one
-  if (!best || best->size > ceph::oob::Arena::round(needed)) {
-    if (Buffer* b = make_buffer(needed)) {
-      best = b;
-    }
-  }
-  if (best) {
-    best->in_use = true;
-  }
-  return best;
-}
-
-Buffer* Service::make_buffer(size_t needed)
-{
-  // caller holds mtx
-  const auto slice = arena->alloc(needed);
+  // no lock: the arena, the device and the endpoint take their own, and
+  // registering up to 64 MiB takes a while
+  const auto slice = arena->alloc(size);
   if (!slice) {
     return nullptr;
   }
-  Buffer b;
-  b.ptr = arena->ptr(slice);
-  b.size = slice.len;
-  // nothing of what the arena held before reaches a client
-  std::memset(b.ptr, 0, b.size);
-  b.mr = dev.register_memory(b.ptr, b.size);
-  if (!b.mr) {
-    lderr(cct) << "rgw_rdma_rc: ibv_reg_mr failed for a buffer of " << b.size
+  auto b = std::make_unique<Buffer>();
+  b->slice = slice;
+  b->ptr = arena->ptr(slice);
+  b->size = size;
+  // Nothing reads the buffer from the network. A PUT's buffer and queue
+  // pair get a protection domain of their own: no other session's queue
+  // pair reaches the buffer, whatever key it holds or a device hands out
+  // again, and a write that the session's queue pair takes lands in this
+  // buffer or nowhere. The registration covers exactly the session's
+  // size, so the write of that size that READY takes fills it. The
+  // buffer is zeroed as well, so that nothing an earlier user of the
+  // memory left in it can be stored should a write ever fall short of
+  // that. A GET buffer is written by the OSDs when they relay through
+  // the DC target, and only its landed bytes are pushed.
+  int access = 0;
+  if (op == Op::PUT) {
+    b->pd = dev.alloc_pd();
+    if (!b->pd) {
+      lderr(cct) << "rgw_rdma_rc: ibv_alloc_pd failed: " << cpp_strerror(errno)
+                 << dendl;
+      arena->free(slice);
+      return nullptr;
+    }
+    std::memset(b->ptr, 0, size);
+    access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+  }
+#ifdef HAVE_MLX5DV
+  if (op == Op::GET && dct) {
+    access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+  }
+#endif
+  b->mr = dev.register_memory(b->ptr, size, access, b->pd);
+  if (!b->mr) {
+    lderr(cct) << "rgw_rdma_rc: ibv_reg_mr failed for a buffer of " << size
                << " bytes: " << cpp_strerror(errno) << dendl;
+    Device::dealloc_pd(b->pd);
     arena->free(slice);
     return nullptr;
   }
+  if (op == Op::GET) {
 #ifdef HAVE_MLX5DV
-  if (dct) {
-    b.osd_token = dct->token(b.ptr, static_cast<uint32_t>(b.size), b.mr->rkey);
-  }
+    if (dct) {
+      b->osd_token = dct->token(b->ptr, static_cast<uint32_t>(size),
+                                b->mr->rkey);
+    }
 #endif
 #ifdef WITH_OOB_OFI
-  if (ofi_ep) {
-    ceph::ofi::Endpoint::window_t w;
-    if (int r = ofi_ep->register_window(static_cast<char*>(b.ptr), b.size, &w);
-        r == 0) {
-      b.osd_token = ofi_ep->window_token(w, 0, b.size);
-      b.ofi_window = w.id;
-      b.ofi_registered = true;
-    } else {
-      // this buffer relays through the gateway
-      ldout(cct, 1) << "rgw_rdma_rc: registering a relay window over "
-                    << "libfabric failed (" << ofi_ep->last_error() << ")"
-                    << dendl;
+    if (ofi_ep) {
+      ceph::ofi::Endpoint::window_t w;
+      if (int r = ofi_ep->register_window(static_cast<char*>(b->ptr), size, &w);
+          r == 0) {
+        b->osd_token = ofi_ep->window_token(w, 0, size);
+        b->ofi_window = w.id;
+        b->ofi_registered = true;
+      } else {
+        // this session relays through the gateway
+        ldout(cct, 1) << "rgw_rdma_rc: registering a relay window over "
+                      << "libfabric failed (" << ofi_ep->last_error() << ")"
+                      << dendl;
+      }
     }
-  }
 #endif
-  ldout(cct, 10) << "rgw_rdma_rc: new buffer of " << b.size << " bytes; "
-                 << pool.size() + 1 << " in the pool" << dendl;
-  pool.push_back(std::move(b));
-  return &pool.back();
+  }
+  return b;
 }
 
-void Service::release_buffer(Buffer* b, std::chrono::milliseconds quarantine)
+std::unique_ptr<Buffer> Service::release_buffer(
+  std::unique_ptr<Buffer> b, std::chrono::milliseconds quarantine)
 {
-  // caller holds mtx
+  // caller does not hold mtx; the session's queue pair is gone
   if (!b) {
-    return;
+    return nullptr;
   }
-  b->in_use = false;
 #ifdef WITH_OOB_OFI
-  if (ofi_ep && b->ofi_registered) {
-    // A new key, so that no OSD write meant for the last session lands
-    // once the buffer serves another: not one a failed relay left in
-    // flight, and not a provider's late duplicate of one that completed,
-    // which the delivery lease does not bound. After a session that left
-    // no write in flight the buffer is free at once. After one that did
-    // (a quarantine: its reads failed, or one was resent) it keeps its
-    // quarantine anyway, and the key quarantine at least: those writes may
-    // still be on the way, and the new key keeps them out only if the
-    // provider drops what carries the old one.
-    const ceph::ofi::Endpoint::window_t w{b->ofi_window,
-					  static_cast<char*>(b->ptr), b->size};
-    if (int r = ofi_ep->rekey_window(w); r == 0) {
-      b->osd_token = ofi_ep->window_token(w, 0, b->size);
-      if (quarantine.count() == 0) {
-        b->quarantined_until = clock::time_point::min();
-        return;
-      }
-      quarantine = std::max(quarantine, ofi_ep->key_quarantine());
-    } else {
-      ldout(cct, 1) << "rgw_rdma_rc: re-keying a relay window: "
-                    << cpp_strerror(r) << " (" << ofi_ep->last_error()
-                    << "); keeping it out of use" << dendl;
+  if (b->ofi_registered) {
+    // Closing the window retires its key, so that no OSD write meant for
+    // the session lands once the memory serves another: not one a failed
+    // relay left in flight, and not a provider's late duplicate of one
+    // that completed, which the delivery lease does not bound. After a
+    // session that left no write in flight the buffer is free at once.
+    // After one that did (a quarantine: its reads failed, or one was
+    // resent) it keeps its quarantine anyway, and the key quarantine at
+    // least: those writes may still be on the way, and the retired key
+    // keeps them out only if the provider drops what carries it. So does
+    // every buffer when closing does not revoke the key.
+    ofi_ep->deregister_window(b->ofi_window);
+    b->ofi_registered = false;
+    if (quarantine.count() > 0 || !ofi_revokes_keys) {
       quarantine = std::max(quarantine, ofi_ep->key_quarantine());
     }
   }
 #endif
   if (quarantine.count() > 0) {
-    b->quarantined_until = std::max(b->quarantined_until,
-                                    clock::now() + quarantine);
+    // the verbs registration stays until then, so that the key a DC
+    // write carries names no other memory meanwhile
+    b->held_until = clock::now() + quarantine;
+    return b;
   }
+  free_buffer(*b);
+  return nullptr;
 }
+
+void Service::free_buffer(Buffer& b)
+{
+#ifdef WITH_OOB_OFI
+  if (b.ofi_registered) {
+    ofi_ep->deregister_window(b.ofi_window);
+    b.ofi_registered = false;
+  }
+#endif
+  if (int r = Device::deregister_memory(b.mr); r != 0) {
+    // the key still reaches the memory: it never serves another session
+    lderr(cct) << "rgw_rdma_rc: ibv_dereg_mr failed for a buffer of "
+               << b.size << " bytes: " << cpp_strerror(r)
+               << "; keeping it out of use" << dendl;
+  } else {
+    // the queue pair went first
+    if (int r = Device::dealloc_pd(b.pd); r != 0) {
+      ldout(cct, 1) << "rgw_rdma_rc: ibv_dealloc_pd failed: "
+                    << cpp_strerror(r) << dendl;
+    }
+    // nothing exposes the memory any more
+    arena->free(b.slice);
+  }
+  b.mr = nullptr;
+  b.pd = nullptr;
+  b.slice = {};
+  b.ptr = nullptr;
+}
+
+#ifdef WITH_OOB_OFI
+bool Service::ofi_close_revokes_key()
+{
+  // a provider whose registration cache keeps a closed region, and with
+  // it the key, hands that key back when the memory is registered again
+  const auto slice = arena->alloc(ceph::oob::Arena::MIN);
+  if (!slice) {
+    return false;
+  }
+  bool revokes = false;
+  ceph::ofi::Endpoint::window_t w;
+  if (ofi_ep->register_window(arena->ptr(slice), slice.len, &w) == 0) {
+    revokes = ofi_ep->rekey_window(w) == 0;
+    ofi_ep->deregister_window(w.id);
+  }
+  arena->free(slice);
+  return revokes;
+}
+#endif
 
 bool Service::limits_take(const std::string& principal)
 {
@@ -449,40 +505,40 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
   }
 
   {
-    std::unique_lock l(mtx);
+    std::lock_guard l(mtx);
     if (!limits_take(req.principal)) {
       return Error::LIMIT;
     }
-    s->buf = acquire_buffer(req.size);
-    if (!s->buf) {
-      limits_release(req.principal);
-      // for the 503: a buffer an OSD write may still land in counts
-      // against the pool until its quarantine passes
-      const auto now = clock::now();
-      size_t in_use = 0, held = 0;
-      for (const auto& b : pool) {
-        if (b.in_use) {
-          in_use++;
-        } else if (now < b.quarantined_until) {
-          held++;
-        }
-      }
-      ldout(cct, 4) << "rgw_rdma_rc: no free buffer: " << in_use
-                    << " in use, " << held << " in quarantine" << dendl;
-      return Error::NO_BUFFER;
-    }
+  }
+  s->buf = make_buffer(s->op, req.size);
+  if (!s->buf) {
+    std::lock_guard l(mtx);
+    limits_release(req.principal);
+    // for the 503: a buffer an OSD write may still land in stays out of
+    // the arena until its quarantine passes
+    ldout(cct, 4) << "rgw_rdma_rc: no buffer of " << req.size << " bytes: "
+                  << sessions.size() << " sessions, " << held.size()
+                  << " buffers in quarantine" << dendl;
+    return Error::NO_BUFFER;
   }
 
   auto rollback = [&] {
+    // the queue pair goes first: a posted receive references the buffer.
+    // Nobody got the buffer's address or keys yet
+    s->conn.destroy();
+    free_buffer(*s->buf);
     std::lock_guard l(mtx);
-    release_buffer(s->buf, {});
     limits_release(req.principal);
   };
 
   // the queue pair is created per session and left in INIT until READY
   // pairs it; the depth bounds how many writes a relay can leave
-  // unreaped while it streams
-  if (s->conn.create(cct, dev, send_depth, RECV_DEPTH) < 0) {
+  // unreaped while it streams. Only a PUT client writes into the
+  // gateway, through the buffer's own protection domain, and nobody
+  // reads from it
+  const int qp_access = s->op == Op::PUT ? IBV_ACCESS_REMOTE_WRITE : 0;
+  if (s->conn.create(cct, dev, send_depth, RECV_DEPTH, qp_access,
+                     s->buf->pd) < 0) {
     rollback();
     return Error::WIRE;
   }
@@ -534,19 +590,18 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
       }
       s->id.clear();
     }
-    if (s->id.empty()) {
-      release_buffer(s->buf, {});
-      limits_release(req.principal);
-      return Error::INTERNAL;
+    if (!s->id.empty()) {
+      reply.session_id = s->id;
+      ldout(cct, 20) << "rgw_rdma_rc: prepared session " << s->id << " op="
+                     << (s->op == Op::GET ? "GET" : "PUT") << " target="
+                     << s->target << " size=" << s->size << " offset="
+                     << s->offset << " qpn=" << reply.server_qpn << dendl;
+      sessions.emplace(s->id, std::move(s));
+      return Error::OK;
     }
-    reply.session_id = s->id;
-    ldout(cct, 20) << "rgw_rdma_rc: prepared session " << s->id << " op="
-                   << (s->op == Op::GET ? "GET" : "PUT") << " target="
-                   << s->target << " size=" << s->size << " offset="
-                   << s->offset << " qpn=" << reply.server_qpn << dendl;
-    sessions.emplace(s->id, std::move(s));
   }
-  return Error::OK;
+  rollback();
+  return Error::INTERNAL;
 }
 
 Error Service::info(const std::string& id, const std::string& principal,
@@ -665,8 +720,8 @@ void Service::finish(Session* s, Outcome outcome, uint64_t bytes,
   s->io_refs = 0;
   s->reap_pending = true;
   s->state = State::REAPING;
-  // the reap hands it to release_buffer(), which re-keys the buffer and
-  // must not mistake it for a clean one
+  // the reap hands it to release_buffer(), which closes the buffer's
+  // windows and must not mistake it for a clean one
   s->quarantine = quarantine;
   reap_locked(l, s->id);
 }
@@ -713,21 +768,22 @@ void Service::reap_locked(std::unique_lock<std::mutex>& lock,
   }
   std::unique_ptr<Session> s = std::move(it->second);
   sessions.erase(it);
-  Buffer* buf = s->buf;
-  s->buf = nullptr;
   limits_release(s->principal);
   ldout(cct, 20) << "rgw_rdma_rc: reaping session " << s->id << " ("
                  << to_string(s->last_outcome) << ", quarantine "
                  << s->quarantine.count() << "ms)" << dendl;
-  // the queue pair must be gone before its buffer can be handed out
-  // again: a posted work request may still reference the region
+  // the queue pair must be gone before its buffer is: a posted work
+  // request may still reference the region
   lock.unlock();
   s->conn.destroy();
-  lock.lock();
   // with the quarantine finish() was given. A session reaped without
   // finish() has none: it never ran a data phase, or went back to
   // PREPARED after one that left no write in flight.
-  release_buffer(buf, s->quarantine);
+  auto hold = release_buffer(std::move(s->buf), s->quarantine);
+  lock.lock();
+  if (hold) {
+    held.push_back(std::move(hold));
+  }
 }
 
 void Service::reaper_loop()
@@ -739,6 +795,23 @@ void Service::reaper_loop()
       break;
     }
     const auto now = clock::now();
+    // buffers whose quarantine passed go back to the arena
+    std::vector<std::unique_ptr<Buffer>> due;
+    for (auto it = held.begin(); it != held.end(); ) {
+      if (now >= (*it)->held_until) {
+        due.push_back(std::move(*it));
+        it = held.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (!due.empty()) {
+      l.unlock();
+      for (auto& b : due) {
+        free_buffer(*b);
+      }
+      l.lock();
+    }
     std::vector<std::string> expired;
     for (auto& [id, s] : sessions) {
       if (s->io_refs > 0) {

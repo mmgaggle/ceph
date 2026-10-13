@@ -20,6 +20,9 @@
 #include <string_view>
 #include <vector>
 
+class DoutPrefixProvider;
+struct req_info;
+
 /**
  * Wire encoding of the hipobj-rc-v2 control protocol.
  *
@@ -38,9 +41,10 @@
  *                             transfer and answers with the outcome
  *   POST /.hipobj-rc/cancel   session  ->  tears the session down
  *
- * Everything here is pure: parsers and formatters for the header
- * values, with no transport or request state, so the encoding can be
- * unit tested on hosts without RDMA hardware. The protocol is defined
+ * Everything here is free of the transport, so it can be unit tested on
+ * hosts without RDMA hardware: parsers and formatters for the header
+ * values, which hold no request state, and check_signed(), which reads
+ * a request's signature headers. The protocol is defined
  * by AMD's hipObject client library; the header names and value
  * formats below mirror its reference server.
  */
@@ -139,17 +143,21 @@ std::optional<target_t> parse_target(std::string_view target);
 std::string build_target(std::string_view bucket, std::string_view key,
                          std::string_view query = {});
 
-/// the SignedHeaders list of a SigV4 Authorization header value
-/// ("AWS4-HMAC-SHA256 Credential=..., SignedHeaders=a;b, Signature=...");
-/// nullopt when the header is not SigV4 or carries no list
-std::optional<std::string_view> sigv4_signed_headers(std::string_view authorization);
-
 /// true when every name (lowercase) is an entry of the ';'-separated
 /// signed-headers list. Unsigned protocol headers could be rewritten by
 /// anything on the path without breaking the signature, so the control
 /// routes require all x-amz-rdma-* request headers to be signed.
 bool all_signed(std::string_view signed_list,
                 const std::vector<std::string>& names);
+
+/// 0 when the signature of the request covers every x-amz-rdma-* header
+/// it carries, -EACCES otherwise. The signature version and route are
+/// the ones the S3 authenticator picks, and the signed list is the one
+/// the SigV4 signature was verified over, read by the verifier's own
+/// parser: a list placed where that parser does not look vouches for
+/// nothing. SigV2, in the header or presigned, signs every x-amz-*
+/// header.
+int check_signed(const DoutPrefixProvider* dpp, const req_info& info);
 
 /**
  * The byte ranges of a relay window that hold object data. OSDs place

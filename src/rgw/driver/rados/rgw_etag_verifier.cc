@@ -4,15 +4,44 @@
 #include "rgw_etag_verifier.h"
 #include "rgw_obj_manifest.h"
 
+#include <algorithm>
+#include <cctype>
+
 #define dout_subsys ceph_subsys_rgw
 
 namespace rgw::putobj {
+
+namespace {
+
+/// whether etag has the form of a multipart upload's: an MD5 in hex, a
+/// dash and a count
+bool is_multipart_etag(std::string_view etag)
+{
+  // as an attr holds it, with a trailing NUL, or quoted
+  while (!etag.empty() && (etag.back() == '\0' || etag.back() == '"')) {
+    etag.remove_suffix(1);
+  }
+  while (!etag.empty() && etag.front() == '"') {
+    etag.remove_prefix(1);
+  }
+  constexpr size_t md5_hex = CEPH_CRYPTO_MD5_DIGESTSIZE * 2;
+  if (etag.size() < md5_hex + 2 || etag[md5_hex] != '-') {
+    return false;
+  }
+  const auto hex = [] (char c) { return std::isxdigit((unsigned char)c); };
+  const auto digit = [] (char c) { return std::isdigit((unsigned char)c); };
+  return std::all_of(etag.begin(), etag.begin() + md5_hex, hex) &&
+         std::all_of(etag.begin() + md5_hex + 1, etag.end(), digit);
+}
+
+} // anonymous namespace
 
 int create_etag_verifier(const DoutPrefixProvider *dpp, 
                          CephContext* cct, rgw::sal::DataProcessor* filter,
                          const bufferlist& manifest_bl,
                          const std::optional<RGWCompressionInfo>& compression,
-                         etag_verifier_ptr& verifier)
+                         etag_verifier_ptr& verifier,
+                         std::string_view etag)
 {
   RGWObjManifest manifest;
 
@@ -33,6 +62,14 @@ int create_etag_verifier(const DoutPrefixProvider *dpp,
 
   if (rule.start_part_num == 0) {
     /* Atomic object */
+    if (is_multipart_etag(etag)) {
+      // an ETag that is not the MD5 of the data, such as the MD5 of the
+      // stripes' CRCs an OSD-direct PUT stores: the MD5 this verifier
+      // computes could never match it
+      ldpp_dout(dpp, 4) << "the etag of an atomic object has the multipart "
+          "form, not the MD5 of its data" << dendl;
+      return -ENOTSUP;
+    }
     verifier.emplace<ETagVerifier_Atomic>(cct, filter);
     return 0;
   }

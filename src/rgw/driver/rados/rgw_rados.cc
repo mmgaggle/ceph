@@ -3845,9 +3845,13 @@ public:
     }
 
     if (try_etag_verify) {
+      std::string_view src_etag;
+      if (auto i = src_attrs.find(RGW_ATTR_ETAG); i != src_attrs.end()) {
+        src_etag = std::string_view(i->second.c_str(), i->second.length());
+      }
       ret = rgw::putobj::create_etag_verifier(dpp, cct, filter, manifest_bl,
                                               compression_info,
-                                              etag_verifier);
+                                              etag_verifier, src_etag);
       if (ret < 0) {
         ldpp_dout(dpp, 4) << "failed to initial etag verifier, "
             "disabling etag verification" << dendl;

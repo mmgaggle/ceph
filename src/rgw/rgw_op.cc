@@ -2586,11 +2586,19 @@ int RGWGetObj::get_data_cb(bufferlist& bl, off_t bl_ofs, off_t bl_len)
   if (rdma_oob_mode() && bl_len > 0) {
     // the store streamed data instead of honoring the passthrough
     // contract (rgw_sal.h) - e.g. a SAL store or filter that predates
-    // params.rdma_token. Reject it before any HTTP bytes are committed
-    // so execute() transparently restarts in a fallback mode.
+    // params.rdma_token, or the D4N filter, which does not pass it on. It
+    // sent nothing out of band then (execute() checks), and no HTTP
+    // bytes are committed yet, so serve this read in a fallback mode.
+    // Failing it to restart in that mode would run iterate() twice on
+    // the same ReadOp, which D4N's, keeping state for one pass, cannot
+    // take.
     ldpp_dout(this, 4) << "rdma passthrough: store returned inline data, "
                        << "falling back" << dendl;
-    return -EOPNOTSUPP;
+    rdma_switched_from = rdma_mode;
+    select_rdma_mode(false);
+  }
+  if (rdma_mode == RdmaMode::STAGED) {
+    return rdma_stage(bl, bl_ofs, bl_len);
   }
   /* garbage collection related handling:
    * defer_gc disabled for https://tracker.ceph.com/issues/47866 */
@@ -2704,7 +2712,9 @@ void RGWGetObj::note_rdma_reads(bool submitted, bool needed, bool resent,
   f.sent = true;
   f.needed = needed;
   f.resent = resent;
-  f.client_window = rdma_mode == RdmaMode::PASSTHROUGH;
+  // the mode they went out in, before any switch in get_data_cb()
+  f.client_window = (rdma_switched_from != RdmaMode::NONE ?
+                     rdma_switched_from : rdma_mode) == RdmaMode::PASSTHROUGH;
   f.settled = false;
   f.wait_ms = static_cast<uint64_t>(std::ceil(fence_s * 1000.0));
 }
@@ -2793,7 +2803,8 @@ void RGWGetObj::select_rdma_mode(bool plain_chain)
     }
     return;
   }
-  if (rdma_token.empty() || !get_data || get_type() != RGW_OP_GET_OBJ) {
+  if (rdma_token.empty() || !get_data || get_type() != RGW_OP_GET_OBJ ||
+      !rdma_eligible()) {
     return;
   }
   if (plain_chain && rdma_osd_direct(s->cct, rdma_token)) {
@@ -2815,8 +2826,18 @@ void RGWGetObj::select_rdma_mode(bool plain_chain)
   if (auto* cuobj = RGWCuObjServer::get_instance();
       cuobj && cuobj->is_available() &&
       ceph::rdma::is_cuobj_descriptor(rdma_token)) {
-    // reserve the staging buffer up front: once the response headers
-    // are out there is no way left to signal a staging failure
+    // the one write goes to the start of the client's window, which
+    // must hold the whole response, as for passthrough
+    auto window = ceph::rdma::parse_rdma_token(rdma_token);
+    if (!window || total_len > window->size) {
+      ldpp_dout(this, 4) << "rgw_cuobj: staging not eligible: "
+                         << (window ? "response larger than client window"
+                                    : "malformed token")
+                         << ", serving the body over HTTP" << dendl;
+      return;
+    }
+    // reserve the staging buffer up front: without one the body goes
+    // over HTTP
     if (!rdma_buf) {
       rdma_buf = cuobj->acquire_buffer(total_len);
       rdma_buf_offset = 0;
@@ -2830,6 +2851,69 @@ void RGWGetObj::select_rdma_mode(bool plain_chain)
   }
 #endif
   // otherwise NONE: data goes over HTTP with x-amz-rdma-reply: 501
+}
+
+int RGWGetObj::rdma_stage(bufferlist& bl, off_t bl_ofs, off_t bl_len)
+{
+#ifdef WITH_CUOBJ
+  if (bl_len <= 0) {
+    return 0;
+  }
+  // nothing past the response, which fits the client's window
+  auto* entry = static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf);
+  if (!entry || rdma_buf_offset + bl_len > total_len ||
+      rdma_buf_offset + bl_len > entry->size) {
+    ldpp_dout(this, 0) << "rgw_cuobj: ERROR: staging buffer overflow at "
+                       << rdma_buf_offset << "+" << bl_len << dendl;
+    return -EIO;
+  }
+  memcpy(static_cast<char*>(entry->ptr) + rdma_buf_offset,
+         bl.c_str() + bl_ofs, bl_len);
+  rdma_buf_offset += bl_len;
+  return 0;
+#else
+  return -EOPNOTSUPP;
+#endif
+}
+
+int RGWGetObj::rdma_write_staged()
+{
+#ifdef WITH_CUOBJ
+  auto* cuobj = RGWCuObjServer::get_instance();
+  auto* entry = static_cast<RGWCuObjServer::RDMABufEntry*>(rdma_buf);
+  const auto window = ceph::rdma::parse_rdma_token(rdma_token);
+  if (!cuobj || !entry || !window) {
+    return -EIO;
+  }
+  // the whole response, and never past the client's window
+  if (rdma_buf_offset != total_len || rdma_buf_offset > window->size) {
+    ldpp_dout(this, 0) << "rgw_cuobj: ERROR: staged " << rdma_buf_offset
+                       << " of " << total_len << " bytes for a window of "
+                       << window->size << dendl;
+    return -EIO;
+  }
+  ssize_t ret = 0;
+  if (rdma_buf_offset > 0) {
+    ret = cuobj->rdma_write_to_client(s->object->get_name(), entry, 0,
+                                      rdma_buf_offset, rdma_token);
+  }
+  cuobj->release_buffer(entry);
+  rdma_buf = nullptr;
+  if (ret < 0) {
+    ldpp_dout(this, 0) << "rgw_cuobj: ERROR: failed to write to client via "
+                       << "RDMA: " << cpp_strerror(ret) << dendl;
+    return -EIO;
+  }
+  if (static_cast<size_t>(ret) != rdma_buf_offset) {
+    ldpp_dout(this, 0) << "rgw_cuobj: ERROR: RDMA wrote " << ret << " of "
+                       << rdma_buf_offset << " bytes to the client" << dendl;
+    return -EIO;
+  }
+  s->rdma_bytes_transferred = rdma_buf_offset;
+  return 0;
+#else
+  return -EOPNOTSUPP;
+#endif
 }
 
 /// the object's stored checksum, when it is a full-object CRC-64/NVME
@@ -3157,13 +3241,29 @@ void RGWGetObj::execute(optional_yield y)
   if (op_ret < 0) {
     rdma_failed_at = "the read";
   }
+  if (rdma_switched_from != RdmaMode::NONE &&
+      read_op->params.rdma_submitted) {
+    // the store streamed data that get_data_cb() switched to a fallback
+    // mode for, and sent descriptor-bearing reads as well, against the
+    // contract (rgw_sal.h): their writes may land in the window over or
+    // after what the fallback put there. Fail behind the fence: a staged
+    // response is still held back, one over HTTP went out already.
+    ldpp_dout(this, 0) << "ERROR: rdma passthrough: the store returned "
+                       << "inline data after sending out-of-band reads"
+                       << dendl;
+    op_ret = -EIO;
+    rdma_failed_at = "the read";
+  }
 
   if (op_ret == -EOPNOTSUPP && rdma_oob_mode()) {
     // an OSD (or the store) cannot push directly - old OSDs, cuObject
     // absent or disabled, an expired lease, a resent op or a push cut
     // off. No HTTP bytes are committed yet, so restart the whole GET in
     // staged (or plain HTTP) mode, once nothing of this attempt can
-    // write the window any more.
+    // write the window any more. Only a store that honors the token
+    // fails so, before it delivers any data (rgw_sal.h), and the RADOS
+    // one can iterate again; a store that streams the data instead was
+    // switched over in get_data_cb().
     ldpp_dout(this, 4) << "rdma passthrough unsupported, restarting GET "
                        << "in fallback mode" << dendl;
     rdma_fence_before("the fallback", false, false);
@@ -3241,7 +3341,18 @@ void RGWGetObj::execute(optional_yield y)
     }
   }
 
+  // before the staged write too, which goes to the client's window
   rdma_fence_before("the response", true, true);
+  if (rdma_mode == RdmaMode::STAGED) {
+    // the response tells the client that its window holds the body, so
+    // it goes out once the write put all of it there; a failed or short
+    // write is an error the client still gets
+    op_ret = rdma_write_staged();
+    if (op_ret < 0) {
+      rdma_failed_at = "the staged RDMA write";
+      goto done_err;
+    }
+  }
   op_ret = send_response_data(bl, 0, 0);
   if (op_ret < 0) {
     rdma_failed_at = "sending the response";

@@ -485,6 +485,9 @@ protected:
   };
   std::string rdma_token;  ///< x-amz-rdma-token header, empty if absent
   RdmaMode rdma_mode = RdmaMode::NONE;
+  /// the out-of-band mode get_data_cb() switched away from when the
+  /// store streamed the data instead; NONE when it did not
+  RdmaMode rdma_switched_from = RdmaMode::NONE;
   /// a gateway memory window for the relay modes: the subclass serving
   /// an RC session sets these before execute(); relay_token is the
   /// cuObject descriptor the OSDs push into (empty = no OSD-direct
@@ -532,14 +535,23 @@ protected:
   std::optional<uint64_t> rdma_crc64;
   std::optional<uint32_t> rdma_crc32c;
   /// staged-mode buffer (an RGWCuObjServer::RDMABufEntry*), reserved at
-  /// mode-selection time because staging failures cannot be signalled
-  /// once response headers are out
+  /// mode-selection time, so that a gateway short of it serves the body
+  /// over HTTP instead
   void* rdma_buf = nullptr;
   size_t rdma_buf_offset = 0;
 
   /// pick rdma_mode for this request; plain_chain is true when no data
   /// filter (compression, encryption, lua, flight) is engaged
   void select_rdma_mode(bool plain_chain);
+  /// whether the data of a request with x-amz-rdma-token may reach the
+  /// client out of band; not when send_response_data() must see it
+  virtual bool rdma_eligible() { return true; }
+  /// staged mode: copy the data the store read into the staging buffer.
+  /// Nothing of the response goes out before rdma_write_staged()
+  int rdma_stage(bufferlist& bl, off_t bl_ofs, off_t bl_len);
+  /// staged mode: RDMA-write the staged response into the client's
+  /// window; 0 once every byte of it is there
+  int rdma_write_staged();
 
   int init_common();
 public:

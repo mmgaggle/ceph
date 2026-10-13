@@ -141,6 +141,22 @@ add_ceph_unittest(unittest_rgw_rdma_fence)
 target_include_directories(unittest_rgw_rdma_fence
   PRIVATE ${CMAKE_SOURCE_DIR}/src/rgw)
 
+# unittest_rgw_rdma_get
+add_executable(unittest_rgw_rdma_get test_rgw_rdma_get.cc)
+add_ceph_unittest(unittest_rgw_rdma_get)
+target_include_directories(unittest_rgw_rdma_get
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+target_link_libraries(unittest_rgw_rdma_get unit-main ${rgw_libs})
+
+if(WITH_RADOSGW_RADOS)
+# unittest_rgw_etag_verifier
+add_executable(unittest_rgw_etag_verifier test_rgw_etag_verifier.cc)
+add_ceph_unittest(unittest_rgw_etag_verifier)
+target_include_directories(unittest_rgw_etag_verifier
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+target_link_libraries(unittest_rgw_etag_verifier unit-main ${rgw_libs})
+endif()
+
 # unittest_rgw_cors
 add_executable(unittest_rgw_cors
   test_rgw_cors.cc

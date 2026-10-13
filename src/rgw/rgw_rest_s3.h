@@ -45,6 +45,7 @@ protected:
   bool checksum_mode{false};
   std::map<std::string, std::string> crypt_http_responses;
   int override_range_hdr(const rgw::auth::StrategyRegistry& auth_registry, optional_yield y);
+  bool rdma_eligible() override;
 public:
   RGWGetObj_ObjStore_S3() {}
   ~RGWGetObj_ObjStore_S3() override;

@@ -1700,15 +1700,38 @@ public:
   /// it, and clients, which reason about it, cannot disagree
   static constexpr double DEFAULT_RDMA_DELIVERY_LEASE = 5.0;
   double get_rdma_delivery_lease() const {
-    return opts.value_or(pool_opts_t::RDMA_DELIVERY_LEASE,
-			 double{DEFAULT_RDMA_DELIVERY_LEASE});
+    return rdma_delivery_option(pool_opts_t::RDMA_DELIVERY_LEASE,
+				DEFAULT_RDMA_DELIVERY_LEASE,
+				MAX_RDMA_DELIVERY_LEASE);
   }
   /// default for pool_opts_t::RDMA_DELIVERY_DRAIN (seconds); a
   /// constant for the same reason as the lease's
   static constexpr double DEFAULT_RDMA_DELIVERY_DRAIN = 3.0;
   double get_rdma_delivery_drain() const {
-    return opts.value_or(pool_opts_t::RDMA_DELIVERY_DRAIN,
-			 double{DEFAULT_RDMA_DELIVERY_DRAIN});
+    return rdma_delivery_option(pool_opts_t::RDMA_DELIVERY_DRAIN,
+				DEFAULT_RDMA_DELIVERY_DRAIN,
+				MAX_RDMA_DELIVERY_DRAIN);
+  }
+  /// the largest RDMA_DELIVERY_LEASE and RDMA_DELIVERY_DRAIN (seconds)
+  /// the mon takes. An out-of-band transfer holds its op thread and its
+  /// PG's lock for up to lease plus drain, which must stay well below
+  /// osd_op_thread_timeout (15 s), past which the OSD stops answering
+  /// heartbeats.
+  static constexpr double MAX_RDMA_DELIVERY_LEASE = 6.0;
+  static constexpr double MAX_RDMA_DELIVERY_DRAIN = 4.0;
+  /// a delivery option as set, or what a value no mon takes now reads
+  /// as: the default for one that is not a positive number, the largest
+  /// for one past it. Only a mon built before these bounds stored such
+  /// values, and its daemons and clients read them as stored: set the
+  /// value within the bounds before upgrading any of them, so that all
+  /// agree on it.
+  double rdma_delivery_option(pool_opts_t::key_t key, double dflt,
+			      double max) const {
+    const double v = opts.value_or(key, double{dflt});
+    if (!(v > 0.0)) {
+      return dflt;
+    }
+    return v > max ? max : v;
   }
 
   typedef enum {

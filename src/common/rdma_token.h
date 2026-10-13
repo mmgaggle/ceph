@@ -174,7 +174,8 @@ struct delivery_t {
    *
    * A pull is not advisory: the op has no other data. An OSD that
    * cannot pull fails the op (-EOPNOTSUPP when it has no way to read
-   * the window, -EIO when the read failed), and an OSD that predates
+   * the window, or when its client message throttle has no room for the
+   * payload; -EIO when the read failed), and an OSD that predates
    * pulls fails it for its missing data (-EINVAL). Either way nothing
    * is written. The window must stay valid, and unchanged, until the
    * op's reply arrives.

@@ -88,6 +88,16 @@ add_executable(unittest_ec_gather
 add_ceph_unittest(unittest_ec_gather)
 target_link_libraries(unittest_ec_gather osd global)
 
+if(WITH_OOB_OFI OR WITH_CUOBJ)
+  # unittest_oob_pull: what a pulled write charges to the client message
+  # throttle
+  add_executable(unittest_oob_pull
+    test_oob_pull.cc
+    )
+  add_ceph_unittest(unittest_oob_pull)
+  target_link_libraries(unittest_oob_pull global)
+endif()
+
 if(WITH_OOB_OFI)
   # unittest_osd_ofi: the libfabric executor over the tcp provider, which
   # needs no special hardware

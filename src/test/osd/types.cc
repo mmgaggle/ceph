@@ -2104,6 +2104,42 @@ TEST(pool_opts_t, deep_scrub_interval) {
   EXPECT_FALSE(opts.is_set(pool_opts_t::DEEP_SCRUB_INTERVAL));
 }
 
+TEST(pg_pool_t, rdma_delivery_bounds) {
+  // an out-of-band transfer holds an op thread for up to lease plus
+  // drain, which must stay below osd_op_thread_timeout
+  EXPECT_LT(pg_pool_t::MAX_RDMA_DELIVERY_LEASE +
+	    pg_pool_t::MAX_RDMA_DELIVERY_DRAIN, 15.0);
+  EXPECT_LE(pg_pool_t::DEFAULT_RDMA_DELIVERY_LEASE,
+	    pg_pool_t::MAX_RDMA_DELIVERY_LEASE);
+  EXPECT_LE(pg_pool_t::DEFAULT_RDMA_DELIVERY_DRAIN,
+	    pg_pool_t::MAX_RDMA_DELIVERY_DRAIN);
+
+  pg_pool_t p;
+  EXPECT_EQ(pg_pool_t::DEFAULT_RDMA_DELIVERY_LEASE,
+	    p.get_rdma_delivery_lease());
+  EXPECT_EQ(pg_pool_t::DEFAULT_RDMA_DELIVERY_DRAIN,
+	    p.get_rdma_delivery_drain());
+  p.opts.set(pool_opts_t::RDMA_DELIVERY_LEASE, 2.5);
+  p.opts.set(pool_opts_t::RDMA_DELIVERY_DRAIN, 1.5);
+  EXPECT_EQ(2.5, p.get_rdma_delivery_lease());
+  EXPECT_EQ(1.5, p.get_rdma_delivery_drain());
+
+  // what a mon built before the bounds let in reads as the default or as
+  // the largest value
+  const double inf = std::numeric_limits<double>::infinity();
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  p.opts.set(pool_opts_t::RDMA_DELIVERY_LEASE, nan);
+  p.opts.set(pool_opts_t::RDMA_DELIVERY_DRAIN, -1.0);
+  EXPECT_EQ(pg_pool_t::DEFAULT_RDMA_DELIVERY_LEASE,
+	    p.get_rdma_delivery_lease());
+  EXPECT_EQ(pg_pool_t::DEFAULT_RDMA_DELIVERY_DRAIN,
+	    p.get_rdma_delivery_drain());
+  p.opts.set(pool_opts_t::RDMA_DELIVERY_LEASE, inf);
+  p.opts.set(pool_opts_t::RDMA_DELIVERY_DRAIN, 1e10);
+  EXPECT_EQ(pg_pool_t::MAX_RDMA_DELIVERY_LEASE, p.get_rdma_delivery_lease());
+  EXPECT_EQ(pg_pool_t::MAX_RDMA_DELIVERY_DRAIN, p.get_rdma_delivery_drain());
+}
+
 struct RequiredPredicate : IsPGRecoverablePredicate {
   unsigned required_size;
   explicit RequiredPredicate(unsigned required_size) : required_size(required_size) {}

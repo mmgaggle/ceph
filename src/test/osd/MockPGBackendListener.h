@@ -90,6 +90,10 @@ public:
   /// every ec_repair_on_read call: the object and the shards it named
   std::vector<std::pair<hobject_t, std::set<pg_shard_t>>> ec_read_repairs;
 
+  /// what oob_gather_executor() returns: the executor that lends the EC
+  /// read pipeline its gather windows, or null
+  OSDOobExecutor* gather_executor = nullptr;
+
   MockPGBackendListener(OSDMapRef osdmap, int64_t pool_id, DoutPrefixProvider *dpp, pg_shard_t pg_whoami, PeeringState *ps = nullptr) :
     osdmap(osdmap), pool_id(pool_id), log(g_ceph_context), dpp(dpp), pg_whoami(pg_whoami), peering_state(ps) {
     // Create a full OSD PerfCounters using the standard build_osd_logger function.
@@ -791,6 +795,10 @@ public:
 
   struct ECListener *get_eclistener() override {
     return static_cast<ECListener *>(this);
+  }
+
+  OSDOobExecutor* oob_gather_executor() override {
+    return gather_executor;
   }
 };
 

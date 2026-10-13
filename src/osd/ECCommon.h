@@ -366,6 +366,11 @@ struct ECCommon {
 
     /// windows peer shards push their reads into (oob_cluster_transport)
     gather_windows_t gather;
+    /// whether this read lends gather windows. Only a client read does:
+    /// when a push fails its checksum, that shard's read fails, and a
+    /// client read decodes from the other shards, which the read of a
+    /// partial write, needing those very shards, cannot
+    bool lends_windows = false;
 
     ReadOp(
         int priority,
@@ -432,7 +437,8 @@ struct ECCommon {
         std::map<hobject_t, read_request_t> &to_read,
         bool do_redundant_reads,
         bool for_recovery,
-        std::unique_ptr<ReadCompleter> on_complete);
+        std::unique_ptr<ReadCompleter> on_complete,
+        bool lend_windows = false);
 
     void do_read_op(ReadOp &rop);
 

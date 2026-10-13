@@ -2010,6 +2010,28 @@ bool PrimaryLogPG::should_use_coroutine(MOSDOp* m)
   return false;
 }
 
+/// the bytes a request's writes ask the primary to pull out of client
+/// memory (delivery_t::FLAG_PULL): payload the message does not carry,
+/// saturating, so that no lengths can wrap the sum into range
+static uint64_t pulled_data_len(const MOSDOp* m)
+{
+  const auto& deliveries = m->get_rdma_deliveries();
+  if (deliveries.size() != m->ops.size()) {
+    return 0;
+  }
+  uint64_t len = 0;
+  for (size_t i = 0; i < deliveries.size(); i++) {
+    const auto& op = m->ops[i].op;
+    if (deliveries[i].empty() || !deliveries[i].is_pull() ||
+	(op.op != CEPH_OSD_OP_WRITE && op.op != CEPH_OSD_OP_WRITEFULL)) {
+      continue;
+    }
+    const uint64_t l = op.extent.length;
+    len = l > UINT64_MAX - len ? UINT64_MAX : len + l;
+  }
+  return len;
+}
+
 void PrimaryLogPG::do_op_impl(OpRequestRef op)
 {
   MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
@@ -2200,12 +2222,17 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op)
       return;
     }
 
-    // too big?
+    // too big? a payload the primary pulls out of client memory counts
+    // as if it came inline
+    const uint64_t max_write = cct->_conf->osd_max_write_size << 20;
+    const uint64_t pulled = pulled_data_len(m);
     if (cct->_conf->osd_max_write_size &&
-        m->get_data_len() > cct->_conf->osd_max_write_size << 20) {
+        (m->get_data_len() > max_write ||
+         pulled > max_write - m->get_data_len())) {
       // journal can't hold commit!
       derr << "do_op msg data len " << m->get_data_len()
-           << " > osd_max_write_size " << (cct->_conf->osd_max_write_size << 20)
+           << " pulled " << pulled
+           << " > osd_max_write_size " << max_write
            << " on " << *m << dendl;
       osd->reply_op_error(op, -OSD_WRITETOOBIG);
       return;
@@ -2585,6 +2612,13 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op)
       reply_ctx(ctx, r);
       return;
     }
+  }
+#else
+  if (m->has_rdma_delivery() && op->may_write() && pulled_data_len(m)) {
+    // built without a transport, this osd cannot pull a write's payload:
+    // fail it as an osd whose transports cannot, not for its missing data
+    reply_ctx(ctx, -EOPNOTSUPP);
+    return;
   }
 #endif
 
@@ -9743,6 +9777,20 @@ int PrimaryLogPG::pull_oob_payloads(OpContext *ctx)
     if (bound <= 0) {
       return -ETIMEDOUT;
     }
+    // The payload is charged to the client message throttle as an inline
+    // one is, before it is pulled, so that what this and the requests
+    // the messenger has already read pull stays within its limit. With
+    // no room now the client sends the payload inline, which the
+    // messenger throttles before it reads it. The request gives the
+    // bytes back when it is done, pulled or not.
+    const auto& con = m->get_connection();
+    if (!op->reserve_pulled(
+	  con->get_messenger()->get_policy(con->get_peer_type()).throttler_bytes,
+	  len)) {
+      dout(5) << __func__ << " op " << i << ": the client message throttle "
+	      << "has no room for " << len << " pulled bytes" << dendl;
+      return -EOPNOTSUPP;
+    }
     const auto plan = ceph::osd::oob::linear_plan(d.base_offset, len);
     bufferlist bl;
     bool started = false;
@@ -9802,7 +9850,6 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
   MOSDOpReply *reply = ctx->reply;
   ctx->reply = nullptr;
 
-#ifdef HAVE_OSD_OOB_DELIVERY
   if (m->has_rdma_delivery()) {
     // advisory out-of-band delivery: try to RDMA-write each
     // descriptor-bearing op's read data straight into the client
@@ -9813,10 +9860,14 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
     std::vector<OSDOp> rops;
     reply->claim_ops(rops);
     std::vector<ceph::rdma::oob_result_t> oob(rops.size());
+#ifdef HAVE_OSD_OOB_DELIVERY
     if (result >= 0 && osd->has_oob_executor()) {
       deliver_oob(ctx, rops, oob);
-    } else {
-      // a failed read, or an OSD without a transport, starts no transfer
+    } else
+#endif
+    {
+      // a failed read, or an OSD without a transport (or built without
+      // one), starts no transfer
       const auto& deliveries = m->get_rdma_deliveries();
       for (size_t i = 0; i < oob.size() && i < deliveries.size(); i++) {
 	if (!deliveries[i].empty()) {
@@ -9833,7 +9884,6 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
     }
     reply->claim_ops(rops);
   }
-#endif
 
   if (result >= 0) {
     if (!ctx->ignore_log_op_stats) {

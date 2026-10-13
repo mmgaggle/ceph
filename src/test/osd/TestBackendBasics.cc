@@ -28,6 +28,9 @@
  *                    data integrity.
  *   PartialWrite   – create an object, perform a partial write at a non-zero
  *                    offset, read back and verify all three regions.
+ *   GatherWindowsOnlyForClientReads
+ *                  – the primary lends its peer shards gather windows for
+ *                    a client read, not for the read of a partial write.
  *
  * TestECFailover
  *   Parameterized over BackendConfig (EC configs only, 12 instances).
@@ -47,6 +50,7 @@
 #include "crush/CrushWrapper.h"
 #include "messages/MOSDECSubOpWrite.h"
 #include "messages/MOSDECSubOpReadReply.h"
+#include "osd/oob_executor.h"
 
 using namespace std;
 
@@ -280,6 +284,86 @@ TEST_P(TestBackendBasics, PartialWrite) {
     ASSERT_EQ(buf[i], param.fill)
       << param.label << " data after partial write region should be unchanged at position " << i;
   }
+}
+
+// ---------------------------------------------------------------------------
+// TestBackendBasics: GatherWindowsOnlyForClientReads
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// a cluster transport's executor that has no window to lend, and counts
+/// the reads that asked it for one
+struct CountingGatherExecutor : public OSDOobExecutor {
+  int asked = 0;
+
+  bool is_available() const override { return true; }
+  bool handles(const std::string& token) const override { return false; }
+  ssize_t execute_plan(const std::string& key, const std::string& token,
+                       const ceph::buffer::list& data,
+                       const ceph::osd::oob::placement_plan& plan,
+                       std::chrono::milliseconds budget,
+                       bool* started) override {
+    if (started) {
+      *started = false;
+    }
+    return -EOPNOTSUPP;
+  }
+  void dump_stats(ceph::Formatter* f) const override {}
+  std::optional<window_t> acquire_window(size_t size) override {
+    ++asked;
+    return std::nullopt;
+  }
+};
+
+} // anonymous namespace
+
+/**
+ * GatherWindowsOnlyForClientReads - a primary whose cluster transport
+ * lends gather windows lends them to a client read, which decodes from
+ * the other shards when a push fails its checksum, but not to the read
+ * of a partial write, which needs the very shards it reads.
+ */
+TEST_P(TestBackendBasics, GatherWindowsOnlyForClientReads) {
+  const auto& param = GetParam().write_read;
+  const auto& backend_config = GetParam().backend;
+
+  // only the optimized EC read pipeline gathers out of band
+  if (backend_config.pool_type != EC ||
+      !(backend_config.pool_flags & pg_pool_t::FLAG_EC_OPTIMIZATIONS)) {
+    GTEST_SKIP() << "gather windows need optimized EC";
+  }
+
+  std::string obj_name = "test_gather_" + backend_config.label + "_" + param.label;
+
+  // three chunks at least, so that a whole-object read reads a shard
+  // other than the primary's
+  const size_t size = std::max(param.size, size_t(3 * stripe_unit));
+  ASSERT_EQ(0, create_and_write(obj_name, std::string(size, param.fill)));
+
+  // a new map drops the extent cache, so that the partial write below
+  // reads what it overwrites from the shards
+  auto new_osdmap = std::make_shared<OSDMap>();
+  new_osdmap->deepish_copy_from(*osdmap);
+  new_osdmap->inc_epoch();
+  update_osdmap(new_osdmap);
+
+  CountingGatherExecutor exec;
+  MockPGBackendListener* primary = get_primary_listener();
+  ASSERT_NE(nullptr, primary);
+  primary->gather_executor = &exec;
+
+  // part of a chunk: the primary reads the old data first
+  EXPECT_EQ(0, write(obj_name, stripe_unit + 512, std::string(512, 'x'), size));
+  EXPECT_EQ(0, exec.asked) << param.label
+    << " the read of a partial write asked for gather windows";
+
+  bufferlist read_data;
+  EXPECT_GE(read_object(obj_name, 0, size, read_data, size), 0);
+  EXPECT_GT(exec.asked, 0) << param.label
+    << " a client read asked for no gather window";
+
+  primary->gather_executor = nullptr;
 }
 
 // ---------------------------------------------------------------------------

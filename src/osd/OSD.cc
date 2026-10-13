@@ -76,9 +76,9 @@
 #ifdef WITH_OOB_OFI
 #include "osd_ofi.h"
 #endif
+#include "common/oob_config.h"
 #ifdef HAVE_OSD_OOB_DELIVERY
 #include "common/oob_arena.h"
-#include "common/oob_config.h"
 #include "common/rdma_token.h"
 #include "oob_executor.h"
 #endif
@@ -543,6 +543,7 @@ void OSDService::shutdown()
   }
 
 #ifdef HAVE_OSD_OOB_DELIVERY
+  oob_published = false;
   oob_executors.clear();
   oob_lender = nullptr;
 #endif
@@ -567,7 +568,7 @@ void OSDService::shutdown()
 #ifdef HAVE_OSD_OOB_DELIVERY
 OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
 {
-  for (auto* e : oob_executors) {
+  for (auto* e : published_oob_executors()) {
     if (e->handles(token)) {
       return e;
     }
@@ -577,7 +578,7 @@ OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
 
 OSDOobExecutor* OSDService::oob_puller_for(const std::string& token) const
 {
-  for (auto* e : oob_executors) {
+  for (auto* e : published_oob_executors()) {
     if (e->pulls(token)) {
       return e;
     }
@@ -587,6 +588,7 @@ OSDOobExecutor* OSDService::oob_puller_for(const std::string& token) const
 
 void OSDService::add_oob_executor(OSDOobExecutor* e, bool lends)
 {
+  ceph_assert(!oob_published);
   oob_executors.push_back(e);
   if (lends) {
     ceph_assert(!oob_lender);
@@ -594,14 +596,26 @@ void OSDService::add_oob_executor(OSDOobExecutor* e, bool lends)
   }
 }
 
+void OSDService::publish_oob_executors()
+{
+  oob_published.store(true, std::memory_order_release);
+}
+
+const std::vector<OSDOobExecutor*>&
+OSDService::published_oob_executors() const
+{
+  static const std::vector<OSDOobExecutor*> none;
+  return oob_published.load(std::memory_order_acquire) ? oob_executors : none;
+}
+
 OSDOobExecutor* OSDService::oob_gather_executor() const
 {
-  return oob_lender;
+  return oob_published.load(std::memory_order_acquire) ? oob_lender : nullptr;
 }
 
 bool OSDService::has_oob_executor() const
 {
-  return !oob_executors.empty();
+  return !published_oob_executors().empty();
 }
 #endif
 
@@ -613,6 +627,7 @@ void OSDService::fast_shutdown()
     watch_timer.shutdown();
   }
 #ifdef HAVE_OSD_OOB_DELIVERY
+  oob_published = false;
   oob_executors.clear();
   oob_lender = nullptr;
 #endif
@@ -1126,7 +1141,7 @@ void OSDService::set_statfs(const struct store_statfs_t &stbuf,
   logger->set(l_osd_stat_bytes_avail, avail);
 
 #ifdef HAVE_OSD_OOB_DELIVERY
-  for (auto* e : oob_executors) {
+  for (auto* e : published_oob_executors()) {
     e->get_alerts(alerts);
   }
 #endif
@@ -4170,7 +4185,6 @@ int OSD::init()
 
   check_config();
 
-#ifdef HAVE_OSD_OOB_DELIVERY
   // start the executors of the transports that oob_client_transports and
   // oob_cluster_transport name; the cluster transport's lends the gather
   // windows, and only it registers them
@@ -4179,6 +4193,7 @@ int OSD::init()
     for (const auto& w : oob.warnings) {
       derr << "WARNING: " << w << dendl;
     }
+#ifdef HAVE_OSD_OOB_DELIVERY
     ceph::oob::location_t loc;
     std::string err;
     if (ceph::oob::resolve(
@@ -4197,7 +4212,7 @@ int OSD::init()
       ceph::oob::Arena* arena = service.oob_arena.get();
       dout(1) << "out-of-band memory: " << arena->size() << " bytes"
 	      << dendl;
-      const bool cuobj_lends = oob.cluster_cuobj();
+      [[maybe_unused]] const bool cuobj_lends = oob.cluster_cuobj();
       const bool ofi_lends = oob.cluster_ofi();
       if (oob.cuobj()) {
 #ifdef WITH_CUOBJ
@@ -4233,9 +4248,26 @@ int OSD::init()
 	     << "built without" << dendl;
 #endif
       }
+      if (service.oob_executors.empty()) {
+	// nothing registered the arena or takes buffers from it
+	dout(1) << "no out-of-band transport started, freeing the "
+		<< "out-of-band memory" << dendl;
+	service.oob_arena.reset();
+      }
     }
-  }
+    service.publish_oob_executors();
+#else
+    if (oob.cuobj()) {
+      derr << "WARNING: the out-of-band transports name cuobj, which this "
+	   << "osd was built without" << dendl;
+    }
+    if (!oob.ofi_provider.empty()) {
+      derr << "WARNING: the out-of-band transports name the libfabric "
+	   << "provider " << oob.ofi_provider << ", which this osd was "
+	   << "built without" << dendl;
+    }
 #endif
+  }
 
   dout(10) << "ensuring pgs have consumed prior maps" << dendl;
   consume_map();

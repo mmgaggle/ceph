@@ -9423,8 +9423,12 @@ int OSDMonitor::prepare_command_pool_set(const cmdmap_t& cmdmap,
            << floaterr;
         return -EINVAL;
       }
-      if (f < 0) {
-        ss << var << " must be >= 0 (0 restores the default)";
+      // an op thread waits on a transfer for up to lease plus drain
+      const double max = var == "rdma_delivery_lease" ?
+        pg_pool_t::MAX_RDMA_DELIVERY_LEASE : pg_pool_t::MAX_RDMA_DELIVERY_DRAIN;
+      if (!std::isfinite(f) || f < 0 || f > max) {
+        ss << var << " must be between 0 and " << max
+           << " seconds (0 restores the default)";
         return -ERANGE;
       }
     }

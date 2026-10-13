@@ -16,10 +16,11 @@ namespace ceph::oob {
 
 /**
  * The memory that a daemon registers for out-of-band transfers: one
- * allocation of oob_memory bytes, which each of its transports
- * registers. Transfers take buffers of it in powers of two from MIN to
- * MAX bytes, from a buddy allocator. reserve() takes whole blocks of MAX
- * bytes, in one run, for windows that last as long as the daemon.
+ * mapping of oob_memory bytes, apart from the heap, which each of its
+ * transports registers. Transfers take buffers of it in powers of two
+ * from MIN to MAX bytes, from a buddy allocator. reserve() takes whole
+ * blocks of MAX bytes, in one run, for windows that last as long as the
+ * daemon, and always leaves a block for buffers.
  */
 class Arena {
 public:
@@ -56,8 +57,12 @@ public:
   void free(const slice_t& s) { free(s.offset, s.len); }
 
   /// len bytes, rounded up to whole blocks of MAX, in one run, taken for
-  /// the arena's life; null when no such run is free
+  /// the arena's life; null when no such run is free, or when it would
+  /// leave no block for buffers
   char* reserve(uint64_t len);
+  /// give back the run at p that reserve(len) returned, when the windows
+  /// in it did not come up; nothing may read or write it any more
+  void unreserve(char* p, uint64_t len);
 
   struct stats_t {
     uint64_t size = 0;

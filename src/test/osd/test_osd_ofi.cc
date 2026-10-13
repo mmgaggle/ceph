@@ -81,6 +81,18 @@ TEST(OSDOfi, RegistersWindowsOnlyWhenLending)
     ASSERT_EQ(0, ofi.init("tcp", loopback(), true, a.get()));
     EXPECT_FALSE(ofi.acquire_window(4096));
   }
+  {
+    // the windows would take every block, and leave transfers nowhere
+    // to stage: they stay inline, and the arena stays for staging
+    auto a = arena(2);
+    OSDOfi ofi(g_ceph_context, nullptr);
+    ASSERT_EQ(0, ofi.init("tcp", loopback(), true, a.get()));
+    EXPECT_FALSE(ofi.acquire_window(4096));
+    EXPECT_EQ(0u, a->stats().reserved);
+    auto s = a->alloc(ceph::oob::Arena::MAX);
+    EXPECT_TRUE(s);
+    a->free(s);
+  }
 }
 
 namespace {

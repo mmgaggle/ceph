@@ -7,7 +7,6 @@
 
 #include "osd/osd_dc_target.h"
 
-#include <arpa/inet.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
@@ -20,29 +19,12 @@
 #include "common/ceph_context.h"
 #include "common/debug.h"
 #include "common/errno.h"
+#include "common/oob_config.h"
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_osd
 #undef dout_prefix
 #define dout_prefix *_dout << "osd_dc_target: "
-
-namespace {
-
-/// the RoCE GID for an IPv4 address: ::ffff:a.b.c.d
-bool ipv4_gid(const std::string& ip, ibv_gid* out)
-{
-  in_addr a;
-  if (inet_pton(AF_INET, ip.c_str(), &a) != 1) {
-    return false;
-  }
-  std::memset(out, 0, sizeof(*out));
-  out->raw[10] = 0xff;
-  out->raw[11] = 0xff;
-  std::memcpy(&out->raw[12], &a, 4);
-  return true;
-}
-
-} // anonymous namespace
 
 OSDDcTarget::~OSDDcTarget()
 {
@@ -64,45 +46,48 @@ void OSDDcTarget::close()
 int OSDDcTarget::open(CephContext* cct, const std::string& rdma_ip,
 		      char* pool, size_t pool_size, uint64_t dc_key)
 {
-  ibv_gid want;
-  if (!ipv4_gid(rdma_ip, &want)) {
-    derr << "cannot map " << rdma_ip << " to a RoCE GID" << dendl;
-    return -EINVAL;
+  // the device, port and GID that carry our RDMA address, as the OSD's
+  // out-of-band location names them: a RoCE v2 GID when one holds the
+  // address, since only v2 routes, and an IPv6 address's own GID
+  std::string dev_name;
+  unsigned port = 0;
+  int gid_index = -1;
+  if (!ceph::oob::find_rdma_gid("/sys", rdma_ip, &dev_name, &port,
+				&gid_index)) {
+    derr << "no RDMA device carries " << rdma_ip << dendl;
+    return -ENODEV;
   }
-  // the device and port whose GID table carries our RDMA address
   int num = 0;
   ibv_device** list = ibv_get_device_list(&num);
-  int gid_index = -1;
-  uint8_t port = 1;
-  for (int i = 0; list && i < num && gid_index < 0; i++) {
-    ibv_context* c = ibv_open_device(list[i]);
-    if (!c) continue;
-    ibv_port_attr pa;
-    if (ibv_query_port(c, port, &pa) == 0) {
-      for (int g = 0; g < pa.gid_tbl_len; g++) {
-	ibv_gid gid;
-	if (ibv_query_gid(c, port, g, &gid) == 0 &&
-	    std::memcmp(gid.raw, want.raw, 16) == 0) {
-	  gid_index = g;
-	  m_lid = pa.lid;
-	  break;
-	}
-      }
-    }
-    if (gid_index >= 0) {
-      m_ctx = c;
-    } else {
-      ibv_close_device(c);
+  for (int i = 0; list && i < num && !m_ctx; i++) {
+    if (dev_name == ibv_get_device_name(list[i])) {
+      m_ctx = ibv_open_device(list[i]);
     }
   }
   if (list) {
     ibv_free_device_list(list);
   }
   if (!m_ctx) {
-    derr << "no verbs device carries " << rdma_ip << dendl;
+    derr << "cannot open RDMA device " << dev_name << ", which carries "
+	 << rdma_ip << dendl;
     return -ENODEV;
   }
-  std::memcpy(m_gid, want.raw, 16);
+  ibv_port_attr pa;
+  ibv_gid gid;
+  if (int r = ibv_query_port(m_ctx, port, &pa); r != 0) {
+    derr << "querying " << dev_name << " port " << port << ": "
+	 << cpp_strerror(r) << dendl;
+    close();
+    return -EIO;
+  }
+  if (ibv_query_gid(m_ctx, port, gid_index, &gid) != 0) {
+    derr << "querying GID " << gid_index << " of " << dev_name << " port "
+	 << port << ": " << cpp_strerror(errno) << dendl;
+    close();
+    return -EIO;
+  }
+  m_lid = pa.lid;
+  std::memcpy(m_gid, gid.raw, 16);
 
   m_pool_size = pool_size;
   m_pool = pool;
@@ -110,9 +95,10 @@ int OSDDcTarget::open(CephContext* cct, const std::string& rdma_ip,
     close();
     return -ENOMEM;
   }
+  // peers only write into the windows: none may read back what a
+  // window holds, another client's gathered data perhaps
   m_mr = ibv_reg_mr(m_pd, m_pool, pool_size,
-		    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-		    IBV_ACCESS_REMOTE_READ);
+		    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   m_cq = ibv_create_cq(m_ctx, 1, nullptr, nullptr, 0);
   ibv_srq_init_attr srq_attr;
   std::memset(&srq_attr, 0, sizeof(srq_attr));
@@ -144,13 +130,11 @@ int OSDDcTarget::open(CephContext* cct, const std::string& rdma_ip,
     close();
     return -EOPNOTSUPP;
   }
-  ibv_port_attr pa;
-  ibv_query_port(m_ctx, port, &pa);
   ibv_qp_attr qpa;
   std::memset(&qpa, 0, sizeof(qpa));
   qpa.qp_state = IBV_QPS_INIT;
-  qpa.port_num = port;
-  qpa.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+  qpa.port_num = static_cast<uint8_t>(port);
+  qpa.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
   if (ibv_modify_qp(m_dct, &qpa, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
 		    IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
     derr << "DCT -> INIT: " << cpp_strerror(errno) << dendl;
@@ -162,7 +146,7 @@ int OSDDcTarget::open(CephContext* cct, const std::string& rdma_ip,
   qpa.path_mtu = pa.active_mtu;
   qpa.min_rnr_timer = 12;
   qpa.ah_attr.is_global = 1;
-  qpa.ah_attr.port_num = port;
+  qpa.ah_attr.port_num = static_cast<uint8_t>(port);
   qpa.ah_attr.grh.hop_limit = 4;
   qpa.ah_attr.grh.sgid_index = static_cast<uint8_t>(gid_index);
   if (ibv_modify_qp(m_dct, &qpa, IBV_QP_STATE | IBV_QP_MIN_RNR_TIMER |
@@ -172,8 +156,9 @@ int OSDDcTarget::open(CephContext* cct, const std::string& rdma_ip,
     return -EIO;
   }
   m_dctn = m_dct->qp_num;
-  dout(1) << "DC target dctn=" << m_dctn << " on " << rdma_ip << ", pool "
-	  << pool_size << " bytes" << dendl;
+  dout(1) << "DC target dctn=" << m_dctn << " on " << rdma_ip << " ("
+	  << dev_name << " port " << port << " GID " << gid_index
+	  << "), pool " << pool_size << " bytes" << dendl;
   return 0;
 }
 

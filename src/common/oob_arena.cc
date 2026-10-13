@@ -6,22 +6,37 @@
 
 #include <algorithm>
 #include <bit>
-#include <cstdlib>
+#include <cerrno>
+#include <cstring>
+
+#include <sys/mman.h>
 
 namespace ceph::oob {
 
 std::unique_ptr<Arena> Arena::create(uint64_t size, std::string* err)
 {
   size = std::max<uint64_t>(MAX, size / MAX * MAX);
-  void* p = nullptr;
-  // aligned to a huge page, so that a provider can map it with few
-  // entries
-  if (posix_memalign(&p, 2 << 20, size) != 0 || !p) {
-    *err = "cannot allocate " + std::to_string(size) +
-      " bytes for out-of-band transfers";
+  // mapped, not taken from the heap: the heap allocator does not count
+  // it, so the OSD's cache autotuner, which holds the heap to
+  // osd_memory_target, does not shrink the caches by it. Aligned to a
+  // huge page, so that a provider can map it with few entries: map a
+  // huge page more than asked, and trim both ends.
+  constexpr uint64_t align = 2 << 20;
+  void* p = ::mmap(nullptr, size + align, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) {
+    *err = "cannot map " + std::to_string(size) +
+      " bytes for out-of-band transfers: " + std::strerror(errno);
     return nullptr;
   }
-  return std::unique_ptr<Arena>(new Arena(static_cast<char*>(p), size));
+  const auto start = reinterpret_cast<uintptr_t>(p);
+  const uintptr_t base = (start + align - 1) & ~uintptr_t(align - 1);
+  if (base > start) {
+    ::munmap(p, base - start);
+  }
+  ::munmap(reinterpret_cast<void*>(base + size), start + align - base);
+  return std::unique_ptr<Arena>(new Arena(reinterpret_cast<char*>(base),
+					  size));
 }
 
 Arena::Arena(char* base, uint64_t size)
@@ -35,7 +50,7 @@ Arena::Arena(char* base, uint64_t size)
 
 Arena::~Arena()
 {
-  std::free(base_);
+  ::munmap(base_, size_);
 }
 
 uint64_t Arena::round(uint64_t len)
@@ -109,6 +124,12 @@ char* Arena::reserve(uint64_t len)
     return nullptr;
   }
   std::lock_guard l(mtx);
+  // at least a block stays out of every run, for buffers: a reservation
+  // that took the whole arena would leave every transfer to stage
+  // nowhere, and go inline
+  if (st.reserved + blocks * MAX >= size_) {
+    return nullptr;
+  }
   auto& top = free_[ORDERS - 1];
   // the highest run, so that buffers stay at the start
   for (auto it = top.rbegin(); it != top.rend(); ++it) {
@@ -130,6 +151,20 @@ char* Arena::reserve(uint64_t len)
     }
   }
   return nullptr;
+}
+
+void Arena::unreserve(char* p, uint64_t len)
+{
+  const uint64_t blocks = (len + MAX - 1) / MAX;
+  if (!p || blocks == 0) {
+    return;
+  }
+  const uint64_t first = static_cast<uint64_t>(p - base_);
+  std::lock_guard l(mtx);
+  for (uint64_t i = 0; i < blocks; i++) {
+    free_[ORDERS - 1].insert(first + i * MAX);
+  }
+  st.reserved -= blocks * MAX;
 }
 
 Arena::stats_t Arena::stats() const

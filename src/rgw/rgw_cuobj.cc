@@ -20,10 +20,11 @@
 std::unique_ptr<RGWCuObjServer> RGWCuObjServer::s_instance;
 thread_local uint16_t RGWCuObjServer::tls_channel_id = 0;
 thread_local bool RGWCuObjServer::tls_channel_valid = false;
+thread_local bool RGWCuObjServer::tls_channel_refused = false;
 
 static constexpr size_t MAX_RDMA_OP_SIZE = 1ULL << 30; // 1 GiB per cuObj API
-// DC initiators
-static constexpr int NUM_DCIS = 128;
+// DC initiators, at the least
+static constexpr int MIN_DCIS = 128;
 
 RGWCuObjServer::~RGWCuObjServer()
 {
@@ -73,15 +74,19 @@ int RGWCuObjServer::do_init(CephContext* cct)
 
   // the library chooses its rdma_cm port; no client connects to it
   const unsigned short rdma_port = 0;
-  const int num_dcis = NUM_DCIS;
+  // a DC initiator for each frontend thread: each thread keeps the
+  // channel that it takes on its first transfer, and beast moves a
+  // request from thread to thread as it waits, so a request that staged
+  // on one thread can write to the client from any other
+  m_num_dcis = std::max<int>(MIN_DCIS, cct->_conf->rgw_thread_pool_size);
 
   cuObjRDMATunable params;
-  params.setNumDcis(num_dcis);
+  params.setNumDcis(m_num_dcis);
   params.setDcKey(cct->_conf.get_val<uint64_t>("cuobj_dc_key"));
 
   ldout(cct, 1) << "rgw_cuobj: initializing cuObjServer on "
                 << rdma_ip << ":" << rdma_port
-                << " dcis=" << num_dcis << ", staging in "
+                << " dcis=" << m_num_dcis << ", staging in "
                 << m_arena->size() << " bytes" << dendl;
 
   try {
@@ -125,9 +130,13 @@ void RGWCuObjServer::do_shutdown()
   m_server.reset();
 }
 
-bool RGWCuObjServer::is_available() const
+bool RGWCuObjServer::is_available()
 {
-  return m_server && m_server->isConnected();
+  // a frontend thread that the library has no channel for serves its
+  // requests over HTTP: asked before the first transfer on the thread
+  // too, so that a PUT without a body is declined rather than failed
+  return m_server && m_server->isConnected() &&
+    get_channel_id() != invalid_channel;
 }
 
 // descriptor token: leading "addr:size:" hex fields, remainder opaque;
@@ -159,10 +168,21 @@ static uint64_t parse_rdma_descriptor_addr(const std::string& rdma_descr)
 uint16_t RGWCuObjServer::get_channel_id()
 {
   if (!tls_channel_valid) {
-    tls_channel_id = m_server->allocateChannelId();
+    const uint16_t id = m_server->allocateChannelId();
+    if (id == invalid_channel) {
+      if (!tls_channel_refused) {
+        tls_channel_refused = true;
+        lderr(m_cct) << "rgw_cuobj: ERROR: cuObject channel allocation "
+                     << "failed (" << m_num_dcis << " DC initiators, one for "
+                     << "each frontend thread); this thread serves its "
+                     << "requests over HTTP" << dendl;
+      }
+      return invalid_channel;
+    }
+    tls_channel_id = id;
     tls_channel_valid = true;
+    ldout(m_cct, 21) << "rgw_cuobj: allocated channel ID " << id << dendl;
   }
-  ldout(m_cct, 21) << "rgw_cuobj: allocated channel ID " << tls_channel_id << dendl;
   return tls_channel_id;
 }
 
@@ -178,6 +198,12 @@ void RGWCuObjServer::release_channel_id()
 RGWCuObjServer::RDMABufEntry* RGWCuObjServer::acquire_buffer(size_t needed_size)
 {
   ldout(m_cct, 21) << "rgw_cuobj: acquiring RDMA buffer for size " << needed_size << dendl;
+  // a buffer only for a thread with a channel to move it: a GET takes
+  // its buffer before its headers go out, and without one it is served
+  // over HTTP
+  if (get_channel_id() == invalid_channel) {
+    return nullptr;
+  }
   // a buffer of the arena at the transfer's size; a larger transfer than
   // Arena::MAX, or one that finds the arena full, gets none
   const auto slice = m_arena->alloc(needed_size);
@@ -211,6 +237,10 @@ ssize_t RGWCuObjServer::rdma_read_from_client(
     const std::string& rdma_descr)
 {
   uint16_t channel = get_channel_id();
+  if (channel == invalid_channel) {
+    // acquire_buffer() found one, on another thread perhaps
+    return -EIO;
+  }
   uint64_t client_addr = parse_rdma_descriptor_addr(rdma_descr) + remote_offset;
   size_t total_read = 0;
 
@@ -258,6 +288,10 @@ ssize_t RGWCuObjServer::rdma_write_to_client(
     const std::string& rdma_descr)
 {
   uint16_t channel = get_channel_id();
+  if (channel == invalid_channel) {
+    // acquire_buffer() found one, on another thread perhaps
+    return -EIO;
+  }
   uint64_t client_addr = parse_rdma_descriptor_addr(rdma_descr) + remote_offset;
   size_t total_written = 0;
 

@@ -78,7 +78,10 @@ target_link_libraries(osd
     legacy-option-headers
     os heap_profiler cpu_profiler ${FMT_LIB} ${CMAKE_DL_LIBS})
 if(WITH_CUOBJ)
-  target_link_libraries(osd PRIVATE ${CUOBJSERVER_LIBRARY} IBVerbs::verbs)
+  # osd_dc_target.cc calls mlx5dv_create_qp()
+  target_include_directories(osd PRIVATE ${MLX5DV_INCLUDE_DIR})
+  target_link_libraries(osd PRIVATE ${CUOBJSERVER_LIBRARY} IBVerbs::verbs
+    ${MLX5_LIBRARY})
 endif()
 if(WITH_OOB_OFI)
   target_link_libraries(osd PRIVATE ofi_rma)

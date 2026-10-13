@@ -144,19 +144,44 @@ private:
   /// the staging buffer of a plan that ended with writes still posted
   /// on this thread's channel, when it timed out or a poll failed
   /// without a reset: the thread posts no other plan until they
-  /// complete, and the buffer goes back with the last of them
+  /// complete, and the buffer goes back with the last of them. A
+  /// submission that failed may have posted part of its write, which no
+  /// completion need report: the buffer of its plan then goes back once
+  /// the DC retry budget has run out on that part (settle())
   struct held_t {
     BufEntry* buf = nullptr;
+    /// a submission of the plan failed
+    bool partial = false;
+  };
+  /// a buffer that only the part of a failed submission may still read
+  /// or write, kept until that part can retry no longer
+  struct delayed_t {
+    BufEntry* buf = nullptr;
+    std::chrono::steady_clock::time_point until{};
   };
   /// a completion on this thread's channel that no plan in progress
   /// posted: credit it to the timed-out plan that did
   void credit_abandoned(uint64_t handle);
   /// the library reset this thread's channel, flushing what the
-  /// timed-out plans left posted: give their buffers back
+  /// timed-out plans and failed submissions left posted: give their
+  /// buffers back
   void drop_abandoned();
   /// take, without waiting, the completions that timed-out plans left
-  /// on the channel, before posting on it again
+  /// on the channel, and give back the delayed buffers whose time came,
+  /// before posting on it again
   void reap_abandoned(uint16_t channel);
+  /// a plan's buffer that no posted write of the plan reads any more:
+  /// give it back, or keep it in tls_delayed while the part of its
+  /// failed submission can still retry
+  void settle(const held_t& held);
+  /// give back the buffers in tls_delayed whose time came, or all of
+  /// them when the channel was reset
+  void release_delayed(bool all);
+  /// writes of an earlier plan, or the part of a failed submission, may
+  /// still be posted on this thread's channel: a synchronous write,
+  /// which cannot tell its completion from theirs, posts nothing behind
+  /// them
+  static bool channel_busy();
 
   CephContext* m_cct;
   std::unique_ptr<cuObjServer> m_server;
@@ -191,4 +216,7 @@ private:
   static thread_local uint16_t tls_channel_id;
   static thread_local bool tls_channel_valid;
   static thread_local ceph::osd::oob::abandoned_plans<held_t> tls_abandoned;
+  /// buffers of plans whose writes all completed, kept until a failed
+  /// submission's part can no longer be posted
+  static thread_local std::vector<delayed_t> tls_delayed;
 };

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 #include <thread>
 
 #include "common/ceph_context.h"
@@ -57,6 +58,7 @@ thread_local uint16_t OSDCuObj::tls_channel_id = 0;
 thread_local bool OSDCuObj::tls_channel_valid = false;
 thread_local ceph::osd::oob::abandoned_plans<OSDCuObj::held_t>
   OSDCuObj::tls_abandoned;
+thread_local std::vector<OSDCuObj::delayed_t> OSDCuObj::tls_delayed;
 
 // per-call limit of the cuObj API
 static constexpr size_t MAX_RDMA_OP_SIZE = 1ULL << 30;
@@ -122,11 +124,18 @@ int OSDCuObj::do_init(const std::string& rdma_ip, bool lend_windows,
     m_win_size = WINDOW_SIZE;
     auto dct = std::make_unique<OSDDcTarget>();
     char* mem = m_arena->reserve(WINDOW_SIZE * WINDOW_COUNT);
-    if (mem && dct->open(m_cct, rdma_ip, mem, WINDOW_SIZE * WINDOW_COUNT,
+    if (!mem) {
+      derr << "WARNING: oob_memory has no room for " << WINDOW_COUNT
+	   << " gather windows of " << WINDOW_SIZE << " bytes and for "
+	   << "staging; peers will reply inline" << dendl;
+    } else if (dct->open(m_cct, rdma_ip, mem, WINDOW_SIZE * WINDOW_COUNT,
 			 dc_key) == 0) {
       m_dct = std::move(dct);
       m_win_slots.resize(WINDOW_COUNT);
     } else {
+      // the target registered nothing that stays: the run goes back to
+      // staging
+      m_arena->unreserve(mem, WINDOW_SIZE * WINDOW_COUNT);
       derr << "WARNING: no DC target for gather windows; peers will reply "
 	   << "inline" << dendl;
     }
@@ -239,8 +248,9 @@ void OSDCuObj::credit_abandoned(uint64_t handle)
   held_t held;
   switch (tls_abandoned.credit(handle, &held)) {
   case credit_t::unknown:
-    // its plan's buffer went back when the channel was reset, or the
-    // library returned a write that this channel did not post
+    // its plan's buffer went back when the channel was reset, it is
+    // what a failed submission posted, or the library returned a write
+    // that this channel did not post
     dout(5) << "completion of write " << handle << " that no plan on "
 	    << "this channel waits for" << dendl;
     break;
@@ -249,11 +259,49 @@ void OSDCuObj::credit_abandoned(uint64_t handle)
   case credit_t::last:
     // the plan's last write is done with its buffer
     dout(10) << "timed-out plan of write " << handle << " completed its "
-	     << "last write; staging buffer reclaimed" << dendl;
-    release_buffer(held.buf);
-    m_buffers_reclaimed++;
+	     << "last write; staging buffer "
+	     << (held.partial ? "kept for its failed submission" : "reclaimed")
+	     << dendl;
+    settle(held);
     break;
   }
+}
+
+void OSDCuObj::settle(const held_t& held)
+{
+  if (!held.partial) {
+    release_buffer(held.buf);
+    m_buffers_reclaimed++;
+    return;
+  }
+  // the part of the failed submission goes out once what is ahead of it
+  // on the channel is done: the plan's own writes, which have all
+  // completed now, and the parts of earlier failed submissions, by their
+  // own time. The DC retry budget runs on it from then.
+  auto start = std::chrono::steady_clock::now();
+  for (const auto& d : tls_delayed) {
+    start = std::max(start, d.until);
+  }
+  tls_delayed.push_back({held.buf, start + CUOBJ_RETRY_BUDGET});
+}
+
+void OSDCuObj::release_delayed(bool all)
+{
+  const auto now = std::chrono::steady_clock::now();
+  for (auto it = tls_delayed.begin(); it != tls_delayed.end(); ) {
+    if (!all && now < it->until) {
+      ++it;
+      continue;
+    }
+    release_buffer(it->buf);
+    m_buffers_reclaimed++;
+    it = tls_delayed.erase(it);
+  }
+}
+
+bool OSDCuObj::channel_busy()
+{
+  return !tls_abandoned.empty() || !tls_delayed.empty();
 }
 
 void OSDCuObj::drop_abandoned()
@@ -262,10 +310,15 @@ void OSDCuObj::drop_abandoned()
     release_buffer(held.buf);
     m_buffers_reclaimed++;
   }
+  // the reset flushed what failed submissions posted too
+  release_delayed(true);
 }
 
 void OSDCuObj::reap_abandoned(uint16_t channel)
 {
+  // the buffers of failed submissions, once the DC retry budget has run
+  // out on what they may have posted
+  release_delayed(false);
   if (tls_abandoned.empty()) {
     return;
   }
@@ -324,9 +377,9 @@ ssize_t OSDCuObj::rdma_write(const std::string& key,
   // own completion from one of a write that a timed-out plan left
   // posted on the channel: do not post behind such a write
   reap_abandoned(channel);
-  if (!tls_abandoned.empty()) {
-    dout(10) << "channel " << channel << " still has writes of timed-out "
-	     << "plans posted; not writing " << key << dendl;
+  if (channel_busy()) {
+    dout(10) << "channel " << channel << " may still have writes of "
+	     << "earlier plans posted; not writing " << key << dendl;
     return -EBUSY;
   }
   BufEntry* buf = acquire_buffer(len);
@@ -488,7 +541,11 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
   // budget runs out; this plan would hold the op worker until its
   // deadline meanwhile. Take what completed of those writes, which also
   // frees their buffers for this plan, and deliver this read inline
-  // while any is left.
+  // while any is left. The part that a failed submission may have
+  // posted does not hold the channel: a submission can fail before it
+  // posts anything, on a descriptor that the library rejects, and a
+  // plan posted behind a part that is still retrying times out into the
+  // case above. Its buffer stays out of the arena meanwhile (settle()).
   reap_abandoned(channel);
   if (!tls_abandoned.empty()) {
     dout(10) << "channel " << channel << " still has writes of "
@@ -509,15 +566,11 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
   }
 
   m_plans_started++;
-  // no earlier plan's write is left on the channel, but a completion
-  // counts toward this plan only when it carries one of the handles
-  // that this plan reserves here, write i carrying first + i
+  // no write of a timed-out plan is left on the channel; this plan
+  // reserves a handle for each of its writes here, write i carrying
+  // first + i
   const uint64_t first =
     m_next_handle.fetch_add(items.size(), std::memory_order_relaxed);
-  auto mine = [&](const void* handle) {
-    return ceph::osd::oob::owns_handle(first, items.size(),
-				       handle_value(handle));
-  };
   dout(20) << "executing plan " << first << " for " << key << ": "
 	   << items.size() << " " << what << "s, " << total
 	   << " bytes, channel " << channel << dendl;
@@ -528,6 +581,24 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
   size_t outstanding = 0;
   size_t completed = 0;
   ssize_t err = 0;
+  // set when a submission failed: it may have posted part of its write,
+  // which no completion need report and which can go on retrying for
+  // the DC retry budget, so the staging buffer is kept until then
+  bool submit_failed = false;
+  // the library reset the channel, flushing all that was posted on it
+  bool reset = false;
+  // a completion counts toward this plan only when it carries the handle
+  // of a write that the plan posted, writes first to first + next - 1:
+  // not the failed submission's, first + next, so that outstanding does
+  // not wrap
+  auto mine = [&](const void* handle) {
+    return outstanding > 0 &&
+      ceph::osd::oob::owns_handle(first, next, handle_value(handle));
+  };
+  // what a plan that stops waiting keeps
+  auto held = [&] {
+    return held_t{buf, submit_failed};
+  };
   while (completed < items.size()) {
     while (err == 0 && next < items.size() && outstanding < POLL_BATCH) {
       // a write posted past the deadline could retry past the budget
@@ -557,6 +628,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	derr << "ERROR: async " << (pull ? "handlePutObject" : "handleGetObject")
 	     << " submission failed for " << key << ": " << r << dendl;
 	err = r;
+	submit_failed = true;
 	break;
       }
       next++;
@@ -581,8 +653,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	m_writes_inflight -= outstanding;
 	m_buffers_leaked++;
 	m_plans_failed++;
-	tls_abandoned.abandon(first, items.size(), outstanding,
-			      {buf});
+	tls_abandoned.abandon(first, next, outstanding, held());
 	return -ETIMEDOUT;
       }
       continue;
@@ -614,8 +685,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	m_writes_inflight -= outstanding;
 	m_buffers_leaked++;
 	m_plans_failed++;
-	tls_abandoned.abandon(first, items.size(), outstanding,
-			      {buf});
+	tls_abandoned.abandon(first, next, outstanding, held());
 	return err == -EOPNOTSUPP ? -EIO : err;
       }
       // on -EIO the library has reset the QP, flushing the remaining
@@ -624,6 +694,11 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
       m_writes_inflight -= outstanding;
       completed += outstanding;
       outstanding = 0;
+      reset = n == -EIO;
+      if (reset) {
+	// the reset flushed what earlier failed submissions posted too
+	release_delayed(true);
+      }
       break;
     }
     for (int i = 0; i < n; i++) {
@@ -631,8 +706,9 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	continue;
       }
       if (!mine(events[i].async_handle)) {
-	// not this plan's write, nor one of a timed-out plan that is
-	// still posted: none of those is left when a plan starts
+	// not a write this plan posted: what a failed submission posted,
+	// this plan's or an earlier one's, or a write of a timed-out plan,
+	// though none of those is left posted when a plan starts
 	dout(5) << "plan " << first << " for " << key << " took the "
 		<< "completion of write "
 		<< handle_value(events[i].async_handle)
@@ -662,8 +738,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
       m_writes_inflight -= outstanding;
       m_buffers_leaked++;
       m_plans_failed++;
-      tls_abandoned.abandon(first, items.size(), outstanding,
-			    {buf});
+      tls_abandoned.abandon(first, next, outstanding, held());
       return -ETIMEDOUT;
     }
   }
@@ -672,7 +747,17 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
     out->clear();
     out->append(static_cast<const char*>(buf->ptr), local_len);
   }
-  release_buffer(buf);
+  if (submit_failed && !reset) {
+    // what the failed submission posted may still read or write the
+    // buffer: it goes back once the DC retry budget has run out on that
+    dout(10) << "plan " << first << " for " << key << " keeps its staging "
+	     << "buffer until its failed submission can retry no longer"
+	     << dendl;
+    m_buffers_leaked++;
+    settle(held());
+  } else {
+    release_buffer(buf);
+  }
   if (err < 0) {
     m_plans_failed++;
     return err == -EOPNOTSUPP ? -EIO : err;

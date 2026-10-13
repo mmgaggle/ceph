@@ -33,11 +33,19 @@ public:
   static void shutdown();
   static RGWCuObjServer* get_instance();
 
-  bool is_available() const;
+  /// the server is up, and the calling thread has a channel, which this
+  /// allocates on the thread's first call
+  bool is_available();
 
+  /// the calling thread's channel (DC initiator), allocated on first
+  /// use; invalid_channel when the library has none left
   uint16_t get_channel_id();
   void release_channel_id();
+  static constexpr uint16_t invalid_channel = UINT16_MAX;
 
+  /// a buffer of the arena of at least needed_size bytes, or null when
+  /// the arena has none free, none that large, or the calling thread no
+  /// channel
   RDMABufEntry* acquire_buffer(size_t needed_size);
   void release_buffer(RDMABufEntry* buf);
 
@@ -66,8 +74,12 @@ private:
   /// the arena, registered with the library once
   struct rdma_buffer* m_arena_handle = nullptr;
   CephContext* m_cct = nullptr;
+  /// DC initiators: one for each frontend thread
+  int m_num_dcis = 0;
 
   static std::unique_ptr<RGWCuObjServer> s_instance;
   static thread_local uint16_t tls_channel_id;
   static thread_local bool tls_channel_valid;
+  /// the library had no channel left for this thread; reported once
+  static thread_local bool tls_channel_refused;
 };

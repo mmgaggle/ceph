@@ -25,6 +25,7 @@
 #include "common/ceph_argparse.h"
 #include "rgw/rgw_cksum.h"
 #include "rgw/rgw_cksum_pipe.h"
+#include "rgw/rgw_rdma_cksum.h"
 #include <openssl/sha.h>
 #include "rgw/rgw_hex.h"
 
@@ -744,6 +745,46 @@ TEST(RGWCksum, CtorUnarmor)
 				  rgw::cksum::Cksum::CtorStyle::from_armored);
 
   ASSERT_EQ(armored_text1, cksum2.to_armor());
+}
+
+TEST(RGWCksum, RdmaCanonical)
+{
+  /* S3 over RDMA renders the canonical CRCs that the OSDs report; the
+   * rendering must be the one a digest stores for the same bytes, on
+   * either byte order, or a whole-object GET or an OSD-direct PUT finds
+   * a mismatch */
+  for (const auto* s : {&lorem, &dolor, &lacrimae}) {
+    const auto* p = (const unsigned char *) s->c_str();
+
+    auto t = cksum::Type::crc64nvme;
+    DigestVariant dv1 = rgw::cksum::digest_factory(t);
+    Digest* digest1 = get_digest(dv1);
+    ASSERT_NE(digest1, nullptr);
+    digest1->Update(p, s->length());
+    auto stored1 = rgw::cksum::finalize_digest(digest1, t);
+    EXPECT_EQ(stored1.to_armor(),
+	      rgw::rdma::cksum_crc64nvme(
+		spdk_crc64_nvme(p, s->length(), 0)).to_armor());
+
+    t = cksum::Type::crc32c;
+    DigestVariant dv2 = rgw::cksum::digest_factory(t);
+    Digest* digest2 = get_digest(dv2);
+    ASSERT_NE(digest2, nullptr);
+    digest2->Update(p, s->length());
+    auto stored2 = rgw::cksum::finalize_digest(digest2, t);
+    EXPECT_EQ(stored2.to_armor(),
+	      rgw::rdma::cksum_crc32c(
+		rgw::rdma::crc32c_of(p, s->length())).to_armor());
+  }
+
+  /* the values that DigestCRC32c and CRC64NVME2 compare with */
+  const auto* p = (const unsigned char *) dolor.c_str();
+  EXPECT_EQ("wiBA+PSv41M=",
+	    rgw::rdma::cksum_crc64nvme(
+	      spdk_crc64_nvme(p, dolor.length(), 0)).to_armor());
+  EXPECT_EQ("ldwuSw==",
+	    rgw::rdma::cksum_crc32c(
+	      rgw::rdma::crc32c_of(p, dolor.length())).to_armor());
 }
 
 } /* namespace */

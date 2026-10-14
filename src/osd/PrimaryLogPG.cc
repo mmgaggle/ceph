@@ -66,9 +66,9 @@
 #ifdef HAVE_OSD_OOB_DELIVERY
 #include "oob_executor.h"
 #include "osd/oob_placement.h"
+#include "osd/oob_pull.h"
 #include "osd/oob_read_delivery.h"
 #include "osd/oob_xfer.h"
-#include "common/crc64nvme.h"
 #endif
 
 // required includes order:
@@ -9672,114 +9672,22 @@ void PrimaryLogPG::deliver_oob(OpContext *ctx, MOSDOpReply *reply,
 #ifdef HAVE_OSD_OOB_DELIVERY
 int PrimaryLogPG::pull_oob_payloads(OpContext *ctx)
 {
-  OpRequestRef op = ctx->op;
-  auto m = op->get_req<MOSDOp>();
-  const auto& deliveries = m->get_rdma_deliveries();
-  auto& ops = *ctx->ops;
-  if (deliveries.size() != ops.size()) {
-    // the descriptor vector must mirror the ops; a write that needed a
-    // pull then fails for its missing data
-    return 0;
-  }
-  if (op->oob_pulled.size() != ops.size()) {
-    op->oob_pulled.assign(ops.size(), {});
-  }
-  for (size_t i = 0; i < ops.size(); i++) {
-    const auto& d = deliveries[i];
-    if (d.empty() || !d.is_pull()) {
-      continue;
-    }
-    OSDOp& osd_op = ops[i];
-    const uint64_t len = osd_op.op.extent.length;
-    if (osd_op.op.op != CEPH_OSD_OP_WRITE &&
-	osd_op.op.op != CEPH_OSD_OP_WRITEFULL) {
-      dout(5) << __func__ << " op " << i << " " << osd_op
-	      << " carries a pull descriptor, which only writes take" << dendl;
-      return -EINVAL;
-    }
-    if (d.flags & ~ceph::rdma::delivery_t::PULL_KNOWN_FLAGS) {
-      return -EOPNOTSUPP;
-    }
-    if (len && osd_op.indata.length() == len &&
-	op->oob_pulled[i].bytes == len) {
-      continue;  // pulled before the request waited and ran again
-    }
-    if (osd_op.indata.length() != 0) {
-      return -EINVAL;
-    }
-    if (len == 0) {
-      continue;
-    }
-    if (len > (cct->_conf->osd_max_write_size << 20)) {
-      return -EFBIG;
-    }
-    OSDOobExecutor* exec = osd->oob_puller_for(d.token);
-    if (!exec) {
-      dout(10) << __func__ << " op " << i << ": no transport pulls from "
-	       << "this token" << dendl;
-      return -EOPNOTSUPP;
-    }
-    // A pull places nothing in client memory, so the lease that bounds
-    // read delivery does not protect anything here. The same bound keeps
-    // an op thread from waiting on a client that gave its request up.
-    const double bound = pool.info.get_rdma_delivery_lease() +
-      pool.info.get_rdma_delivery_drain() -
-      (ceph_clock_now() - m->get_recv_stamp());
-    if (bound <= 0) {
-      return -ETIMEDOUT;
-    }
-    // The payload is charged to the client message throttle as an inline
-    // one is, before it is pulled, so that what this and the requests
-    // the messenger has already read pull stays within its limit. With
-    // no room now the client sends the payload inline, which the
-    // messenger throttles before it reads it. The request gives the
-    // bytes back when it is done, pulled or not.
+  auto m = ctx->op->get_req<MOSDOp>();
+  ceph::osd::oob::pull_env env;
+  env.cct = cct;
+  env.xfer = osd->oob_transfers();
+  env.puller_for = [osd = osd](const std::string& token) {
+    return osd->oob_puller_for(token);
+  };
+  env.client_throttle = [m] {
     const auto& con = m->get_connection();
-    if (!op->reserve_pulled(
-	  con->get_messenger()->get_policy(con->get_peer_type()).throttler_bytes,
-	  len)) {
-      dout(5) << __func__ << " op " << i << ": the client message throttle "
-	      << "has no room for " << len << " pulled bytes" << dendl;
-      return -EOPNOTSUPP;
-    }
-    const auto plan = ceph::osd::oob::linear_plan(d.base_offset, len);
-    bufferlist bl;
-    bool started = false;
-    const ssize_t r = exec->execute_pull(
-      m->get_hobj().oid.name, d.token, plan, len, &bl,
-      std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)),
-      &started);
-    if (r < 0) {
-      dout(5) << __func__ << " op " << i << ": pulling " << len
-	      << " bytes failed: " << cpp_strerror(r) << dendl;
-      // a payload larger than the transport stages is not one it can pull
-      return r == -E2BIG ? -EOPNOTSUPP : static_cast<int>(r);
-    }
-    ceph_assert(bl.length() == len);
-    ceph::rdma::oob_result_t res;
-    res.bytes = len;
-    const bool want64 = d.flags & ceph::rdma::delivery_t::FLAG_CRC64NVME;
-    const bool want32c = d.flags & ceph::rdma::delivery_t::FLAG_CRC32C;
-    if (want64 || want32c) {
-      // the bytes as they arrived here, before the write encodes them
-      if (want64) {
-	res.crc64 = ceph::crc64nvme(bl);
-      }
-      if (want32c) {
-	res.crc32c = ceph::rdma::crc32c_canonical(bl);
-      }
-      res.ranges.push_back({d.base_offset, len, res.crc64, res.crc32c});
-      res.flags |= ceph::rdma::oob_result_t::FLAG_COMBINABLE |
-	ceph::rdma::oob_result_t::FLAG_RANGES |
-	(want64 ? ceph::rdma::oob_result_t::FLAG_CRC64NVME : 0) |
-	(want32c ? ceph::rdma::oob_result_t::FLAG_CRC32C : 0);
-    }
-    dout(20) << __func__ << " op " << i << ": pulled " << len << " bytes"
-	     << dendl;
-    osd_op.indata = std::move(bl);
-    op->oob_pulled[i] = std::move(res);
-  }
-  return 0;
+    return con->get_messenger()->get_policy(
+      con->get_peer_type()).throttler_bytes;
+  };
+  env.max_write = cct->_conf->osd_max_write_size << 20;
+  env.lease = pool.info.get_rdma_delivery_lease();
+  env.drain = pool.info.get_rdma_delivery_drain();
+  return ceph::osd::oob::pull_payloads(env, *ctx->op, *ctx->ops);
 }
 #endif // HAVE_OSD_OOB_DELIVERY
 
@@ -9837,6 +9745,13 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
 	  oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
 	}
       }
+#ifdef HAVE_OSD_OOB_DELIVERY
+      if (ctx->op->oob_pull) {
+	// but a write may fail after its pull read the client's window: an
+	// invalid snap context, or a FULL_TRY write to a full pool
+	ctx->op->oob_pull->clear_declined(oob);
+      }
+#endif
     }
   }
 #ifdef HAVE_OSD_OOB_DELIVERY

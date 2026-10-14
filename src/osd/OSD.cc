@@ -81,6 +81,7 @@
 #include "common/oob_arena.h"
 #include "common/rdma_token.h"
 #include "oob_executor.h"
+#include "oob_pull.h"
 #include "oob_xfer.h"
 #endif
 
@@ -1823,7 +1824,7 @@ void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
 #endif
   if (declined) {
     // an op answered here never reached complete_read_ctx, the only
-    // place a transfer starts: say so, so that a client bounced off a
+    // place a push starts: say so, so that a client bounced off a
     // laggy replica can retry without fencing its window
     const auto& deliveries = m->get_rdma_deliveries();
     std::vector<ceph::rdma::oob_result_t> oob(deliveries.size());
@@ -1832,6 +1833,13 @@ void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
 	oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
       }
     }
+#ifdef HAVE_OSD_OOB_DELIVERY
+    if (op->oob_pull) {
+      // but a pull of the request may have read the client's window,
+      // before it failed or before the request did
+      op->oob_pull->clear_declined(oob);
+    }
+#endif
     reply->set_oob_results(std::move(oob));
   }
   m->get_connection()->send_message(reply);

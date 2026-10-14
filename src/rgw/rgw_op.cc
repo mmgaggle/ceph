@@ -5251,6 +5251,53 @@ void RGWPutObj::execute(optional_yield y)
     }
   }
 
+  // S3 over RDMA: a PUT that names a window of the client's memory in
+  // x-amz-rdma-token, and sends no body, asks for the object to be taken
+  // out of that memory. With rgw_rdma_osd_direct the primary OSD of each
+  // stripe pulls the stripe itself, and the gateway sees none of the
+  // bytes (an OSD-direct PUT). Only a window of size 0 is stored as an
+  // empty object. A token that names no window fails with 400; what
+  // cannot be served out of band is declined with 501, and the client
+  // sends the body instead. The headers alone decide the 400 and the
+  // window's checks, so they come before the PUT archives a Swift
+  // version or reserves a notification.
+  const auto rdma_put_token =
+    s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
+  const bool rdma_put_bodyless = rdma_put_token && copy_source.empty() &&
+    s->content_length == 0 && !chunked_upload && rdma_staging_allowed;
+  std::optional<ceph::rdma::token_window> rdma_put_window;
+  if (rdma_put_bodyless) {
+    rdma_put_window = ceph::rdma::parse_rdma_token(*rdma_put_token);
+    if (!rdma_put_window) {
+      // whatever the token's type and the gateway's transports: read over
+      // HTTP, the missing body would replace the object with nothing
+      ldpp_dout(this, 4) << "S3 over RDMA: the token of a PUT without a "
+                         << "body names no window" << dendl;
+      s->err.message = "x-amz-rdma-token does not name a window of the "
+                       "client's memory";
+      op_ret = -EINVAL;
+      return;
+    }
+    if (rdma_put_window->size == 0) {
+      rdma_put_window.reset();  // an empty object needs no transfer
+    } else {
+      // the quota check above saw no body: the window is the object,
+      // whether the OSDs pull it or the gateway stages it. It is checked
+      // before is_available() takes this thread's cuObject channel: a
+      // quota check can yield, and the request can resume on a frontend
+      // thread that has none
+      if (rdma_put_window->size > s->cct->_conf->rgw_max_put_size) {
+        op_ret = -ERR_TOO_LARGE;
+        return;
+      }
+      op_ret = s->bucket->check_quota(this, quota, rdma_put_window->size, y);
+      if (op_ret < 0) {
+        ldpp_dout(this, 20) << "check_quota() returned ret=" << op_ret << dendl;
+        return;
+      }
+    }
+  }
+
   if (supplied_etag) {
     supplied_md5 = supplied_etag;
   }
@@ -5341,23 +5388,6 @@ void RGWPutObj::execute(optional_yield y)
   }
 #endif
 
-  // S3 over RDMA: a PUT that names a window of the client's memory in
-  // x-amz-rdma-token, and sends no body, asks for the object to be taken
-  // out of that memory. With rgw_rdma_osd_direct the primary OSD of each
-  // stripe pulls the stripe itself, and the gateway sees none of the
-  // bytes (an OSD-direct PUT). Such a PUT is never stored as an empty
-  // object: what cannot be served out of band is declined with 501, and
-  // the client sends the body instead.
-  const auto rdma_put_token =
-    s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
-  std::optional<ceph::rdma::token_window> rdma_put_window;
-  if (rdma_put_token && copy_source.empty() && s->content_length == 0 &&
-      !chunked_upload && rdma_staging_allowed) {
-    rdma_put_window = ceph::rdma::parse_rdma_token(*rdma_put_token);
-    if (rdma_put_window && rdma_put_window->size == 0) {
-      rdma_put_window.reset();  // an empty object needs no transfer
-    }
-  }
   bool osd_put = false;
   const char* osd_put_refusal = nullptr;
   if (rdma_put_window) {
@@ -5518,8 +5548,7 @@ void RGWPutObj::execute(optional_yield y)
   std::string rdma_descr;
   bool rdma_put = false;
   auto* cuobj_srv = RGWCuObjServer::get_instance();
-  if (cuobj_srv && cuobj_srv->is_available() && copy_source.empty() &&
-      rdma_staging_allowed && !osd_put) {
+  if (cuobj_srv && copy_source.empty() && rdma_staging_allowed && !osd_put) {
     auto rdma_token = s->info.env->get_optional("HTTP_X_AMZ_RDMA_TOKEN");
     if (rdma_token && ceph::rdma::is_ofi_token(*rdma_token)) {
       // the cuObjServer can only read from cuObject descriptors, and
@@ -5527,9 +5556,37 @@ void RGWPutObj::execute(optional_yield y)
       // the body comes over HTTP, as it does with no cuObjServer
       ldpp_dout(this, 4) << "rgw_cuobj: libfabric token on a PUT, reading "
                          << "the body over HTTP" << dendl;
+    } else if (rdma_put_bodyless && !rdma_put_window) {
+      // a window of size 0 holds an empty object, which needs no
+      // transfer: HTTP stores it, as it does with no cuObjServer
+      ldpp_dout(this, 20) << "rgw_cuobj: empty window on a PUT without a "
+                          << "body, storing an empty object" << dendl;
     } else if (rdma_token) {
-      rdma_descr = *rdma_token;
-      rdma_put = true;
+      if (!rdma_put_bodyless) {
+        // with a body too, the object is the descriptor's window, not
+        // the body that the first quota check saw. It is checked before
+        // is_available(), as a body-less window is
+        const auto window = ceph::rdma::parse_rdma_token(*rdma_token);
+        if (window && window->size > 0) {
+          if (window->size > s->cct->_conf->rgw_max_put_size) {
+            op_ret = -ERR_TOO_LARGE;
+            return;
+          }
+          op_ret = s->bucket->check_quota(this, quota, window->size, y);
+          if (op_ret < 0) {
+            ldpp_dout(this, 20) << "check_quota() returned ret=" << op_ret
+                                << dendl;
+            return;
+          }
+        }
+      }
+      // on a thread that has no channel, a body is read over HTTP, and a
+      // PUT without one is declined. Nothing yields from here to
+      // acquire_buffer(), which needs the channel of this thread
+      if (cuobj_srv->is_available()) {
+        rdma_descr = *rdma_token;
+        rdma_put = true;
+      }
     }
   }
 #else
@@ -5581,6 +5638,15 @@ void RGWPutObj::execute(optional_yield y)
       op_ret = -EIO;
       return;
     }
+    // the whole window, or the object would be stored short
+    if (static_cast<size_t>(rdma_ret) != total) {
+      cuobj_srv->release_buffer(rbuf);
+      ldpp_dout(this, 0) << "rgw_cuobj: ERROR: RDMA read " << rdma_ret
+                         << " of " << total << " bytes from the client"
+                         << dendl;
+      op_ret = -EIO;
+      return;
+    }
 
     tracepoint(rgw_op, before_data_transfer, s->req_id.c_str());
     uint64_t chunk_size = s->cct->_conf->rgw_max_chunk_size;
@@ -5620,11 +5686,9 @@ void RGWPutObj::execute(optional_yield y)
   else
 #endif
   if (osd_put) {
+    // rgw_max_put_size and the quota were checked against the window
+    // after the first quota check
     const uint64_t total = rdma_put_window->size;
-    if (total > s->cct->_conf->rgw_max_put_size) {
-      op_ret = -ERR_TOO_LARGE;
-      return;
-    }
     // the ETag is built from every stripe's CRC-64/NVME; the object's
     // checksum is the CRC-32C when the client chose that, else the
     // CRC-64/NVME

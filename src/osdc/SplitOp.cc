@@ -569,7 +569,7 @@ void SplitOp::complete() {
     }
   }
 
-  if (rc >= 0) {
+  if (rc != -EAGAIN) {
 
     // Each op's aggregate: bytes summed over its sub-reads, and every
     // sub-read's crc ranges gathered. The sub-reads tile the op's
@@ -583,6 +583,12 @@ void SplitOp::complete() {
     // librados takes the callback form, which a pointer-only copy here
     // used to skip, so every split passthrough read reported nothing
     // delivered.
+    //
+    // A failed read reports too, as an unsplit read's error reply does:
+    // when every sub-read declined (each OSD answered with the error,
+    // say) the caller need not fence its window before it answers. Its
+    // bytes are not summed, so it never reads landed. Only a retry
+    // reports nothing here: its own reply does.
     for (unsigned i = 0; i < orig_op->rdma_oob_result.size(); ++i) {
       if (!Objecter::rdma_oob_wanted(orig_op, i)) {
         continue;
@@ -617,8 +623,9 @@ void SplitOp::complete() {
         }
       }
       // declined when every sub-read started no transfer, landed when
-      // every one placed all its bytes before replying, resent when any
-      // was resent
+      // every one either placed all its bytes before replying or started
+      // no transfer (a replica's share past the object's end), resent
+      // when any was resent
       std::vector<uint32_t> part_flags;
       for (auto& [index, sub_read] : sub_reads) {
         for (unsigned j = 0; j < sub_read.parent_ops.size(); ++j) {
@@ -656,7 +663,9 @@ void SplitOp::complete() {
       }
       Objecter::deliver_rdma_oob_result(orig_op, i, agg);
     }
+  }
 
+  if (rc >= 0) {
     // In a "normal" completion, out_ops is generated in the MOSDOpReply reply
     // which we do not have here. Here we are going to mimic this behaviour
     // so as to reproduce as much as possible of the IO completion.

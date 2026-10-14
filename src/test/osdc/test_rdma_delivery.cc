@@ -855,7 +855,8 @@ TEST(RdmaDelivery, PriorAttemptsSettled)
 }
 
 // A split read's result: declined only when every sub-read declined,
-// landed only when every one landed and bytes moved, resent when any was.
+// landed only when bytes moved and every one landed or declined, resent
+// when any was.
 TEST(RdmaDelivery, FoldTransferFlags)
 {
   using R = ceph::rdma::oob_result_t;
@@ -867,15 +868,56 @@ TEST(RdmaDelivery, FoldTransferFlags)
   EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_DECLINED, 0}, 0));
   EXPECT_EQ(R::FLAG_LANDED,
             fold_transfer_flags({R::FLAG_LANDED, R::FLAG_LANDED}, 8192));
+  // a replica's share wholly past the object's end declined: nothing of
+  // it can land, so the shares that landed settle the read
+  EXPECT_EQ(R::FLAG_LANDED,
+            fold_transfer_flags({R::FLAG_LANDED, R::FLAG_LANDED,
+                                 R::FLAG_DECLINED}, 8192));
   // a sub-read delivered without the promise: not landed
   EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_LANDED, 0}, 8192));
-  // landed needs bytes
+  EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_LANDED, R::FLAG_DECLINED, 0},
+                                    8192));
+  // landed needs bytes: a failed split does not sum them
   EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_LANDED}, 0));
+  EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_LANDED, R::FLAG_DECLINED}, 0));
+  // and a part that landed: a result is never both declined and landed
+  EXPECT_EQ(R::FLAG_DECLINED,
+            fold_transfer_flags({R::FLAG_DECLINED, R::FLAG_DECLINED}, 4096));
   EXPECT_EQ(R::FLAG_DECLINED | R::FLAG_RESENT,
             fold_transfer_flags({R::FLAG_DECLINED,
                                  R::FLAG_DECLINED | R::FLAG_RESENT}, 0));
+  // resent rides along with landed, as on a resent op's own result
+  EXPECT_EQ(R::FLAG_LANDED | R::FLAG_RESENT,
+            fold_transfer_flags({R::FLAG_LANDED,
+                                 R::FLAG_DECLINED | R::FLAG_RESENT}, 8192));
   // the crc flags are not folded here
   EXPECT_EQ(0u, fold_transfer_flags({R::FLAG_CRC64NVME}, 4096));
+}
+
+// What the fold of a split read's sub-reads tells a gateway, from
+// fold_transfer_flags() alone, not through SplitOp::complete(). A read
+// past the object's end, whose last share declined, needs no fence after
+// the shares that landed. The fold of a failed split, its bytes not
+// summed, needs none when every share declined, as each OSD does that
+// answers with an error, and needs one when a share pushed. That
+// complete() reports a failed split at all takes a cluster to show.
+TEST(RdmaDelivery, FoldedSplitResultSettlesTheFence)
+{
+  using L = librados::ObjectReadOperation;
+  using ceph::rdma::attempt_flags;
+  using ceph::rdma::fold_transfer_flags;
+  using rgw::rdma::fence_needed;
+  const uint32_t landed = attempt_flags(true, true, true);
+  const uint32_t declined = attempt_flags(false, false, false);
+  auto slot = [](const std::vector<uint32_t>& parts, uint64_t bytes) {
+    L::rdma_delivery_result r;
+    r.bytes = bytes;
+    r.flags = fold_transfer_flags(parts, bytes);
+    return std::vector{r};
+  };
+  EXPECT_FALSE(fence_needed(slot({landed, landed, declined}, 1536 << 10)));
+  EXPECT_FALSE(fence_needed(slot({declined, declined}, 0)));
+  EXPECT_TRUE(fence_needed(slot({landed, declined}, 0)));
 }
 
 // A stripe read whose push its OSD cut off - per plan, after the writes

@@ -9634,23 +9634,13 @@ void PrimaryLogPG::deliver_oob(OpContext *ctx, MOSDOpReply *reply,
       op->mark_event("oob_settled");
       osd->send_message_osd_client(r, con);
     });
-  auto *xfer = osd->oob_transfers();
-  for (auto& p : pushes) {
-    const size_t idx = p.idx;
-    // each push runs on this thread, even with transfer threads: the
-    // reply then leaves, and the object's lock is released, only after
-    // the transfers, as they always have been
-    std::unique_ptr<ceph::osd::oob::xfer_job> job =
-      std::make_unique<ceph::osd::oob::push_job>(
-	cct, join, m->get_hobj().oid.name, std::move(p), true);
-    const int r = xfer ? xfer->submit(job) : -ESHUTDOWN;
-    if (r < 0) {
-      // refused, so nothing of it started: declined
-      dout(10) << __func__ << " op " << idx << ": push refused ("
-	       << cpp_strerror(r) << "), delivering inline" << dendl;
-      job->expire(r);
-    }
-  }
+  // from here on a push of this attempt may be writing the client's
+  // windows, and no reply to it may say that none started
+  ctx->op->oob_push_started = true;
+  const bool handed_off = ceph::osd::oob::submit_pushes(
+    cct, osd->oob_transfers(), join, m->get_hobj().oid.name,
+    std::move(pushes),
+    [osd = osd](const OSDOobExecutor* e) { return osd->oob_runs_inline(e); });
   if (log_stats) {
     // the PG's half of the op's stats, while it holds the PG; the OSD's
     // half goes with the reply
@@ -9658,8 +9648,29 @@ void PrimaryLogPG::deliver_oob(OpContext *ctx, MOSDOpReply *reply,
 		    ceph_clock_now() - m->get_recv_stamp());
     publish_stats_to_osd();
   }
-  // drop the guard: the reply goes out once no push holds it
+  if (handed_off) {
+    dout(20) << __func__ << " " << *m << " handed off to the transfer "
+	     << "threads" << dendl;
+    ctx->op->mark_event("oob_handed_off");
+    // the transfer threads run the pushes, and the reply goes out once
+    // the last is over: from its transfer thread, or from here, at the
+    // guard drop, when every push ended first. Before that the request
+    // lets go of its unit of the client's message throttle, so that a
+    // slow transfer does not hold back the client's other messages, and
+    // of the object's lock: the reply's data, versions and result were
+    // fixed under it. The op is in no list of the PG from here on, so an
+    // interval change neither requeues nor runs it again; a reply that
+    // leaves after the client resent is dropped by the client
+    ceph::osd::oob::hand_off(join, [this, ctx] {
+      ctx->op->get_nonconst_req()->release_message_throttle();
+      close_op_ctx(ctx);
+    });
+    return;
+  }
+  // drop the guard: every push ran on this thread, so the reply goes out
+  // now, before the object's lock is released, as it always has
   join->put();
+  close_op_ctx(ctx);
 }
 #endif // HAVE_OSD_OOB_DELIVERY
 
@@ -9810,7 +9821,15 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
     reply->claim_ops(rops);
     oob.resize(rops.size());
 #ifdef HAVE_OSD_OOB_DELIVERY
-    if (result >= 0 && osd->has_oob_executor()) {
+    if (ctx->op->oob_push_started) {
+      // a push of this request was handed off already, and may still be
+      // writing the client's windows. No path runs a request again once
+      // its pushes started; should one, its data goes inline, and its
+      // reply says nothing of the descriptors, rather than that no
+      // transfer started: the client then fences its windows
+      dout(1) << __func__ << " " << *m << " already pushed, delivering "
+	      << "inline" << dendl;
+    } else if (result >= 0 && osd->has_oob_executor()) {
       pushes = deliver_oob_prepare(ctx, rops, oob);
     } else
 #endif
@@ -9865,13 +9884,13 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
   reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
 #ifdef HAVE_OSD_OOB_DELIVERY
   if (pushing) {
+    // sends the reply, now or once the pushes are over, and closes ctx
     deliver_oob(ctx, reply, std::move(rops), std::move(oob),
 		std::move(pushes));
-  } else
-#endif
-  {
-    osd->send_message_osd_client(reply, m->get_connection());
+    return;
   }
+#endif
+  osd->send_message_osd_client(reply, m->get_connection());
   close_op_ctx(ctx);
 }
 

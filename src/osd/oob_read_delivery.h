@@ -34,9 +34,14 @@ namespace ceph { class Formatter; }
  * request, plans each descriptor-bearing op's push (plan_read_push())
  * and fixes the bounds of its transfer. Each push then runs as a
  * push_job, and the reply waits in an oob_reply until every push is
- * over: the last one to finish sends it. PrimaryLogPG runs each push
- * on the thread that submits it, so the reply still leaves before the
- * op thread lets go of the object, as it always has.
+ * over: the last one to finish sends it. With transfer threads the
+ * pushes run there, and the op thread lets go of the object and the
+ * request once it handed them off (submit_pushes(), hand_off()); the
+ * reply leaves only after that, from the transfer thread whose push
+ * ends last, or from the op thread when every push ended first.
+ * Without them, or for an executor whose transfers stay on the op
+ * threads, each push runs on the thread that submits it, and the reply
+ * leaves before the op thread lets go of the object, as it always has.
  */
 namespace ceph::osd::oob {
 
@@ -174,5 +179,30 @@ private:
   const bool here;
   bool finished = false;
 };
+
+/**
+ * Submit a push_job to x for each of the pushes of the reply join waits
+ * for; with no x, refuse them all. A push whose executor's transfers
+ * stay on the op threads (runs_inline) runs on this thread, and so does
+ * every push when x has no threads. A push x refuses is declined, since
+ * nothing of it started. Returns true when any push was handed to a
+ * transfer thread: the caller then drops its guard with hand_off().
+ */
+bool submit_pushes(CephContext* cct, Transfers* x,
+		   const std::shared_ptr<oob_reply>& join,
+		   const std::string& key, std::vector<read_push>&& pushes,
+		   const std::function<bool(const OSDOobExecutor*)>& runs_inline);
+
+/**
+ * The op thread's end of a read whose pushes submit_pushes() handed
+ * off: let_go() releases what the request holds (PrimaryLogPG closes
+ * its op context there, and with it the object's lock), and only then
+ * is the guard on join dropped. So the reply never leaves before
+ * let_go() returned, however soon the pushes end: it leaves from the
+ * transfer thread whose push ends last, or from here, when every push
+ * ended first.
+ */
+void hand_off(const std::shared_ptr<oob_reply>& join,
+	      const std::function<void()>& let_go);
 
 } // namespace ceph::osd::oob

@@ -49,6 +49,13 @@ public:
   /// them (_unregistered())
   Throttle* oob_throttle = nullptr;
   uint64_t oob_throttled = 0;
+  /// the reply to the request's reads was handed to their pushes, which
+  /// may write the client's windows until the pool's lease plus drain
+  /// after receipt: no other reply to the request may say that no
+  /// transfer started (reply_op_error(), complete_read_ctx()). Set
+  /// under the PG lock before the first push is submitted, and never
+  /// cleared.
+  bool oob_push_started = false;
   /// reserve len bytes of t, the throttle of the client's messages, for
   /// a payload about to be pulled: false, with nothing reserved, when t
   /// has no room for them, as the messenger would not read a message of

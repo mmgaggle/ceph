@@ -123,6 +123,15 @@ if(WITH_OOB_OFI)
     )
   add_ceph_unittest(unittest_osd_ofi)
   target_link_libraries(unittest_osd_ofi osd global)
+  # ceph_test_osd_oob_read: reads with out-of-band delivery over the tcp
+  # provider, for qa/standalone/osd/osd-oob-async.sh
+  add_executable(ceph_test_osd_oob_read
+    ceph_test_osd_oob_read.cc
+    )
+  target_link_libraries(ceph_test_osd_oob_read librados ceph-common ofi_rma)
+  install(TARGETS
+    ceph_test_osd_oob_read
+    DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 # unittest_ecbackend_l (legacy EC)

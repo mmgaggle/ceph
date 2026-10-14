@@ -8,7 +8,10 @@
  * the split produced, for every kind of read op, every outcome of the
  * transfer, and every checksum a descriptor asks for; and the reply
  * goes out exactly once, after every push, whichever thread finishes
- * last.
+ * last. Handed off to transfer threads (submit_pushes()), a push that
+ * could not start in time, or that the service shed, starts nothing and
+ * is declined, and the reply carries what the op thread put in it, and
+ * leaves only after the op thread let go of the request.
  */
 
 #include "osd/oob_read_delivery.h"
@@ -16,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -26,10 +30,12 @@
 #include <thread>
 #include <vector>
 
+#include "common/Clock.h"
 #include "common/ceph_context.h"
 #include "common/crc64nvme.h"
 #include "common/rdma_token.h"
 #include "global/global_context.h"
+#include "include/scope_guard.h"
 #include "messages/MOSDOpReply.h"
 #include "msg/Message.h"
 #include "osd/oob_executor.h"
@@ -420,14 +426,22 @@ struct sent_t {
   std::thread::id on;
   std::vector<OSDOp> ops;
   std::vector<oob_result_t> results;
+  int result = 0;
+  int flags = 0;
+  version_t user_version = 0;
   /// called with the reply before it is taken apart
   std::function<void(MOSDOpReply*)> check;
 };
 
-std::shared_ptr<oob_reply> make_join(std::vector<OSDOp> rops, sent_t& sent)
+/// the join of a reply to rops; reply, when given, is the reply the op
+/// thread built
+std::shared_ptr<oob_reply> make_join(std::vector<OSDOp> rops, sent_t& sent,
+				     ceph::ref_t<MOSDOpReply> reply = {})
 {
   std::vector<oob_result_t> oob(rops.size());
-  auto reply = ceph::make_message<MOSDOpReply>();
+  if (!reply) {
+    reply = ceph::make_message<MOSDOpReply>();
+  }
   return std::make_shared<oob_reply>(
     reply.detach(), std::move(rops), std::move(oob),
     [&sent](MOSDOpReply* r) {
@@ -437,6 +451,9 @@ std::shared_ptr<oob_reply> make_join(std::vector<OSDOp> rops, sent_t& sent)
       }
       sent.on = std::this_thread::get_id();
       sent.results = got->get_oob_results();
+      sent.result = got->get_result();
+      sent.flags = got->get_flags();
+      sent.user_version = got->get_user_version();
       got->claim_ops(sent.ops);
       sent.count++;
     });
@@ -961,4 +978,464 @@ TEST(OobReadDelivery, SendsOnceThroughTransferThreads)
   }
   EXPECT_LT(0, accepted);
   EXPECT_LT(0, refused_total);
+}
+
+namespace {
+
+/// holds the transfers of a gated_exec until it opens
+struct gate_t {
+  std::mutex m;
+  std::condition_variable cv;
+  bool open = false;
+  int waiting = 0;
+
+  /// until the gate opens, for up to 10 s
+  void pass() {
+    std::unique_lock l(m);
+    waiting++;
+    cv.notify_all();
+    cv.wait_for(l, 10s, [this] { return open; });
+  }
+  /// until n transfers wait at the gate, for up to 10 s
+  bool wait_for(int n) {
+    std::unique_lock l(m);
+    return cv.wait_for(l, 10s, [this, n] { return waiting >= n; });
+  }
+  void release() {
+    std::lock_guard l(m);
+    open = true;
+    cv.notify_all();
+  }
+};
+
+/// opens g when it goes out of scope. Declared after the service whose
+/// threads pass g, it opens g before the service stops, so that a test
+/// whose assertion fails while transfers wait at g ends, rather than
+/// waiting for them forever
+auto opens_at_exit(gate_t& g)
+{
+  return make_scope_guard([&g] { g.release(); });
+}
+
+/// a fake_exec whose transfers wait at a gate before they start
+struct gated_exec : fake_exec {
+  gate_t gate;
+
+  ssize_t execute_plan(const std::string& key, const std::string& token,
+		       const ceph::buffer::list& data,
+		       const placement_plan& plan,
+		       std::chrono::milliseconds budget,
+		       bool* started) override {
+    gate.pass();
+    return fake_exec::execute_plan(key, token, data, plan, budget, started);
+  }
+};
+
+/// the pushes of every op of rops through exec, with bounds b, as
+/// deliver_oob_prepare() plans them
+std::vector<read_push> pushes_for(const std::vector<OSDOp>& rops,
+				  OSDOobExecutor* exec, const bounds_t& b)
+{
+  std::vector<read_push> v;
+  for (size_t i = 0; i < rops.size(); i++) {
+    auto p = plan_read_push(i, rops[i], descriptor(0, i * 100000), false,
+			    std::nullopt);
+    ceph_assert(p);
+    p->exec = exec;
+    p->token = "token";
+    p->bounds = b;
+    v.push_back(std::move(*p));
+  }
+  return v;
+}
+
+std::vector<OSDOp> reads(size_t n, unsigned seed)
+{
+  std::vector<OSDOp> rops;
+  for (size_t i = 0; i < n; i++) {
+    rops.push_back(read_op(CEPH_OSD_OP_READ, 0, 4096,
+			   pattern(4096, seed + i)));
+  }
+  return rops;
+}
+
+/// up to 10 s for the reply
+bool wait_sent(const sent_t& sent)
+{
+  for (int i = 0; i < 10000 && !sent.count; i++) {
+    std::this_thread::sleep_for(1ms);
+  }
+  return sent.count > 0;
+}
+
+/// the executor's transfers run on the transfer threads
+bool never_inline(const OSDOobExecutor*)
+{
+  return false;
+}
+
+/// every op of a reply is declined, and its data is inline
+void expect_declined(const sent_t& sent, const std::vector<OSDOp>& rops)
+{
+  ASSERT_EQ(rops.size(), sent.results.size());
+  ASSERT_EQ(rops.size(), sent.ops.size());
+  for (size_t i = 0; i < rops.size(); i++) {
+    EXPECT_EQ(oob_result_t::FLAG_DECLINED, sent.results[i].flags) << i;
+    EXPECT_EQ(0u, sent.results[i].bytes) << i;
+    EXPECT_TRUE(sent.ops[i].outdata.contents_equal(rops[i].outdata)) << i;
+  }
+}
+
+/// every op of a reply was placed, and none of its data is inline
+void expect_landed(const sent_t& sent, const std::vector<OSDOp>& rops)
+{
+  ASSERT_EQ(rops.size(), sent.results.size());
+  ASSERT_EQ(rops.size(), sent.ops.size());
+  for (size_t i = 0; i < rops.size(); i++) {
+    EXPECT_EQ(oob_result_t::FLAG_LANDED, sent.results[i].flags) << i;
+    EXPECT_EQ(rops[i].outdata.length(), sent.results[i].bytes) << i;
+    EXPECT_EQ(0u, sent.ops[i].outdata.length()) << i;
+  }
+}
+
+} // anonymous namespace
+
+// where submit_pushes() runs each push: on the transfer threads only
+// when there are some, and the executor's transfers do not stay on the
+// op threads; only then is the reply handed off
+TEST(OobReadDelivery, HandsOffOnlyToTransferThreads)
+{
+  const auto me = std::this_thread::get_id();
+  fake_exec inl;
+  inl.complete = true;
+  auto stays = [&inl](const OSDOobExecutor* e) { return e == &inl; };
+  for (unsigned threads : {0u, 2u}) {
+    for (bool stay : {false, true}) {
+      SCOPED_TRACE("threads " + std::to_string(threads) +
+		   (stay ? " executor stays inline" : ""));
+      const bool expect_handoff = threads > 0 && !stay;
+      // handed off, the pushes wait at the gate until the guard is
+      // dropped, so the last one ends, and sends the reply, on its
+      // transfer thread
+      gated_exec e;
+      e.complete = true;
+      if (!expect_handoff) {
+	e.gate.release();
+      }
+      const auto rops = reads(2, 30);
+      sent_t sent;
+      auto x = service(threads);
+      auto open_gate = opens_at_exit(e.gate);
+      auto join = make_join(rops, sent);
+      OSDOobExecutor* ex = stay ? static_cast<OSDOobExecutor*>(&inl) : &e;
+      inl.calls = 0;
+      const bool handed_off = submit_pushes(
+	g_ceph_context, x.get(), join, "obj",
+	pushes_for(rops, ex, far_bounds()), stays);
+      EXPECT_EQ(expect_handoff, handed_off);
+      if (!handed_off) {
+	// both ran inside submit_pushes(), and the reply waits for the
+	// guard
+	EXPECT_EQ(2, stay ? inl.calls.load() : e.calls.load());
+	EXPECT_EQ(0, sent.count);
+      }
+      join->put();
+      if (handed_off) {
+	ASSERT_TRUE(e.gate.wait_for(2));
+	EXPECT_EQ(0, sent.count);
+	e.gate.release();
+      }
+      ASSERT_TRUE(wait_sent(sent));
+      x->stop();
+      EXPECT_EQ(1, sent.count);
+      expect_landed(sent, rops);
+      if (handed_off) {
+	EXPECT_NE(me, e.ran_on);
+	EXPECT_NE(me, sent.on);
+      } else {
+	EXPECT_EQ(me, stay ? inl.ran_on : e.ran_on);
+	EXPECT_EQ(me, sent.on);
+      }
+    }
+  }
+  {
+    // one push stays on this thread, one goes to a transfer thread: the
+    // reply leaves from wherever the last one ends, after both
+    const auto rops = reads(2, 40);
+    sent_t sent;
+    gated_exec g;
+    g.complete = true;
+    inl.calls = 0;
+    auto x = service(2);
+    auto open_gate = opens_at_exit(g.gate);
+    auto join = make_join(rops, sent);
+    auto pushes = pushes_for(rops, &g, far_bounds());
+    pushes[0].exec = &inl;
+    EXPECT_TRUE(submit_pushes(g_ceph_context, x.get(), join, "obj",
+			      std::move(pushes), stays));
+    EXPECT_EQ(1, inl.calls);
+    EXPECT_EQ(me, inl.ran_on);
+    join->put();
+    ASSERT_TRUE(g.gate.wait_for(1));
+    EXPECT_EQ(0, sent.count);
+    g.gate.release();
+    ASSERT_TRUE(wait_sent(sent));
+    x->stop();
+    expect_landed(sent, rops);
+    EXPECT_NE(me, g.ran_on);
+  }
+  {
+    // no service: every push is refused, and declined
+    const auto rops = reads(2, 50);
+    sent_t sent;
+    fake_exec e;
+    auto join = make_join(rops, sent);
+    EXPECT_FALSE(submit_pushes(g_ceph_context, nullptr, join, "obj",
+			       pushes_for(rops, &e, far_bounds()),
+			       never_inline));
+    join->put();
+    ASSERT_EQ(1, sent.count);
+    EXPECT_EQ(0, e.calls);
+    expect_declined(sent, rops);
+  }
+}
+
+// handed off, a push that a transfer thread takes past its post_by -
+// past the request's lease, or past the PG's readable_until as it was
+// at the handoff - never calls the executor: its op is declined, and
+// its data inline
+TEST(OobReadDelivery, PastPostByInTheQueueDeclines)
+{
+  const ceph::signedspan mnow = 100s;
+  for (bool lease : {true, false}) {
+    SCOPED_TRACE(lease ? "lease" : "readable_until");
+    // received 4.9 s ago, with a lease of 5 s; or just received, with
+    // the PG readable for 100 ms more
+    const utime_t recv_stamp = ceph_clock_now() -
+      (lease ? utime_t(4, 900000000) : utime_t());
+    const auto b = make_bounds(
+      recv_stamp, 5.0, 3.0,
+      lease ? std::nullopt : std::optional<ceph::signedspan>(mnow + 100ms),
+      mnow);
+    const auto now = mono_clock::now();
+    ASSERT_LT(now, b.post_by);
+    ASSERT_GE(now + 100ms, b.post_by);
+    // the drain counts from the lease either way
+    ASSERT_LT(now + 2s, b.land_by);
+
+    const auto blocker_rops = reads(1, 60);
+    const auto rops = reads(2, 70);
+    gated_exec blocker;
+    blocker.complete = true;
+    fake_exec exec;
+    exec.complete = true;
+    sent_t blocker_sent, sent;
+    auto x = service(1);
+    auto open_gate = opens_at_exit(blocker.gate);
+    // the only transfer thread is busy
+    auto bjoin = make_join(blocker_rops, blocker_sent);
+    ASSERT_TRUE(submit_pushes(g_ceph_context, x.get(), bjoin, "busy",
+			      pushes_for(blocker_rops, &blocker,
+					 far_bounds()),
+			      never_inline));
+    bjoin->put();
+    bjoin.reset();
+    ASSERT_TRUE(blocker.gate.wait_for(1));
+    // so these wait in the queue past their post_by
+    auto join = make_join(rops, sent);
+    ASSERT_TRUE(submit_pushes(g_ceph_context, x.get(), join, "obj",
+			      pushes_for(rops, &exec, b), never_inline));
+    join->put();
+    join.reset();
+    std::this_thread::sleep_for(b.post_by + 20ms - mono_clock::now());
+    EXPECT_EQ(0, sent.count);
+    blocker.gate.release();
+    ASSERT_TRUE(wait_sent(sent));
+    ASSERT_TRUE(wait_sent(blocker_sent));
+    x->stop();
+    EXPECT_EQ(0, exec.calls);
+    EXPECT_EQ(2u, x->get_logger()->get(l_oob_xfer_expired));
+    expect_declined(sent, rops);
+    expect_landed(blocker_sent, blocker_rops);
+  }
+}
+
+// the service sheds the pushes still queued when it stops: they start
+// nothing, their ops are declined, and their replies go out at once,
+// while stop() waits for the running push, whose reply follows it
+TEST(OobReadDelivery, ShedPushesDecline)
+{
+  const auto blocker_rops = reads(1, 80);
+  const auto rops = reads(3, 90);
+  gated_exec blocker;
+  blocker.complete = true;
+  fake_exec exec;
+  exec.complete = true;
+  sent_t blocker_sent, sent;
+  auto x = service(1);
+  std::thread stopper;
+  // a failed assertion leaves the gate open, and the stop over
+  auto end_stop = make_scope_guard([&] {
+    blocker.gate.release();
+    if (stopper.joinable()) {
+      stopper.join();
+    }
+  });
+  auto bjoin = make_join(blocker_rops, blocker_sent);
+  ASSERT_TRUE(submit_pushes(g_ceph_context, x.get(), bjoin, "busy",
+			    pushes_for(blocker_rops, &blocker, far_bounds()),
+			    never_inline));
+  bjoin->put();
+  bjoin.reset();
+  ASSERT_TRUE(blocker.gate.wait_for(1));
+  auto join = make_join(rops, sent);
+  ASSERT_TRUE(submit_pushes(g_ceph_context, x.get(), join, "obj",
+			    pushes_for(rops, &exec, far_bounds()),
+			    never_inline));
+  join->put();
+  join.reset();
+
+  stopper = std::thread([&x] { x->stop(); });
+  ASSERT_TRUE(wait_sent(sent));
+  EXPECT_EQ(0, exec.calls);
+  expect_declined(sent, rops);
+  EXPECT_EQ(3u, x->get_logger()->get(l_oob_xfer_shed));
+  // the running push still runs
+  EXPECT_EQ(0, blocker_sent.count);
+  blocker.gate.release();
+  stopper.join();
+  ASSERT_EQ(1, blocker_sent.count);
+  expect_landed(blocker_sent, blocker_rops);
+
+  // once stopped, a push is refused, and declined, at once
+  sent_t late_sent;
+  auto late = make_join(rops, late_sent);
+  EXPECT_FALSE(submit_pushes(g_ceph_context, x.get(), late, "obj",
+			     pushes_for(rops, &exec, far_bounds()),
+			     never_inline));
+  late->put();
+  ASSERT_EQ(1, late_sent.count);
+  EXPECT_EQ(0, exec.calls);
+  expect_declined(late_sent, rops);
+}
+
+// while the OSD stops, a push that would wait for a transfer thread is
+// refused and declined; one whose executor stays on the op threads
+// still runs there
+TEST(OobReadDelivery, StoppingRefusesWhatWouldWait)
+{
+  const auto rops = reads(2, 100);
+  fake_exec exec, inl;
+  exec.complete = inl.complete = true;
+  sent_t sent;
+  auto x = service(2);
+  x->start_stopping();
+  auto join = make_join(rops, sent);
+  auto pushes = pushes_for(rops, &exec, far_bounds());
+  pushes[1].exec = &inl;
+  EXPECT_FALSE(submit_pushes(
+    g_ceph_context, x.get(), join, "obj", std::move(pushes),
+    [&inl](const OSDOobExecutor* e) { return e == &inl; }));
+  join->put();
+  ASSERT_EQ(1, sent.count);
+  EXPECT_EQ(0, exec.calls);
+  EXPECT_EQ(1, inl.calls);
+  ASSERT_EQ(2u, sent.results.size());
+  EXPECT_EQ(oob_result_t::FLAG_DECLINED, sent.results[0].flags);
+  EXPECT_TRUE(sent.ops[0].outdata.contents_equal(rops[0].outdata));
+  EXPECT_EQ(oob_result_t::FLAG_LANDED, sent.results[1].flags);
+  EXPECT_EQ(0u, sent.ops[1].outdata.length());
+  x->stop();
+}
+
+// the reply a transfer thread sends carries the result, flags and
+// versions the op thread put in it under the PG lock, before the
+// handoff
+TEST(OobReadDelivery, ReplyKeepsWhatTheOpThreadSet)
+{
+  const auto rops = reads(2, 110);
+  for (int result : {0, -ENOENT}) {
+    SCOPED_TRACE("result " + std::to_string(result));
+    gated_exec exec;
+    exec.complete = true;
+    sent_t sent;
+    auto x = service(2);
+    auto open_gate = opens_at_exit(exec.gate);
+    // as complete_read_ctx() fills it in
+    auto reply = ceph::make_message<MOSDOpReply>();
+    reply->set_reply_versions(eversion_t(), 42);
+    reply->set_result(result);
+    reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+    auto join = make_join(rops, sent, reply);
+    reply.reset();
+    ASSERT_TRUE(submit_pushes(g_ceph_context, x.get(), join, "obj",
+			      pushes_for(rops, &exec, far_bounds()),
+			      never_inline));
+    join->put();
+    join.reset();
+    ASSERT_TRUE(exec.gate.wait_for(1));
+    EXPECT_EQ(0, sent.count);
+    exec.gate.release();
+    ASSERT_TRUE(wait_sent(sent));
+    x->stop();
+    EXPECT_NE(std::this_thread::get_id(), sent.on);
+    EXPECT_EQ(result, sent.result);
+    EXPECT_EQ(42u, sent.user_version);
+    EXPECT_EQ(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK, sent.flags);
+    expect_landed(sent, rops);
+  }
+}
+
+// handed off, the reply leaves only after the op thread let go of
+// everything of the request it held - here the op context and the
+// object's context, which deliver_oob() closes in hand_off() before the
+// guard drop - however fast the pushes are; and once it left, nothing
+// of the join is left either. A push holds neither: they cannot reach
+// it (I11).
+TEST(OobReadDelivery, OpThreadLetsGoBeforeTheReply)
+{
+  for (bool gated : {false, true}) {
+    SCOPED_TRACE(gated ? "pushes wait" : "pushes are fast");
+    const auto rops = reads(3, 120);
+    gated_exec exec;
+    exec.complete = true;
+    if (!gated) {
+      exec.gate.release();
+    }
+    sent_t sent;
+    auto x = service(4);
+    auto open_gate = opens_at_exit(exec.gate);
+    // what the op context and the object's context stand for
+    auto ctx = std::make_shared<int>(0);
+    std::weak_ptr<int> ctx_ref = ctx;
+    bool closed_first = false;
+    sent.check = [&](MOSDOpReply*) { closed_first = ctx_ref.expired(); };
+    auto join = make_join(rops, sent);
+    std::weak_ptr<oob_reply> join_ref = join;
+    ASSERT_TRUE(submit_pushes(g_ceph_context, x.get(), join, "obj",
+			      pushes_for(rops, &exec, far_bounds()),
+			      never_inline));
+    if (!gated) {
+      // let the pushes end before the op thread goes on
+      std::this_thread::sleep_for(20ms);
+      EXPECT_EQ(0, sent.count);
+    }
+    // as deliver_oob() lets go of the request
+    hand_off(join, [&] {
+      EXPECT_EQ(0, sent.count);
+      ctx.reset();
+    });
+    join.reset();
+    if (gated) {
+      ASSERT_TRUE(exec.gate.wait_for(3));
+      EXPECT_EQ(0, sent.count);
+      exec.gate.release();
+    }
+    ASSERT_TRUE(wait_sent(sent));
+    x->stop();
+    EXPECT_EQ(1, sent.count);
+    EXPECT_TRUE(closed_first);
+    EXPECT_TRUE(join_ref.expired());
+    expect_landed(sent, rops);
+  }
 }

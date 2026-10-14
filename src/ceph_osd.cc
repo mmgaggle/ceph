@@ -123,6 +123,17 @@ static void usage()
 
 int main(int argc, const char **argv)
 {
+#ifdef WITH_OOB_OFI
+  // a released libfabric window must get a new key, and verbs caches
+  // registrations and hands back the old key unless the cache is off.
+  // set it before any thread starts: setenv() can free the environment
+  // that a concurrent getenv() is reading
+  setenv("FI_MR_CACHE_MONITOR", "disabled", 0);
+  // that makes global_init's setenv("HOME") for --setuser a second new
+  // variable, which can free the environment while the log thread runs.
+  // read TZ now: the log thread's localtime_r() then never calls getenv()
+  tzset();
+#endif
   auto args = argv_to_vec(argc, argv);
   if (args.empty()) {
     cerr << argv[0] << ": -h or --help for usage" << std::endl;

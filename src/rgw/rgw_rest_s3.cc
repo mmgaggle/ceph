@@ -370,6 +370,12 @@ bool RGWGetObj_ObjStore_S3::rdma_eligible()
       attrs.count(RGW_ATTR_AMZ_WEBSITE_REDIRECT_LOCATION)) {
     return false;
   }
+  // nor an ErrorDocument, which goes out with the 403 or 404 of the
+  // error it answers: a client that reads only its window would take
+  // the page for the object
+  if (custom_http_ret) {
+    return false;
+  }
   return true;
 }
 

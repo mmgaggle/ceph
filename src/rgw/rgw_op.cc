@@ -2916,11 +2916,33 @@ int RGWGetObj::rdma_write_staged()
 #endif
 }
 
+/// whether the object's ETag has the form of a multipart upload's: an
+/// MD5 in hex, a dash and the part count
+static bool multipart_etag(const rgw::sal::Attrs& attrs)
+{
+  auto it = attrs.find(RGW_ATTR_ETAG);
+  if (it == attrs.end()) {
+    return false;
+  }
+  const std::string etag = rgw_bl_str(it->second);
+  constexpr size_t md5_hex = CEPH_CRYPTO_MD5_DIGESTSIZE * 2;
+  return etag.size() > md5_hex + 1 && etag[md5_hex] == '-' &&
+    etag.find_first_not_of("0123456789", md5_hex + 1) == std::string::npos;
+}
+
 /// the object's stored checksum, when it is a full-object CRC-64/NVME
 /// or CRC-32C, which an out-of-band GET of the whole object compares
-/// with what the OSDs deliver
-static std::optional<rgw::cksum::Cksum> stored_full_crc(
-  const rgw::sal::Attrs& attrs)
+/// with what the OSDs deliver. A composite combined checksum is not
+/// one, nor is one that a GET with x-amz-checksum-mode reports as
+/// composite: the checksum of a multipart object written before CRC
+/// combining carries no flags. Such an object is multipart by its
+/// manifest, or by its ETag once a lifecycle transition, a multisite
+/// sync or a copy has rewritten it with an atomic manifest. A GET of
+/// part 1 of an object without parts reads the whole object. Not
+/// static: unittest_rgw_rdma_get declares it
+std::optional<rgw::cksum::Cksum> stored_full_crc(
+  const rgw::sal::Attrs& attrs, const std::optional<int>& part_num,
+  const std::optional<int>& parts_count)
 {
   auto it = attrs.find(RGW_ATTR_CKSUM);
   if (it == attrs.end()) {
@@ -2930,8 +2952,16 @@ static std::optional<rgw::cksum::Cksum> stored_full_crc(
     rgw::cksum::Cksum stored;
     auto bp = it->second.cbegin();
     decode(stored, bp);
-    if ((stored.type == rgw::cksum::Type::crc64nvme ||
-         stored.type == rgw::cksum::Type::crc32c) && !stored.composite()) {
+    if ((stored.type != rgw::cksum::Type::crc64nvme &&
+         stored.type != rgw::cksum::Type::crc32c) || stored.composite()) {
+      return std::nullopt;
+    }
+    const bool has_parts = parts_count && *parts_count > 0;
+    const auto cksum_type = (part_num && has_parts) ?
+      rgw::cksum::get_part_checksum_type(stored) :
+      rgw::cksum::get_checksum_type(stored,
+                                    has_parts || multipart_etag(attrs));
+    if (std::get<0>(cksum_type) == rgw::cksum::Cksum::FLAG_CKSUM_NONE) {
       return stored;
     }
   } catch (const buffer::error&) {
@@ -3222,7 +3252,9 @@ void RGWGetObj::execute(optional_yield y)
     if (s->cct->_conf.get_val<bool>("rgw_rdma_checksum")) {
       want = rdma_cksum_asked;
       if (ofs == 0 && total_len == s->obj_size) {
-        if (auto stored = stored_full_crc(attrs); stored) {
+        if (auto stored = stored_full_crc(attrs, multipart_part_num,
+                                          multipart_parts_count);
+            stored) {
           want.crc64nvme |= stored->type == rgw::cksum::Type::crc64nvme;
           want.crc32c |= stored->type == rgw::cksum::Type::crc32c;
         }
@@ -3316,7 +3348,9 @@ void RGWGetObj::execute(optional_yield y)
     // No HTTP bytes are committed yet, so a mismatch can still fail the
     // request cleanly.
     if (ofs == 0 && total_len == s->obj_size) {
-      if (auto stored = stored_full_crc(attrs); stored) {
+      if (auto stored = stored_full_crc(attrs, multipart_part_num,
+                                        multipart_parts_count);
+          stored) {
         std::optional<rgw::cksum::Cksum> computed;
         if (stored->type == rgw::cksum::Type::crc64nvme && rdma_crc64) {
           computed = rgw::rdma::cksum_crc64nvme(*rdma_crc64);

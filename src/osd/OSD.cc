@@ -4445,7 +4445,8 @@ void OSD::final_init()
   if (service.oob_xfer) {
     r = admin_socket->register_command(
       "dump_oob_transfers", asok_hook,
-      "show the out-of-band transfers queued and running");
+      "show the out-of-band transfer threads, the queue length and the "
+      "running transfers");
     ceph_assert(r == 0);
   }
 #endif

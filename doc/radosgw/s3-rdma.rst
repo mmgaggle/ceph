@@ -155,8 +155,9 @@ for RMA reads, and pulls into a buffer of the OSD's arena (see
 `Registered memory`_). A provider without RMA reads still starts, for
 delivery only. The cuObject executor reads with
 ``handlePutObject``, as the gateway's staged PUT does. A pull holds the
-object's lock and the op thread until it completes, at most for the
-pool's lease plus drain.
+object's lock, the PG's lock and the op thread until it completes, at
+most for the pool's lease plus drain. Pulls do not run on the transfer
+threads (see `Transfer threads`_).
 
 An OSD that cannot pull fails the write with ``EOPNOTSUPP``. That
 happens in these cases:
@@ -445,6 +446,8 @@ no descriptor. An OSD replies inline in these cases:
   written twice. See `Retries`_.
 * The OSD's PG read lease (``readable_until``) lapsed. See
   `Placement plans`_.
+* The OSD's transfer threads refused or shed the transfer, over one of
+  their caps or because the OSD stopped. See `Transfer threads`_.
 * The descriptor has flag bits that the OSD does not know.
 
 With an inline reply, the OSD also says whether it started a transfer
@@ -542,7 +545,54 @@ Before an OSD starts a transfer, it reads its PG read lease
 cover a read that stalled after dispatch. An OSD whose lease lapsed,
 such as a primary that lost contact with its peers, replies inline and
 marks the result declined, instead of writing into a window that a new
-acting set can already serve.
+acting set can already serve. No push of the request starts after that
+lease or the pool's ``rdma_delivery_lease`` ends. In a request with
+several descriptor-bearing reads, a later read whose push cannot start
+in time is delivered inline and declined.
+
+Transfer threads
+----------------
+
+With ``osd_oob_transfer_threads`` at 0, the default, an OSD runs each
+transfer on the op worker thread that serves the request. That thread
+holds the PG's lock until every write completes or is cut off, so other
+operations on the PG wait. With a value above 0, that many transfer
+threads run the OSD's pushes instead. These are the pushes of reads into
+client windows, and the pushes of erasure-coded shards into gather
+windows. See `Gathering shard reads out of band`_.
+
+Under the PG's lock, the op thread checks the read, plans its push, and
+fixes the reply's versions, result and flags. It then hands the push to
+a transfer thread, releases the object's lock and the request's unit of
+``osd_client_message_cap``, and goes on. The reply still leaves only
+after every write completes or is cut off. It never leaves before the
+op thread releases the object's lock.
+
+Replies to descriptor-bearing reads therefore leave a PG in the order
+that their pushes complete. A later write to the same object can be
+acknowledged before an earlier read's reply. That read still returns
+the data and the version from before the write.
+
+A push waits in a queue until a transfer thread is free. A queued push
+starts nothing once the pool's lease ends, or once the PG read lease
+that the OSD read at handoff ends. ``osd_oob_transfer_queue_max`` and
+``osd_oob_transfer_queue_bytes`` cap the pushes that wait for or run on
+the transfer threads. The OSD refuses a push over either cap. In each
+case, the OSD delivers the read inline and marks it declined.
+
+When ``osd_fast_shutdown`` is off, a stopping OSD refuses each new push
+for its transfer threads. Once its op threads stop, it sheds the pushes
+still queued. A shed push starts nothing. The OSD delivers its read
+inline, marks it declined, and still sends the reply.
+It then waits for the running pushes, each until its writes land or are
+cut off. It stops its messengers only after that.
+
+Some transfers stay on the op thread, also with transfer threads. A
+pulled write holds its op thread and the PG's lock until the pull
+completes (see `OSD-direct PUT`_). cuObject transfers stay on the op
+threads unless ``osd_oob_cuobj_transfer_threads`` is set. Each thread
+that runs them needs a DC initiator of its own (see `cuObject`_). The
+caps do not count the transfers that stay on the op threads.
 
 Gateway behavior
 ================
@@ -674,16 +724,18 @@ How an OSD cuts off a write depends on the transport:
   cuObject executor stops waiting that long before the deadline, and
   posts no write after that point. It does not start a transfer when
   less than that is left; ``cuobj status`` counts those reads in
-  ``budget_refused``. The writes of a transfer that stopped waiting
-  stay posted on the cuObject channel of its op worker thread until
-  they complete or the DC transport gives up on them. A write posted
+  ``budget_refused``.
+
+  The writes of a transfer that stopped waiting stay posted on its
+  thread's cuObject channel until they complete or fail. A write posted
   behind them would wait for them, and could land after its own
   transfer's drain. So until then the thread starts no transfer: it
   delivers its reads inline, with nothing staged, and ``cuobj status``
   counts them in ``channel_busy``. The first read on the thread that
   finds the earlier writes done gives the earlier transfer's staging
-  buffer back. Until then the buffer stays held, also when no further
-  read comes to the thread.
+  buffer back. On an op worker thread, the buffer stays held until then,
+  also when no further read comes. A transfer thread also makes this
+  check each time it has nothing to run for 100 ms.
 
   A write whose submission fails may have posted part of itself, and
   nothing reports a completion for that part. The executor keeps that
@@ -985,6 +1037,22 @@ unless its new key fails. One whose data it did not use keeps its
 quarantine, and stays out of use for 10 s at least once it has a new
 key. A cuObject window gets no new key. See `Reusing a window`_.
 
+With ``osd_oob_transfer_threads`` above 0, a shard runs its push on a
+transfer thread, and sends its sub-read reply from there. Its op thread
+reads and checks the sub-read under the PG's lock, hands the push off,
+and goes on. The reply still leaves only after the push completes or is
+cut off. So the primary reads a window only after the shard's reply. A
+push that waits in the queue past the pool's lease, or that the shard
+refuses or sheds, sends nothing. The shard then replies inline and says
+that it sent nothing, as when its executor refuses a push.
+
+A shard's sub-read replies then leave its PG in the order that their
+pushes complete. A reply that leaves after an interval change carries
+the old epoch, and the primary drops it. The primary still completes
+the client reads of a PG in the order that it started them. So while a
+shard's push is slow, later client reads of that PG wait for it. The
+shard's PG goes on serving writes and other sub-reads meanwhile.
+
 The executor of ``oob_cluster_transport`` lends the windows. It reserves
 16 windows of 8 MiB in the OSD's arena when it starts. A shard read
 larger than a window, or one that finds no free window, is returned
@@ -1170,7 +1238,8 @@ library. Gateway-staged mode for cuObject clients needs ``cuobj`` in
 the gateway host. No GPU is needed on the OSD, gateway or client hosts.
 Only GPU memory targets on the client need CUDA.
 
-Each OSD creates one DC initiator for each op worker thread. The
+Each OSD creates one DC initiator for each op worker thread, and one
+for each transfer thread with ``osd_oob_cuobj_transfer_threads``. The
 gateway creates one for each frontend thread (``rgw_thread_pool_size``),
 and at least 128. Every DC initiator and target uses ``cuobj_dc_key``.
 The library chooses its ``rdma_cm`` port, and clients never connect to
@@ -1293,10 +1362,11 @@ until the writes in flight are done, so that none of them misses its
 cut-off, and until the gather windows lent before it are back (see
 below), and then holds the endpoint until the provider returns. The
 endpoint is quiet from when the insert starts to wait until it is
-done. An op thread waits for a quiet endpoint at most 10 ms, also when
-the insert is for its own read's client, and not at all once the
-endpoint has been quiet for 10 ms. It then goes on without the
-endpoint, so that the operations queued behind it do not wait too:
+done. An op thread or a transfer thread waits at most 10 ms for a quiet
+endpoint, also for its own read's client. Once the endpoint has been
+quiet for 10 ms, the thread does not wait at all. It then goes on
+without the endpoint, so that the operations and transfers queued
+behind it do not wait too:
 
 * A read for any client, a new client's first read included, is
   delivered inline, and declined. A push this OSD makes as a shard of
@@ -1314,15 +1384,15 @@ write is in flight and no gather window is lent, refuses nothing.
 Inserts queued back to back quiet the endpoint one after another.
 
 The progress thread that places data in gather windows cannot poll
-during the insert, so a shard pushing into a window then would wait
-for the insert, holding its op thread. The insert therefore first
-waits for the windows lent before it, polling meanwhile, so that the
-shards' pushes into them land: until the gathers return them, which
-takes about as long as a gather, or until 8 s, the default lease plus
-drain, after a window was lent. A shard whose push comes later still,
-in a pool with a longer lease or drain, waits for the insert within
-its budget: a push that runs out of budget is cut off, and the shard
-replies inline.
+during the insert. A shard that pushes into a window then can wait for
+the insert, and hold the thread that runs its push. The insert
+therefore first waits for the windows lent before it, polling
+meanwhile, so that the shards' pushes into them land: until the
+gathers return them, which takes about as long as a gather, or until
+8 s, the default lease plus drain, after a window was lent. A shard
+whose push comes later still, in a pool with a longer lease or drain,
+waits for the insert within its budget: a push that runs out of budget
+is cut off, and the shard replies inline.
 
 Clients choose their endpoint names, so the executor bounds what they
 can make it do. At most 64 first contacts are queued or running at
@@ -1548,8 +1618,10 @@ The OSDs enforce both options, and the gateway reads the same values
 from the OSDMap, so no daemon setting must agree with them. Set them
 with ``ceph osd pool set <pool> <option> <seconds>``. A value of 0
 restores the default. The lease can be at most 6 seconds and the drain
-at most 4 seconds. The monitor rejects larger values, because an OSD
-holds an op thread and the PG's lock while it waits on a transfer.
+at most 4 seconds. The monitor rejects larger values, because a
+transfer can hold an op thread and the PG's lock while it runs. A pulled
+write always does, and a push does unless it runs on a transfer thread
+(see `Transfer threads`_).
 
 ``rdma_delivery_lease``
   How long, in seconds, after it receives a stripe operation an OSD can
@@ -1667,6 +1739,37 @@ instead. See `Fencing a window before reuse`_.
   Have the primary repair a shard whose store failed a client read with
   a media error. The default is true. See `Shard read errors`_.
 
+The OSD reads the options of its transfer threads only when it starts.
+See `Transfer threads`_.
+
+``osd_oob_transfer_threads``
+  The number of transfer threads that run the OSD's pushes. The default
+  is 0, which runs each transfer on its op thread.
+
+``osd_oob_transfer_queue_max``
+  How many pushes can wait for or run on the transfer threads. The OSD
+  refuses a push past this cap, and delivers its data inline. The
+  default is 64.
+
+``osd_oob_transfer_queue_bytes``
+  How many bytes of data the pushes that wait for or run on the transfer
+  threads can hold. The OSD refuses a push that takes them past this
+  cap. The default is 512 MiB.
+
+``osd_oob_transfer_thread_timeout``
+  The heartbeat grace of a transfer thread. A thread that runs one
+  transfer for longer marks the OSD unhealthy, but the OSD never kills
+  it. A transfer ends within the pool's lease plus drain from receipt,
+  which is 10 s at most, plus ``osd_oob_cutoff_late_tolerance`` for a
+  late cut-off. With transfer threads, the OSD raises a value that does
+  not cover that to 1 s past it, and logs a warning. The default is
+  30 s.
+
+``osd_oob_cuobj_transfer_threads``
+  Run cuObject transfers on the transfer threads too. The default is
+  false, which keeps them on the op threads. With true, the OSD also
+  creates a DC initiator for each transfer thread. See `cuObject`_.
+
 Operations
 ==========
 
@@ -1699,9 +1802,11 @@ writes in flight, and these counters:
 * ``budget_refused``: the reads delivered inline, with nothing staged,
   because less than the DC retry budget was left.
 
-A kept buffer comes back when a later cuObject read on the same op
-worker thread finds its writes completed, or when the transport resets
-the channel. A thread that serves no further cuObject read keeps it, so
+A kept buffer comes back when a later cuObject read on its thread finds
+its writes completed, or when the transport resets the channel. A
+transfer thread also checks its channel each time it has nothing to run
+for 100 ms. An op worker thread that serves no further cuObject read
+keeps the buffer, so
 ``buffers_leaked`` can stay above ``buffers_reclaimed`` on an idle OSD.
 
 ``ofi status`` shows the windows lent and exhausted, ``staging_busy``,
@@ -1729,13 +1834,13 @@ endpoint's last error (``last_error``). It also shows:
   endpoint; with a ``FI_THREAD_DOMAIN`` provider, ``insert_busy``
   counts those that gave up on an insert. ``peers``,
   ``pending_inserts`` and ``inserts_refused``. See `libfabric`_.
-* ``insert_busy``: calls of op threads that gave up on an insert of a
-  ``FI_THREAD_DOMAIN`` provider, having waited for it at most 10 ms:
-  writes refused with nothing sent, to a known client or to a new one
-  not yet added (the read delivered inline and declined, or the
-  shard's push delivered inline), gathers' reads of a window ordered
-  without the endpoint, and, rarely, a gather window's token or new
-  key asked for just as an insert began.
+* ``insert_busy``: calls of op or transfer threads that gave up on an
+  insert of a ``FI_THREAD_DOMAIN`` provider, having waited for it at
+  most 10 ms: writes refused with nothing sent, to a known client or to
+  a new one not yet added (the read delivered inline and declined, or
+  the shard's push delivered inline), gathers' reads of a window ordered
+  without the endpoint, and, rarely, a gather window's token or new key
+  asked for just as an insert began.
   ``windows_declined_insert``: gather windows not lent meanwhile, one
   for each shard a gather would have lent one to.
   ``windows_rekeys_put_off``: windows returned meanwhile, re-keyed by a
@@ -1760,6 +1865,44 @@ shard could not read and bounced to the primary.
 ``ec_read_repair`` counts the shards that a primary marked missing to
 repair them after a read decoded around their media error. Each event
 also goes to the cluster log. See `Shard read errors`_.
+
+An OSD that started a transport also reports the ``oob_xfer``
+performance counters, which ``ceph daemon osd.N perf dump oob_xfer``
+shows. See `Transfer threads`_.
+
+* ``queued``: the pushes that wait for a transfer thread.
+* ``running``: the pushes that run now, on a transfer thread or on an
+  op thread.
+* ``refused``: the pushes refused over a cap or while the OSD stopped.
+* ``expired``: the pushes whose lease ended while they waited to start.
+* ``shed``: the pushes still queued when the OSD stopped.
+* ``queue_lat``: how long a push waited for a transfer thread.
+* ``push_lat``: how long a push took, on a transfer thread or on an op
+  thread.
+* ``pull_lat``: unused, because pulls do not run on the transfer
+  threads.
+
+A refused, expired or shed push starts nothing, and its data goes
+inline. When ``expired`` or ``refused`` grows under load, the transfer
+threads do not keep up, and more reads go inline.
+
+``ceph daemon osd.N dump_oob_transfers`` shows the settings of the
+transfer threads and the number of queued pushes. Its ``pinned_bytes``
+is the data that the transfer threads hold. The command also shows each
+running push:
+
+* ``kind``, ``age``, ``queued_for``, ``post_by_in``, ``pinned_bytes``,
+  and ``inline``, which is true for a push that runs on its op thread.
+* For a read push: ``object``, ``op``, ``bytes`` and ``ranges``.
+* For a push of an erasure-coded shard: ``pgid``, the shard's own PG
+  instance, such as ``1.0s1``, ``sub_read``, the primary's sub-read
+  tid, and ``bytes``.
+
+A read whose op thread handed its push off gets the event
+``oob_handed_off`` in ``ceph daemon osd.N dump_historic_ops``. A read or
+a shard's sub-read with a push gets ``oob_settled`` when its reply
+leaves. ``op_r_latency`` counts such a read from receipt to its reply,
+with the push included.
 
 Accounting
 ----------
@@ -1788,7 +1931,18 @@ Testing
   the gather window cycle under load, with cut-offs alongside.
 * ``unittest_ec_gather`` tests the check of gathered shard data against
   its shard's checksum, and that a reply says when its shard sent
-  nothing into the window.
+  nothing into the window. It also runs a shard's push through the
+  transfer threads with a fake executor: placed, failed, expired,
+  refused and shed.
+* ``unittest_oob_xfer`` tests the transfer threads: their caps,
+  transfers past their leases, and shedding at stop. It also tests
+  transfers that run on the submitting thread, the heartbeat of a long
+  transfer, and what ``dump_oob_transfers`` shows.
+* ``unittest_oob_read_delivery`` tests that the read push gives the same
+  replies as the earlier code, for every kind of read and outcome. It
+  also tests the handoff to the transfer threads, pushes past their
+  leases and shed pushes. It checks that the reply leaves only after the
+  op thread releases the object.
 * ``unittest_oob_placement`` tests placement plans.
 * ``unittest_oob_abandoned`` tests how the cuObject executor counts a
   completion against the plan that posted it, and when it gives the
@@ -1809,6 +1963,13 @@ Testing
 * ``qa/standalone/erasure-code/test-erasure-eio.sh`` covers shard-direct
   reads whose shard read fails with ``-EIO``, and their bounce to the
   primary.
+* ``qa/standalone/osd/osd-oob-async.sh`` runs pushes on transfer threads
+  over the libfabric ``tcp`` provider. While one push is held, the other
+  operations on its PG do not wait for it, and with 0 threads they do.
+  It covers read pushes and erasure-coded shard pushes, an interval
+  change, a slow stop, and pushes past the lease or over
+  ``osd_oob_transfer_queue_max``. Its librados client is
+  ``ceph_test_osd_oob_read``, which needs a build with ``WITH_OOB_OFI``.
 * ``unittest_rgw_rdma_fence`` tests when the gateway fences, and how it
   reads each stripe's reply.
 * ``unittest_rgw_rdma_rc_wire`` tests the ``hipobj-rc-v2`` wire
@@ -1823,12 +1984,18 @@ Testing
 Limitations
 ===========
 
-* An OSD writes on the op worker thread and waits for the writes to
-  complete before the next operation on that thread.
-* The cuObject executor keeps one channel per op worker thread. After
-  a transfer on it times out, the thread delivers its reads inline
-  until the transfer's writes complete or the DC transport gives up on
-  them, for up to the DC retry budget.
+* With ``osd_oob_transfer_threads`` at 0, the default, an OSD writes on
+  the op worker thread. It waits for the writes to complete before the
+  next operation on that thread. A pull always runs that way. So does a
+  cuObject push, unless ``osd_oob_cuobj_transfer_threads`` is set. See
+  `Transfer threads`_.
+* An erasure-coded primary completes the client reads of a PG in the
+  order that it started them. While a shard's push is slow, later
+  client reads of that PG wait for it, also with transfer threads.
+* The cuObject executor keeps one channel per thread that runs its
+  transfers. After a transfer on it times out, the thread delivers its
+  reads inline until the transfer's writes complete or the DC transport
+  gives up on them, for up to the DC retry budget.
 * An OSD copies each read into a staging buffer. It does not register
   the read's own buffers.
 * An OSD runs one libfabric endpoint, so ``oob_cluster_transport`` and
@@ -1872,4 +2039,5 @@ Limitations
   On an E810 adapter, this costs about 2.5 ms for a 64 MiB PUT session.
   Zeroing takes 1.6 ms, registering 0.74 ms and deregistering 0.21 ms.
   At 4 MiB it costs about 0.13 ms. Soft-RoCE (``rxe``) is similar.
-* The cuObject executor's gather windows are not tested on hardware.
+* The cuObject executor's gather windows, and cuObject transfers on the
+  transfer threads, are not tested on hardware.

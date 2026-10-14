@@ -60,6 +60,7 @@ set(osd_srcs
   ${osd_cyg_functions_src}
   ${osdc_osd_srcs}
   oob_placement.cc
+  oob_read_delivery.cc
   oob_xfer.cc
   osd_tracer.cc)
 if(HAS_VTA)

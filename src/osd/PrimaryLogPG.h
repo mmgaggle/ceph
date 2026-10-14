@@ -45,6 +45,11 @@ class PGLSFilter;
 class HitSet;
 struct TierAgentState;
 class OSDService;
+#ifdef HAVE_OSD_OOB_DELIVERY
+namespace ceph::osd::oob {
+struct read_push;
+}
+#endif
 
 void intrusive_ptr_add_ref(PrimaryLogPG *pg);
 void intrusive_ptr_release(PrimaryLogPG *pg);
@@ -1233,6 +1238,13 @@ protected:
   void reply_ctx(OpContext *ctx, int err);
   void make_writeable(OpContext *ctx);
   void log_op_stats(const OpRequest& op, uint64_t inb, uint64_t outb);
+  /// the half of log_op_stats() that counts in the OSD's logger, which
+  /// needs no PG and runs on any thread; returns the op's latency
+  static utime_t log_op_osd_stats(OSDService *osd, const OpRequest& op,
+				  uint64_t inb, uint64_t outb);
+  /// the half of log_op_stats() that needs the PG: its dynamic perf stats
+  void log_op_pg_stats(const OpRequest& op, uint64_t inb, uint64_t outb,
+		       utime_t latency);
 
   void write_update_size_and_usage(object_stat_sum_t& stats, object_info_t& oi,
 				   interval_set<uint64_t>& modified, uint64_t offset,
@@ -1324,21 +1336,30 @@ protected:
   void complete_read_ctx(int result, OpContext *ctx);
 #ifdef HAVE_OSD_OOB_DELIVERY
   /**
-   * Try to deliver the read reply's data out of band per the MOSDOp's
-   * per-op rdma delivery descriptors: for each op carrying one,
-   * builds an op-aware placement plan (linear, sparse-extent or
-   * EC-direct interleave) and executes it through the cuObject
-   * service. On success strips that op's outdata from rops and
-   * records the pushed byte count in oob[i]; on any refusal or
-   * failure leaves the op untouched so the reply carries its data
-   * inline. Returns true iff anything was pushed.
+   * Prepare to deliver the read reply's data out of band per the
+   * MOSDOp's per-op rdma delivery descriptors: checks the request, and
+   * for each op carrying a descriptor builds an op-aware placement plan
+   * (linear, sparse-extent or EC-direct interleave), finds the executor
+   * for its token and fixes the bounds of its transfer. Returns the
+   * pushes to run. An op that will not be pushed keeps its data inline
+   * in rops, and is reported declined in oob[i], unless the descriptors
+   * do not mirror the ops, when no op gets a result. Starts no
+   * transfer.
    */
-  bool deliver_oob(OpContext *ctx, std::vector<OSDOp>& rops,
-		   std::vector<ceph::rdma::oob_result_t>& oob);
-  /// deliver_oob for one op; *started when a transfer was started for it
-  bool deliver_op_oob(OpContext *ctx, size_t idx, OSDOp& op,
-		      const ceph::rdma::delivery_t& d,
-		      ceph::rdma::oob_result_t& res, bool* started);
+  std::vector<ceph::osd::oob::read_push> deliver_oob_prepare(
+    OpContext *ctx, const std::vector<OSDOp>& rops,
+    std::vector<ceph::rdma::oob_result_t>& oob);
+  /**
+   * Run the pushes deliver_oob_prepare() returned, and send the reply,
+   * with rops and oob back in it, once every push is over. A push that
+   * placed its op's data strips it from the op, and each records its
+   * result in oob. The pushes run on this thread, so the reply has
+   * left when this returns.
+   */
+  void deliver_oob(OpContext *ctx, MOSDOpReply *reply,
+		   std::vector<OSDOp>&& rops,
+		   std::vector<ceph::rdma::oob_result_t>&& oob,
+		   std::vector<ceph::osd::oob::read_push>&& pushes);
   /**
    * Take the payload of each write that carries a pull descriptor
    * (delivery_t::FLAG_PULL) out of the client's window, into the op's

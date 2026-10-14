@@ -154,10 +154,16 @@ Every OSD executor can pull. The libfabric executor asks its provider
 for RMA reads, and pulls into a buffer of the OSD's arena (see
 `Registered memory`_). A provider without RMA reads still starts, for
 delivery only. The cuObject executor reads with
-``handlePutObject``, as the gateway's staged PUT does. A pull holds the
-object's lock, the PG's lock and the op thread until it completes, at
-most for the pool's lease plus drain. Pulls do not run on the transfer
-threads (see `Transfer threads`_).
+``handlePutObject``, as the gateway's staged PUT does.
+
+The OSD checks every pull of a write request before it starts any of
+them. The pulls of one request are all or nothing. After one fails, no
+later pull starts, and no write of the request runs. With
+``osd_oob_transfer_threads`` at 0, a pull holds the object's lock, the
+PG's lock and the op thread until it completes. That takes at most the
+pool's lease plus drain. With transfer threads, a transfer thread runs
+the pull, and the write holds no lock (see `Pulled writes on transfer
+threads`_).
 
 An OSD that cannot pull fails the write with ``EOPNOTSUPP``. That
 happens in these cases:
@@ -166,12 +172,17 @@ happens in these cases:
 * None of its transports can pull with the token.
 * Its client message throttle (``osd_client_message_size_cap``) has no
   room for the payload now.
+* Its transfer threads refuse the pull, over one of their caps or
+  because the OSD stops. The OSD does not pull on the op thread instead.
 
-A pulled payload counts against that throttle as an inline payload
-does, from just before the pull until the request completes. The pulled
-and inline bytes of one request together must not exceed
-``osd_max_write_size``. The OSD fails a larger request with
-``EMSGSIZE`` before it pulls anything.
+The pulled payloads of one request count against that throttle
+together, as the data of one inline message does. The OSD reserves them
+once, after it checks every pull and before the first one starts. As
+the messenger does, it admits a request larger than the throttle's
+limit while the throttle is at or under its limit. The request gives
+the bytes back when it completes. The pulled and inline bytes of one
+request together must not exceed ``osd_max_write_size``. The OSD fails
+a larger request with ``EMSGSIZE`` before it pulls anything.
 
 An OSD of an earlier release fails the write with ``EINVAL``, because
 the write has no data. Below an Umbrella ``require_osd_release``, the
@@ -179,9 +190,21 @@ RADOS client does not send the pull descriptor. Every OSD then fails
 the write with ``EINVAL``, and the result is marked declined. In all
 these cases nothing is written.
 
+When a pulled write fails, its reply marks the descriptor of an op
+declined only when nothing of that op's pull reached the transport. The
+reply leaves the result flags of an op at 0 when its pull started. That
+holds whether the write fails in its pull or after it.
+
 The window must stay registered and unchanged until the reply arrives.
 A token for a readable window lets any holder read that memory. When
 the PUT is complete, re-key the window.
+
+An OSD can still read the window after the reply, when the RADOS client
+resent a stripe write to another OSD. The pull of the earlier attempt
+runs until it ends: at most the pool's lease plus drain after that
+attempt reached its OSD. That OSD writes nothing from what it reads. A
+re-key before then only makes that read fail. See `Pulled writes on
+transfer threads`_.
 
 Transports
 ----------
@@ -555,11 +578,12 @@ Transfer threads
 
 With ``osd_oob_transfer_threads`` at 0, the default, an OSD runs each
 transfer on the op worker thread that serves the request. That thread
-holds the PG's lock until every write completes or is cut off, so other
-operations on the PG wait. With a value above 0, that many transfer
-threads run the OSD's pushes instead. These are the pushes of reads into
-client windows, and the pushes of erasure-coded shards into gather
-windows. See `Gathering shard reads out of band`_.
+holds the PG's lock until the transfer ends, so other operations on the
+PG wait. With a value above 0, that many transfer threads run the OSD's
+pushes and pulls instead. These are the pushes of reads into client
+windows, the pushes of erasure-coded shards into gather windows, and
+the pulls of OSD-direct PUTs. See `Gathering shard reads out of band`_
+and `Pulled writes on transfer threads`_.
 
 Under the PG's lock, the op thread checks the read, plans its push, and
 fixes the reply's versions, result and flags. It then hands the push to
@@ -573,26 +597,101 @@ that their pushes complete. A later write to the same object can be
 acknowledged before an earlier read's reply. That read still returns
 the data and the version from before the write.
 
-A push waits in a queue until a transfer thread is free. A queued push
-starts nothing once the pool's lease ends, or once the PG read lease
-that the OSD read at handoff ends. ``osd_oob_transfer_queue_max`` and
-``osd_oob_transfer_queue_bytes`` cap the pushes that wait for or run on
-the transfer threads. The OSD refuses a push over either cap. In each
-case, the OSD delivers the read inline and marks it declined.
+A push or a pull waits in a queue until a transfer thread is free. A
+queued push starts nothing once the pool's lease ends, or once the PG
+read lease that the OSD read at handoff ends. A queued pull starts
+nothing once the pool's lease plus drain ends.
+``osd_oob_transfer_queue_max`` and ``osd_oob_transfer_queue_bytes`` cap
+the transfers that wait for or run on the transfer threads, and the OSD
+refuses a transfer over either cap. In each case, the OSD delivers the
+read of a push inline and marks it declined. A pull fails its write
+with ``ETIMEDOUT`` when it waited too long, and with ``EOPNOTSUPP``
+when the OSD refused it.
 
 When ``osd_fast_shutdown`` is off, a stopping OSD refuses each new push
-for its transfer threads. Once its op threads stop, it sheds the pushes
-still queued. A shed push starts nothing. The OSD delivers its read
-inline, marks it declined, and still sends the reply.
-It then waits for the running pushes, each until its writes land or are
-cut off. It stops its messengers only after that.
+or pull for its transfer threads. Once its op threads stop, it sheds the
+transfers still queued. A shed transfer starts nothing. The OSD delivers
+the read of a shed push inline, marks it declined, and still sends the
+reply. It then waits for the running transfers, each push until its
+writes land or are cut off, and each pull until it ends. It stops its
+messengers only after that.
 
-Some transfers stay on the op thread, also with transfer threads. A
-pulled write holds its op thread and the PG's lock until the pull
-completes (see `OSD-direct PUT`_). cuObject transfers stay on the op
-threads unless ``osd_oob_cuobj_transfer_threads`` is set. Each thread
-that runs them needs a DC initiator of its own (see `cuObject`_). The
-caps do not count the transfers that stay on the op threads.
+Some transfers stay on the op thread, also with transfer threads.
+cuObject transfers, pulls included, stay there unless
+``osd_oob_cuobj_transfer_threads`` is set. Each thread that runs them
+needs a DC initiator of its own (see `cuObject`_). The pulls of a
+request that runs in a coroutine also stay on the op thread (see
+`Pulled writes on transfer threads`_). The caps do not count the
+transfers that stay on the op threads.
+
+Pulled writes on transfer threads
+---------------------------------
+
+With ``osd_oob_transfer_threads`` above 0, a transfer thread runs the
+pulls of an OSD-direct PUT (see `OSD-direct PUT`_). Under the PG's lock,
+the op thread checks every pull of the write request, and reserves the
+payloads in the client message throttle. It then hands one job with all
+the pulls to the transfer threads. The write parks: it waits for the
+job, and the op thread releases the object's lock and goes on.
+
+When the pulls end, the transfer thread queues a kick for the PG. The
+kick goes ahead of the client ops in the OSD's queue. Under the PG's
+lock, it queues the write again, with the ops that wait behind it. The
+write runs again from the start. It takes the pulled payloads, and goes
+on as a write with inline data does. If a pull failed, the write fails
+with that pull's error instead.
+
+While the write waits, the PG keeps a hold on its object. The hold
+keeps only the waiting ops, and no lock, so a scrub or a backfill can
+still work on the object. Every later client op on the object or its
+snapshots waits in the hold, behind the write. That includes reads, and
+other pulled writes, which start no pull meanwhile. Ops on other objects
+of the PG go on.
+
+Writes to one object therefore keep their order. The PG checks the
+holds before any other list that an op can wait in, such as the wait
+for a scrub. The kick queues the write first, and the ops behind it
+after it, in one step. So a scrub or a recovery cannot let a later op
+pass the write. Only the flush ops of a cache tier, and PG ops such as
+an object listing, pass a hold.
+
+Nothing answers the write while its pulls run, not even with an error.
+A client that is blocklisted meanwhile gets ``EBLOCKLISTED`` only after
+the pulls end. The pulls end by the pool's lease plus drain after the
+OSD received the write. Unlike a read, a waiting write keeps its unit of
+``osd_client_message_cap`` and its reservation in the client message
+throttle until it completes.
+
+A request with a ``CALL`` on an erasure-coded pool with
+``allow_ec_optimizations`` runs in a coroutine. Its pulls run on its op
+thread, and it does not park. A pull on the op thread holds the object's
+lock, the PG's lock and the op thread until it ends.
+
+When the PG's interval changes and the OSD stays its primary, the PG
+queues each waiting write again, with the ops behind it. A write whose
+pulls still run then waits for the same pulls again. It does not pull
+again, and it does not reserve the throttle again. When the OSD is no
+longer the primary, or when it stops, the PG drops the waiting writes
+and their ops. It sends them no reply.
+
+When a write runs again, the PG can drop it as it drops any op: after a
+split, a session reset or a backoff. A pull of a dropped write that has
+not started never starts. A pull that already started runs until it
+ends, and the OSD discards its payload. The client sends a dropped
+write again.
+
+The OSD keeps a list, by request, of the pulls that run on its transfer
+threads. A later attempt of a write can reach the OSD while a pull of an
+earlier attempt still runs. Examples are a resend after a split, a
+session reset or an interval change. The later attempt then waits for
+that pull in the hold of its object, in whichever PG it reaches. It
+pulls nothing, and nothing answers it, until that pull ends. It then
+pulls the window itself, or the OSD answers it as a duplicate when the
+write is done.
+
+A resend to another OSD, such as a new primary, does not wait. That OSD
+can pull the window and answer while the earlier pull still reads it.
+The OSD of the earlier attempt discards what it reads.
 
 Gateway behavior
 ================
@@ -1618,10 +1717,12 @@ The OSDs enforce both options, and the gateway reads the same values
 from the OSDMap, so no daemon setting must agree with them. Set them
 with ``ceph osd pool set <pool> <option> <seconds>``. A value of 0
 restores the default. The lease can be at most 6 seconds and the drain
-at most 4 seconds. The monitor rejects larger values, because a
-transfer can hold an op thread and the PG's lock while it runs. A pulled
-write always does, and a push does unless it runs on a transfer thread
-(see `Transfer threads`_).
+at most 4 seconds.
+
+The monitor rejects larger values, because a transfer can hold an op
+thread and the PG's lock while it runs. A transfer on a transfer thread
+holds neither (see `Transfer threads`_). The client ops on the object
+of a pulled write still wait for its pulls.
 
 ``rdma_delivery_lease``
   How long, in seconds, after it receives a stripe operation an OSD can
@@ -1743,18 +1844,19 @@ The OSD reads the options of its transfer threads only when it starts.
 See `Transfer threads`_.
 
 ``osd_oob_transfer_threads``
-  The number of transfer threads that run the OSD's pushes. The default
-  is 0, which runs each transfer on its op thread.
+  The number of transfer threads that run the OSD's pushes and pulls.
+  The default is 0, which runs each transfer on its op thread.
 
 ``osd_oob_transfer_queue_max``
-  How many pushes can wait for or run on the transfer threads. The OSD
-  refuses a push past this cap, and delivers its data inline. The
+  How many transfers can wait for or run on the transfer threads. The
+  OSD refuses a transfer past this cap. It delivers the data of a
+  refused push inline, and fails the write of a refused pull. The
   default is 64.
 
 ``osd_oob_transfer_queue_bytes``
-  How many bytes of data the pushes that wait for or run on the transfer
-  threads can hold. The OSD refuses a push that takes them past this
-  cap. The default is 512 MiB.
+  How many bytes of data the transfers that wait for or run on the
+  transfer threads can hold. The OSD refuses a transfer that takes them
+  past this cap. The default is 512 MiB.
 
 ``osd_oob_transfer_thread_timeout``
   The heartbeat grace of a transfer thread. A thread that runs one
@@ -1870,39 +1972,56 @@ An OSD that started a transport also reports the ``oob_xfer``
 performance counters, which ``ceph daemon osd.N perf dump oob_xfer``
 shows. See `Transfer threads`_.
 
-* ``queued``: the pushes that wait for a transfer thread.
-* ``running``: the pushes that run now, on a transfer thread or on an
-  op thread.
-* ``refused``: the pushes refused over a cap or while the OSD stopped.
-* ``expired``: the pushes whose lease ended while they waited to start.
-* ``shed``: the pushes still queued when the OSD stopped.
-* ``queue_lat``: how long a push waited for a transfer thread.
+* ``queued``: the pushes and pulls that wait for a transfer thread.
+* ``running``: the pushes and pulls that run now, on a transfer thread
+  or on an op thread.
+* ``refused``: the transfers refused over a cap or while the OSD
+  stopped.
+* ``expired``: the transfers that waited too long to start: a push past
+  its lease, a pull past the lease plus drain.
+* ``shed``: the transfers still queued when the OSD stopped.
+* ``queue_lat``: how long a transfer waited for a transfer thread.
 * ``push_lat``: how long a push took, on a transfer thread or on an op
   thread.
-* ``pull_lat``: unused, because pulls do not run on the transfer
-  threads.
+* ``pull_lat``: how long the pulls of one write request took, on a
+  transfer thread or on an op thread.
 
-A refused, expired or shed push starts nothing, and its data goes
-inline. When ``expired`` or ``refused`` grows under load, the transfer
-threads do not keep up, and more reads go inline.
+A refused, expired or shed transfer starts nothing. The data of such a
+push goes inline. A refused or expired pull fails its write. When
+``expired`` or ``refused`` grows under load, the transfer threads do
+not keep up. More reads then go inline, and the gateway declines more
+PUTs.
 
 ``ceph daemon osd.N dump_oob_transfers`` shows the settings of the
-transfer threads and the number of queued pushes. Its ``pinned_bytes``
-is the data that the transfer threads hold. The command also shows each
-running push:
+transfer threads and the number of queued transfers. Its
+``pinned_bytes`` is the data that the transfer threads hold. The command
+also shows each running transfer:
 
-* ``kind``, ``age``, ``queued_for``, ``post_by_in``, ``pinned_bytes``,
-  and ``inline``, which is true for a push that runs on its op thread.
+* ``kind``, which is ``push`` or ``pull``, ``age``, ``queued_for``,
+  ``post_by_in``, ``pinned_bytes``, and ``inline``, which is true for a
+  transfer that runs on its op thread.
 * For a read push: ``object``, ``op``, ``bytes`` and ``ranges``.
 * For a push of an erasure-coded shard: ``pgid``, the shard's own PG
   instance, such as ``1.0s1``, ``sub_read``, the primary's sub-read
   tid, and ``bytes``.
+* For a pull: ``object``, ``ops``, the number of pulls in the write
+  request, and ``bytes``, their payloads together.
 
 A read whose op thread handed its push off gets the event
 ``oob_handed_off`` in ``ceph daemon osd.N dump_historic_ops``. A read or
 a shard's sub-read with a push gets ``oob_settled`` when its reply
 leaves. ``op_r_latency`` counts such a read from receipt to its reply,
-with the push included.
+with the push included. A pulled write that waits for its pulls, and
+each op that waits behind it, gets the event ``waiting for oob pull``.
+
+``ceph pg <pgid> query`` lists the holds of the PG in
+``oob_pull_holds``, one for each object. Each entry has the ``object``,
+the ``owner``, the request ID of the waiting write, and the request IDs
+of the ``waiters`` behind it. ``age`` is the time since the hold began,
+in seconds. ``settled`` is true once the pulls that the hold waits for
+ended. ``own_pulls`` is false when the owner waits for the pulls of an
+earlier attempt of its request. See `Pulled writes on transfer
+threads`_.
 
 Accounting
 ----------
@@ -1943,6 +2062,15 @@ Testing
   also tests the handoff to the transfer threads, pushes past their
   leases and shed pushes. It checks that the reply leaves only after the
   op thread releases the object.
+* ``unittest_oob_pull`` tests the pulled write with a fake executor. It
+  covers the reservation in the client message throttle, also for a
+  request larger than the limit. It tests that no pull starts before
+  every pull is checked, and that the pulls are all or nothing. It
+  checks that the checksums match the earlier code, and that a second
+  run pulls and reserves nothing. It checks that an error reply declines
+  only the ops whose pull started nothing. It covers the park and the
+  kick, the job of a dropped write, and a resend that waits for an
+  earlier job.
 * ``unittest_oob_placement`` tests placement plans.
 * ``unittest_oob_abandoned`` tests how the cuObject executor counts a
   completion against the plan that posted it, and when it gives the
@@ -1970,6 +2098,19 @@ Testing
   change, a slow stop, and pushes past the lease or over
   ``osd_oob_transfer_queue_max``. Its librados client is
   ``ceph_test_osd_oob_read``, which needs a build with ``WITH_OOB_OFI``.
+
+  It also runs pulls on transfer threads. While a pull is held, the
+  operations on other objects of its PG do not wait, and with 0 threads
+  they do. An inline write and a read behind the pulled write keep their
+  order. It holds a pull during a deep scrub, a backfill, a repeer, a
+  primary change, a blocklist, a session reset and a slow stop. It
+  splits the PG before the pull starts, and while it runs.
+
+  It checks that a pulled write with a ``CALL`` on an erasure-coded pool
+  with ``allow_ec_optimizations`` pulls on its op thread. The ``put``
+  mode of ``ceph_test_osd_oob_read`` sends the pulled writes. It prints
+  ``crc=declined`` for a write whose resend the OSD answered as a
+  duplicate.
 * ``unittest_rgw_rdma_fence`` tests when the gateway fences, and how it
   reads each stripe's reply.
 * ``unittest_rgw_rdma_rc_wire`` tests the ``hipobj-rc-v2`` wire
@@ -1984,11 +2125,15 @@ Testing
 Limitations
 ===========
 
-* With ``osd_oob_transfer_threads`` at 0, the default, an OSD writes on
-  the op worker thread. It waits for the writes to complete before the
-  next operation on that thread. A pull always runs that way. So does a
-  cuObject push, unless ``osd_oob_cuobj_transfer_threads`` is set. See
-  `Transfer threads`_.
+* With ``osd_oob_transfer_threads`` at 0, the default, an OSD runs each
+  transfer on the op worker thread. It waits for the transfer to end
+  before the next operation on that thread. A cuObject transfer always
+  runs that way, unless ``osd_oob_cuobj_transfer_threads`` is set. So
+  does the pull of a request that runs in a coroutine. See `Transfer
+  threads`_.
+* While a pulled write waits for its pulls on a transfer thread, every
+  client op on its object waits behind it, reads included. See `Pulled
+  writes on transfer threads`_.
 * An erasure-coded primary completes the client reads of a PG in the
   order that it started them. While a shard's push is slow, later
   client reads of that PG wait for it, also with transfer threads.

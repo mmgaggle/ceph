@@ -80,6 +80,9 @@ class OSDOobExecutor;
 namespace ceph::oob {
 class Arena;
 }
+namespace ceph::osd::oob {
+class Transfers;
+}
 class OSDMap;
 class MLog;
 class Objecter;
@@ -164,6 +167,24 @@ public:
   /// the executor lending windows for EC gathers (oob_cluster_transport),
   /// or null
   OSDOobExecutor* oob_gather_executor() const;
+  /// the threads that run the executors' transfers instead of the op
+  /// threads (osd_oob_transfer_threads), built with the executors; null
+  /// when none started
+  std::unique_ptr<ceph::osd::oob::Transfers> oob_xfer;
+  /// cuObject transfers run on the transfer threads too
+  /// (osd_oob_cuobj_transfer_threads)
+  bool oob_cuobj_transfer_threads = false;
+  /// oob_xfer once published, else null
+  ceph::osd::oob::Transfers* oob_transfers() const;
+  /// true when e's transfers stay on the thread that submits them even
+  /// with transfer threads: cuObject's, unless
+  /// osd_oob_cuobj_transfer_threads, since only the op threads have its
+  /// DC initiators then
+  bool oob_runs_inline(const OSDOobExecutor* e) const;
+  /// once the op threads stopped: shed the queued transfers, wait for the
+  /// running ones, and stop the transfer threads, before the executors
+  /// go
+  void stop_oob_transfers();
 #endif
 
   void enqueue_back(OpSchedulerItem&& qi);

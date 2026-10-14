@@ -1734,14 +1734,14 @@ options:
   level: advanced
   desc: Threads that run an OSD's out-of-band transfers, so that its op
     threads do not wait on the fabric
-  long_desc: With 0, each out-of-band transfer (a read pushed into a
-    client's memory, a shard read pushed into a gather window, the payload
-    of a write pulled out of a client's memory) runs on the op thread that
-    served the request, while that thread holds the PG lock. With more,
-    the op thread hands the transfer to one of these threads and goes on
-    with other requests. The reply still leaves only once the transfer
-    completed or was cut off. cuObject transfers stay on the op threads
-    unless osd_oob_cuobj_transfer_threads is set.
+  long_desc: With 0, each out-of-band push (a read pushed into a
+    client's memory, a shard read pushed into a gather window) runs on the
+    op thread that served the request, while that thread holds the PG lock.
+    With more, the op thread hands the push to one of these threads and
+    goes on with other requests. The reply still leaves only once the push
+    completed or was cut off. The payload of a pulled write is still pulled
+    on the op thread. cuObject pushes stay on the op threads unless
+    osd_oob_cuobj_transfer_threads is set.
   default: 0
   services:
   - osd
@@ -1759,11 +1759,9 @@ options:
     threads
   long_desc: Past this many, a transfer is refused, and the request is
     served without it, as when a transfer fails before it starts. A read
-    or a shard read is then delivered inline, and the client resends a
-    write whose payload was to be pulled with the payload inline. A
-    queued transfer that cannot start before its pool's delivery lease
-    runs out is served the same way. Used only when
-    osd_oob_transfer_threads is above 0.
+    or a shard read is then delivered inline. A queued transfer that cannot
+    start before its pool's delivery lease runs out is served the same
+    way. Used only when osd_oob_transfer_threads is above 0.
   default: 64
   services:
   - osd

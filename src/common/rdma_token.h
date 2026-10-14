@@ -367,8 +367,12 @@ inline uint32_t attempt_flags(bool placed, bool started, bool landed_promise)
 /**
  * The declined, landed and resent flags of a result assembled from the
  * results of its parts, as a split read assembles its sub-reads': declined
- * when every part declined, landed when every part landed and some bytes
- * moved, resent when any part was resent. The crc flags are the caller's.
+ * when every part declined; landed when some bytes moved and every part
+ * landed or declined, not all of them declined - a part that started no
+ * transfer, as a replica's share wholly past the object's end, leaves
+ * nothing to land after the reply; resent when any part was resent, which
+ * says nothing of the other two, as on a result of one op. The crc flags
+ * are the caller's.
  */
 inline uint32_t fold_transfer_flags(const std::vector<uint32_t>& parts,
 				    uint64_t bytes)
@@ -379,9 +383,11 @@ inline uint32_t fold_transfer_flags(const std::vector<uint32_t>& parts,
   bool declined = true, landed = bytes > 0, resent = false;
   for (uint32_t f : parts) {
     declined = declined && (f & oob_result_t::FLAG_DECLINED);
-    landed = landed && (f & oob_result_t::FLAG_LANDED);
+    landed = landed &&
+      (f & (oob_result_t::FLAG_DECLINED | oob_result_t::FLAG_LANDED));
     resent = resent || (f & oob_result_t::FLAG_RESENT);
   }
+  landed = landed && !declined;
   return (declined ? oob_result_t::FLAG_DECLINED : 0) |
     (landed ? oob_result_t::FLAG_LANDED : 0) |
     (resent ? oob_result_t::FLAG_RESENT : 0);

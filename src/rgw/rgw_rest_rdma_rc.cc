@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -156,8 +157,11 @@ int parse_prepare(req_state* s, Op op, PrepareRequest& out)
   out.size = *size;
   out.offset = 0;
   if (auto o = env(s, H_OFFSET); !o.empty()) {
+    // any offset whose range fits the signed offsets of a read: a
+    // negative start would read a suffix of the object instead
+    constexpr uint64_t max_end = std::numeric_limits<int64_t>::max();
     auto offset = parse_decimal(o);
-    if (!offset || *offset > MAX_TRANSFER_SIZE - out.size) return bad("x-amz-rdma-offset");
+    if (!offset || *offset > max_end - out.size) return bad("x-amz-rdma-offset");
     out.offset = *offset;
   }
   out.target = std::string{env(s, H_TARGET)};
@@ -230,6 +234,7 @@ class GetOp : public RGWGetObj {
   landed_ranges landed;
   uint64_t staged = 0;  ///< inline-copy cursor
   uint64_t pushed = 0;  ///< bytes posted to the client
+  uint32_t acked = 0;   ///< writes the client's queue pair took
   Outcome push_outcome = Outcome::OK;
   uint32_t depth = 1;
 
@@ -327,6 +332,7 @@ int GetOp::reap_one()
   switch (sess->conn.poll_one(wc, sess->deadline, s->yield)) {
   case Completion::OK:
     sess->conn.reaped();
+    ++acked;
     return 0;
   case Completion::TIMEOUT:
     push_outcome = Outcome::TIMEOUT;
@@ -539,6 +545,10 @@ void GetOp::execute_ready(optional_yield y)
       delivered = push_outcome != Outcome::OK;
     }
   }
+  // the logs and the rate limits count what went to the client, also
+  // when the transfer failed after some of it, and not what the OSDs
+  // relayed into the buffer
+  s->rdma_bytes_transferred = pushed;
   Outcome outcome = Outcome::OK;
   if (op_ret < 0 || status.http) {
     outcome = push_outcome != Outcome::OK ? push_outcome : Outcome::BACKEND_FAIL;
@@ -575,6 +585,14 @@ void GetOp::execute_ready(optional_yield y)
     // a retried READY would relay through this buffer, so finish() ends
     // the session instead of rolling the claim back; do not answer 409,
     // which tells the client to retry READY
+    outcome = Outcome::WIRE_FAIL;
+  }
+  if (outcome == Outcome::BUSY && acked > 0) {
+    // the client's queue pair took writes of this transfer and expects
+    // a PSN past the one a retried READY starts from again. Unless the
+    // client resets it, the retry's writes, split as the reads land
+    // then, can miss that PSN, and the last can arrive as a duplicate
+    // that completes nothing for the client. End the session instead
     outcome = Outcome::WIRE_FAIL;
   }
   if (outcome != Outcome::OK && status.http == 0) {
@@ -736,6 +754,9 @@ void PutOp::execute(optional_yield y)
   Outcome outcome = Outcome::OK;
   switch (sess->conn.poll_one(wc, sess->deadline, y)) {
   case Completion::OK:
+    // the logs and the rate limits count what the client wrote, also
+    // when it is not stored, as with the body of a PUT
+    s->rdma_bytes_transferred = wc.byte_len;
     if (wc.opcode != IBV_WC_RECV_RDMA_WITH_IMM ||
         !(wc.wc_flags & IBV_WC_WITH_IMM) ||
         ntohl(wc.imm_data) != sess->cookie || wc.byte_len != sess->size) {

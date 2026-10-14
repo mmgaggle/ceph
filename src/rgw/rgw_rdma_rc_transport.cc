@@ -92,6 +92,13 @@ int Device::select_gid(CephContext* cct, int wanted)
                  << cpp_strerror(errno) << dendl;
       return -errno;
     }
+    // an empty entry of the table reads as all zeroes: no pairing that
+    // routes on it can succeed
+    if (gid_is_zero(local_gid)) {
+      lderr(cct) << "rgw_rdma_rc: " << dev_name << " port " << int(port)
+                 << " has no GID at index " << wanted << dendl;
+      return -ENODEV;
+    }
     gid_index = wanted;
     return 0;
   }
@@ -221,6 +228,16 @@ int Device::open(CephContext* cct, const DeviceConfig& cfg)
   local_lid = pa.lid;
   // the path MTU must not exceed the port's active MTU
   mtu = pa.active_mtu >= IBV_MTU_512 ? pa.active_mtu : IBV_MTU_1024;
+  // nor, for a queue pair paired with a client, the client's: both ends
+  // must use the same one, and hipobj-rc-v2 does not carry it
+  if (auto m = path_mtu_of(cfg.client_mtu, mtu); m) {
+    client_mtu = *m;
+  } else {
+    lderr(cct) << "rgw_rdma_rc: a path MTU of " << cfg.client_mtu
+               << " bytes is below 256" << dendl;
+    close();
+    return -EINVAL;
+  }
 
   ibv_device_attr da;
   std::memset(&da, 0, sizeof(da));
@@ -233,7 +250,8 @@ int Device::open(CephContext* cct, const DeviceConfig& cfg)
 
   ldout(cct, 1) << "rgw_rdma_rc: opened " << dev_name << " port " << int(port)
                 << " gid[" << gid_index << "]=" << gid_to_string(local_gid)
-                << " lid=" << local_lid << " mtu=" << (128 << mtu) << dendl;
+                << " lid=" << local_lid << " mtu=" << (128 << mtu)
+                << " client mtu=" << (128 << client_mtu) << dendl;
   return 0;
 }
 
@@ -416,7 +434,7 @@ int Connection::pair(CephContext* cct, Device& dev, const PeerEndpoint& peer,
   ibv_qp_attr attr;
   std::memset(&attr, 0, sizeof(attr));
   attr.qp_state = IBV_QPS_RTR;
-  attr.path_mtu = dev.path_mtu();
+  attr.path_mtu = dev.client_path_mtu();
   attr.dest_qp_num = peer.qpn;
   attr.rq_psn = peer.psn;
   attr.max_dest_rd_atomic = 1;
@@ -447,7 +465,11 @@ int Connection::pair(CephContext* cct, Device& dev, const PeerEndpoint& peer,
   attr.qp_state = IBV_QPS_RTS;
   attr.timeout = 14;
   attr.retry_cnt = 7;
-  attr.rnr_retry = 7;
+  // not 7, which retries for ever: when the client has not armed the
+  // receive for a GET's final write-with-immediate, the write fails
+  // after six retries, each a wait of the client's min_rnr_timer, and
+  // READY fails then instead of waiting out the session's deadline
+  attr.rnr_retry = 6;
   attr.sq_psn = local_psn;
   attr.max_rd_atomic = 1;
   if (ibv_modify_qp(qp, &attr, IBV_QP_STATE | IBV_QP_TIMEOUT |

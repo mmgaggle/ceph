@@ -101,7 +101,9 @@ void OpRequest::_unregistered() {
   request->clear_payload();
   request->release_message_throttle();
 #ifdef HAVE_OSD_OOB_DELIVERY
-  // the pulled payloads went with the ops' data
+  // the pulled payloads went with the ops' data, or stayed with the pulls
+  // of a request that failed
+  oob_pull.reset();
   if (oob_throttle) {
     oob_throttle->put(oob_throttled);
     oob_throttle = nullptr;

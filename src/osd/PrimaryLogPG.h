@@ -1372,8 +1372,11 @@ protected:
    * indata, before the request runs. The write then runs as if the
    * client had sent the bytes: an erasure-coded one is encoded, and its
    * shards go to their OSDs. Records what was pulled in the request
-   * (OpRequest::oob_pulled), for the reply. Returns 0, or a negative
-   * errno that fails the whole request, with nothing written.
+   * (OpRequest::oob_pulled), for the reply. Every pull of the request
+   * is checked before any starts, and a run of the request after they
+   * started pulls nothing (ceph::osd::oob::pull_payloads()). Returns 0,
+   * or a negative errno that fails the whole request, with nothing
+   * written.
    */
   int pull_oob_payloads(OpContext *ctx);
 #endif

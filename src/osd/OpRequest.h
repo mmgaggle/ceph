@@ -23,6 +23,7 @@
 #ifdef HAVE_OSD_OOB_DELIVERY
 #include "common/rdma_token.h"
 class Throttle;
+namespace ceph::osd::oob { class pull_set; }
 #endif
 
 /**
@@ -41,9 +42,12 @@ public:
   /// what the primary pulled out of client memory for the request's
   /// writes (delivery_t::FLAG_PULL), aligned with its ops; the payload
   /// itself went into the ops' indata. Kept with the request, so that an
-  /// op that waits and runs again neither pulls again nor loses what it
-  /// reports.
+  /// op that waits and runs again does not lose what it reports.
   std::vector<ceph::rdma::oob_result_t> oob_pulled;
+  /// the pulls of the request's writes and what they did (oob_pull.h):
+  /// created when a run of the request starts them, and never replaced,
+  /// so that a later run neither pulls nor charges the throttle again
+  std::shared_ptr<ceph::osd::oob::pull_set> oob_pull;
   /// the throttle the pulled payloads are charged to, and how much; the
   /// request gives it back when it is done, with the ops' data that holds
   /// them (_unregistered())

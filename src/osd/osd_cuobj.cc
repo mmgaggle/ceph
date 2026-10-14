@@ -145,7 +145,7 @@ int OSDCuObj::do_init(const std::string& rdma_ip, bool lend_windows,
 
 std::optional<OSDOobExecutor::window_t> OSDCuObj::acquire_window(size_t size)
 {
-  if (!m_dct || size > m_win_size) {
+  if (!m_dct || size > m_win_size || m_quiesced) {
     return std::nullopt;
   }
   const auto now = std::chrono::steady_clock::now();
@@ -204,7 +204,8 @@ uint16_t OSDCuObj::get_channel_id()
     uint16_t id = m_server->allocateChannelId();
     if (id == invalid_channel) {
       derr << "ERROR: cuObject channel allocation failed"
-	   << " (one DC initiator for each op worker thread)" << dendl;
+	   << " (one DC initiator for each thread that runs transfers)"
+	   << dendl;
       return invalid_channel;
     }
     tls_channel_id = id;
@@ -283,6 +284,7 @@ void OSDCuObj::settle(const held_t& held)
     start = std::max(start, d.until);
   }
   tls_delayed.push_back({held.buf, start + CUOBJ_RETRY_BUDGET});
+  note_retry_until(start + CUOBJ_RETRY_BUDGET);
 }
 
 void OSDCuObj::release_delayed(bool all)
@@ -346,82 +348,61 @@ void OSDCuObj::reap_abandoned(uint16_t channel)
   }
 }
 
-ssize_t OSDCuObj::rdma_write(const std::string& key,
-			     const ceph::buffer::list& bl,
-			     const std::string& token,
-			     uint64_t client_offset)
+void OSDCuObj::note_retry_until(std::chrono::steady_clock::time_point t)
 {
-  if (!is_available()) {
-    return -EOPNOTSUPP;
+  const auto rep = t.time_since_epoch().count();
+  auto last = m_retry_until.load();
+  while (last < rep && !m_retry_until.compare_exchange_weak(last, rep)) {
+    // another thread moved it: last holds what it stored
   }
-  auto window = ceph::rdma::parse_rdma_token(token);
-  if (!window) {
-    dout(5) << "malformed RDMA token for " << key << dendl;
-    return -EINVAL;
-  }
-  const size_t len = bl.length();
-  if (len == 0) {
-    return 0;
-  }
-  if (client_offset > window->size || len > window->size - client_offset) {
-    dout(5) << "target range " << client_offset << "~" << len
-	    << " outside client window of " << window->size
-	    << " bytes for " << key << dendl;
-    return -EINVAL;
-  }
-  uint16_t channel = get_channel_id();
-  if (channel == invalid_channel) {
-    return -EIO;
-  }
-  // the library does not document whether a synchronous call tells its
-  // own completion from one of a write that a timed-out plan left
-  // posted on the channel: do not post behind such a write
-  reap_abandoned(channel);
-  if (channel_busy()) {
-    dout(10) << "channel " << channel << " may still have writes of "
-	     << "earlier plans posted; not writing " << key << dendl;
-    return -EBUSY;
-  }
-  BufEntry* buf = acquire_buffer(len);
-  if (!buf) {
-    // the arena is full, or the read larger than a buffer can be: it
-    // is delivered inline
-    return -ENOMEM;
-  }
-  auto it = bl.begin();
-  it.copy(len, static_cast<char*>(buf->ptr));
+}
 
-  const uint64_t remote_addr = window->addr + client_offset;
-  size_t total = 0;
-  ssize_t ret = 0;
-  dout(20) << "handleGetObject key=" << key << " len=" << len
-	   << " client_offset=" << client_offset
-	   << " channel=" << channel << dendl;
-  while (total < len) {
-    size_t chunk = std::min(len - total, MAX_RDMA_OP_SIZE);
-    ibv_wc_status wc_status = IBV_WC_SUCCESS;
-    ret = m_server->handleGetObject(key, buf->handle, remote_addr + total,
-				    chunk, token, channel, buf->offset + total,
-				    &wc_status);
-    if (ret < 0) {
-      derr << "ERROR: handleGetObject failed for " << key
-	   << ": ret=" << ret
-	   << " wc_status=" << static_cast<int>(wc_status)
-	   << " chunk=" << chunk << " local_offset=" << total << dendl;
-      break;
-    }
-    total += ret;
-    if (static_cast<size_t>(ret) < chunk) {
-      break;
-    }
+std::chrono::steady_clock::time_point OSDCuObj::abandoned_until(bool partial)
+{
+  // the plan's writes may wait on the DC initiator behind the parts of
+  // earlier failed submissions, by their own time, and retry for the DC
+  // retry budget from then; the part of its own failed submission goes
+  // out once they completed, and retries as long again (settle())
+  auto start = std::chrono::steady_clock::now();
+  for (const auto& d : tls_delayed) {
+    start = std::max(start, d.until);
   }
-  release_buffer(buf);
-  if (ret < 0) {
-    // normalize the library's errno-style returns
-    return ret == -EOPNOTSUPP ? -EIO : ret;
+  return start + CUOBJ_RETRY_BUDGET * (partial ? 2 : 1);
+}
+
+void OSDCuObj::idle()
+{
+  // only a thread that ran plans has a channel, and anything on it
+  if (!tls_channel_valid || !channel_busy() || !is_available()) {
+    return;
   }
-  dout(20) << "RDMA wrote " << total << " bytes for " << key << dendl;
-  return static_cast<ssize_t>(total);
+  reap_abandoned(tls_channel_id);
+}
+
+void OSDCuObj::quiesce(ceph::mono_clock::time_point until)
+{
+  m_quiesced = true;
+  // the caller stopped the threads that run plans: what they left posted
+  // can retry until m_retry_until, which each plan that stopped waiting
+  // for its writes, and each failed submission, pushed out. A plan
+  // started past this point fails before it stages anything.
+  auto busy = [this] {
+    return std::chrono::steady_clock::now().time_since_epoch().count() <
+      m_retry_until.load();
+  };
+  if (!busy()) {
+    return;
+  }
+  dout(1) << "waiting for the writes that timed-out plans and failed "
+	  << "submissions left posted to stop retrying" << dendl;
+  while (busy()) {
+    if (ceph::mono_clock::now() >= until) {
+      derr << "WARNING: stopping while writes still posted may retry"
+	   << dendl;
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
 }
 
 ssize_t OSDCuObj::execute_plan(const std::string& key,
@@ -469,6 +450,10 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
   }
   if (!is_available()) {
     return -EOPNOTSUPP;
+  }
+  if (m_quiesced) {
+    // the OSD is stopping, and the arena goes once quiesce() returns
+    return -ESHUTDOWN;
   }
   auto window = ceph::rdma::parse_rdma_token(token);
   if (!window) {
@@ -650,6 +635,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	derr << "ERROR: plan " << first << " for " << key << " timed out with "
 	     << outstanding << " writes outstanding; keeping the staging "
 	     << "buffer until they complete" << dendl;
+	note_retry_until(abandoned_until(submit_failed));
 	m_writes_inflight -= outstanding;
 	m_buffers_leaked++;
 	m_plans_failed++;
@@ -682,6 +668,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	derr << "ERROR: plan " << first << " for " << key << " failed with "
 	     << outstanding << " writes outstanding; keeping the staging "
 	     << "buffer until they complete" << dendl;
+	note_retry_until(abandoned_until(submit_failed));
 	m_writes_inflight -= outstanding;
 	m_buffers_leaked++;
 	m_plans_failed++;
@@ -735,6 +722,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
       derr << "ERROR: plan " << first << " for " << key << " timed out with "
 	   << outstanding << " writes outstanding; keeping the staging "
 	   << "buffer until they complete" << dendl;
+      note_retry_until(abandoned_until(submit_failed));
       m_writes_inflight -= outstanding;
       m_buffers_leaked++;
       m_plans_failed++;

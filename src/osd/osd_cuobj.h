@@ -34,17 +34,20 @@ namespace ceph::oob { class Arena; }
  * reaches it through
  * OSDService::oob_executor_for() for cuObject tokens.
  *
- * Thread safety: rdma_write() may be called concurrently from any
- * number of op worker threads. Each thread lazily allocates its own
- * cuObject channel (DCI), and only that thread posts to it and polls
- * it; buffer-pool slots are claimed with atomic compare-exchange.
+ * Thread safety: execute_plan() and execute_pull() may be called
+ * concurrently from any number of op worker threads, and of transfer
+ * threads when cuObject runs on them (osd_oob_cuobj_transfer_threads).
+ * Each thread lazily allocates its own cuObject channel (DCI), and only
+ * that thread posts to it and polls it; buffer-pool slots are claimed
+ * with atomic compare-exchange.
  */
 class OSDCuObj : public OSDOobExecutor {
 public:
   /// rdma_ip: the OSD's out-of-band address. lend_windows: cuobj is the
   /// cluster transport, so this executor lends the gather windows, and
   /// opens the DC target behind them. num_dcis: one DC initiator for
-  /// each op worker thread. arena: the OSD's out-of-band memory, which
+  /// each op worker thread, and for each transfer thread when cuObject
+  /// runs on them. arena: the OSD's out-of-band memory, which
   /// the executor registers once and stages each transfer in, and in
   /// which it reserves the gather windows; it must outlive the executor
   OSDCuObj(CephContext *cct, const std::string& rdma_ip, bool lend_windows,
@@ -60,16 +63,6 @@ public:
   /// cuObject DC descriptors: every token another executor does not
   /// claim (the descriptor is opaque past its addr:size prefix)
   bool handles(const std::string& token) const override;
-
-  /**
-   * RDMA-write bl into the client memory window described by the
-   * opaque descriptor token, at the token's base address plus
-   * client_offset. key is only used for telemetry. Blocks until the
-   * transfer completes (bounded by the transport's timeout/retry
-   * budget). Returns bytes written or a negative errno.
-   */
-  ssize_t rdma_write(const std::string& key, const ceph::buffer::list& bl,
-		     const std::string& token, uint64_t client_offset);
 
   /**
    * Execute a placement plan: stage data once into a registered
@@ -98,6 +91,18 @@ public:
 		       ceph::buffer::list* out,
 		       std::chrono::milliseconds budget,
 		       bool* started) override;
+
+  /// take what completed of the writes that timed-out plans left posted
+  /// on this thread's channel, and give back their staging buffers and
+  /// those of failed submissions whose time came; a thread without a
+  /// channel has nothing to reap
+  void idle() override;
+
+  /// refuse later plans and windows, and wait until no write that a
+  /// timed-out plan or a failed submission left posted can still retry,
+  /// or until passed; no thread runs a plan or takes a window once it
+  /// is called
+  void quiesce(ceph::mono_clock::time_point until) override;
 
   /// asok/debug counters
   void dump_stats(ceph::Formatter* f) const override;
@@ -178,10 +183,17 @@ private:
   /// them when the channel was reset
   void release_delayed(bool all);
   /// writes of an earlier plan, or the part of a failed submission, may
-  /// still be posted on this thread's channel: a synchronous write,
-  /// which cannot tell its completion from theirs, posts nothing behind
-  /// them
+  /// still be posted on this thread's channel, and hold their staging
+  /// buffers
   static bool channel_busy();
+  /// a write that a plan left posted may retry until t: quiesce() waits
+  /// for the latest such time of any thread
+  void note_retry_until(std::chrono::steady_clock::time_point t);
+  /// until when the writes of a plan that stops waiting for them now
+  /// may retry, by the rule of settle(): they go out behind the parts of
+  /// earlier failed submissions, and the part of the plan's own failed
+  /// submission (partial) goes out behind them
+  static std::chrono::steady_clock::time_point abandoned_until(bool partial);
 
   CephContext* m_cct;
   std::unique_ptr<cuObjServer> m_server;
@@ -212,6 +224,12 @@ private:
   /// the async handle of the next write a plan posts: unique in the
   /// process, and never 0, which reads as no event
   std::atomic<uint64_t> m_next_handle{1};
+  /// quiesce() ran: no plan starts, and no window is lent
+  std::atomic<bool> m_quiesced{false};
+  /// the latest time, on the steady clock, until which a write that a
+  /// timed-out plan or a failed submission left posted on any thread's
+  /// channel may still retry
+  std::atomic<std::chrono::steady_clock::rep> m_retry_until{0};
 
   static thread_local uint16_t tls_channel_id;
   static thread_local bool tls_channel_valid;

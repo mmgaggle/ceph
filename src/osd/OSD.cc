@@ -81,6 +81,7 @@
 #include "common/oob_arena.h"
 #include "common/rdma_token.h"
 #include "oob_executor.h"
+#include "oob_xfer.h"
 #endif
 
 #include "PrimaryLogPG.h"
@@ -517,6 +518,16 @@ void OSDService::start_shutdown()
     std::lock_guard l(recovery_request_lock);
     recovery_request_timer.shutdown();
   }
+
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // a later transfer that would wait for a transfer thread is refused,
+  // and its request served inline; one that runs on its op thread still
+  // runs. The queued and running ones end in stop_oob_transfers(), once
+  // the op threads stopped
+  if (oob_xfer) {
+    oob_xfer->start_stopping();
+  }
+#endif
 }
 
 void OSDService::shutdown_reserver()
@@ -543,12 +554,22 @@ void OSDService::shutdown()
   }
 
 #ifdef HAVE_OSD_OOB_DELIVERY
+  // the op threads and the transfer threads are stopped by now
+  // (stop_oob_transfers()); what the executors left posted may still
+  // touch their staging. A cuObject write left posted retries for up to
+  // 2 s, and the part of a failed submission behind it as long again
+  const auto quiet_by = ceph::mono_clock::now() + std::chrono::seconds(5);
+  for (auto* e : oob_executors) {
+    e->quiesce(quiet_by);
+  }
   oob_published = false;
+  oob_xfer.reset();
   oob_executors.clear();
   oob_lender = nullptr;
 #endif
 #ifdef WITH_CUOBJ
-  // op threads are stopped by now, so no RDMA writes are in flight
+  // no transfer runs any more; a write that quiesce() gave up on cannot
+  // reach the arena once the executor deregistered it
   delete cuobj;
   cuobj = nullptr;
 #endif
@@ -617,6 +638,29 @@ bool OSDService::has_oob_executor() const
 {
   return !published_oob_executors().empty();
 }
+
+ceph::osd::oob::Transfers* OSDService::oob_transfers() const
+{
+  return oob_published.load(std::memory_order_acquire) ? oob_xfer.get() :
+    nullptr;
+}
+
+bool OSDService::oob_runs_inline(const OSDOobExecutor* e) const
+{
+#ifdef WITH_CUOBJ
+  if (e == cuobj && !oob_cuobj_transfer_threads) {
+    return true;
+  }
+#endif
+  return false;
+}
+
+void OSDService::stop_oob_transfers()
+{
+  if (oob_xfer) {
+    oob_xfer->stop();
+  }
+}
 #endif
 
 void OSDService::fast_shutdown()
@@ -627,12 +671,22 @@ void OSDService::fast_shutdown()
     watch_timer.shutdown();
   }
 #ifdef HAVE_OSD_OOB_DELIVERY
+  // the op threads and the transfer threads are stopped by now
+  // (stop_oob_transfers()); what the executors left posted may still
+  // touch their staging. A cuObject write left posted retries for up to
+  // 2 s, and the part of a failed submission behind it as long again
+  const auto quiet_by = ceph::mono_clock::now() + std::chrono::seconds(5);
+  for (auto* e : oob_executors) {
+    e->quiesce(quiet_by);
+  }
   oob_published = false;
+  oob_xfer.reset();
   oob_executors.clear();
   oob_lender = nullptr;
 #endif
 #ifdef WITH_CUOBJ
-  // op threads are stopped by now, so no RDMA writes are in flight
+  // no transfer runs any more; a write that quiesce() gave up on cannot
+  // reach the arena once the executor deregistered it
   delete cuobj;
   cuobj = nullptr;
 #endif
@@ -2989,6 +3043,14 @@ void OSD::asok_command(
     }
     f->close_section();
 #endif
+#ifdef HAVE_OSD_OOB_DELIVERY
+  } else if (prefix == "dump_oob_transfers") {
+    f->open_object_section("oob_transfers");
+    if (auto* xfer = service.oob_transfers()) {
+      xfer->dump(f);
+    }
+    f->close_section();
+#endif
   } else if (prefix == "flush_journal") {
     store->flush_journal();
   } else if (prefix == "dump_ops_in_flight" ||
@@ -4214,10 +4276,19 @@ int OSD::init()
 	      << dendl;
       [[maybe_unused]] const bool cuobj_lends = oob.cluster_cuobj();
       const bool ofi_lends = oob.cluster_ofi();
+      // cuObject gives each thread that runs its transfers a DC
+      // initiator: the op threads, and the transfer threads when it runs
+      // on them
+      const unsigned oob_threads =
+	cct->_conf.get_val<uint64_t>("osd_oob_transfer_threads");
+      service.oob_cuobj_transfer_threads = oob_threads > 0 &&
+	cct->_conf.get_val<bool>("osd_oob_cuobj_transfer_threads");
       if (oob.cuobj()) {
 #ifdef WITH_CUOBJ
+	const int num_dcis = get_num_op_threads() +
+	  (service.oob_cuobj_transfer_threads ? oob_threads : 0);
 	auto cuobj = std::make_unique<OSDCuObj>(cct, loc.addr, cuobj_lends,
-						get_num_op_threads(), arena);
+						num_dcis, arena);
 	if (cuobj->is_available()) {
 	  service.cuobj = cuobj.release();
 	  service.add_oob_executor(service.cuobj, cuobj_lends);
@@ -4253,6 +4324,41 @@ int OSD::init()
 	dout(1) << "no out-of-band transport started, freeing the "
 		<< "out-of-band memory" << dendl;
 	service.oob_arena.reset();
+      } else {
+	// a transfer ends by its pool's lease plus its drain from receipt,
+	// at most the caps, plus a late cut-off's tolerance: a thread's
+	// grace that does not cover that marks the OSD unhealthy while a
+	// long transfer runs, and one of 0 while the thread idles
+	const auto timeout = cct->_conf.get_val<std::chrono::seconds>(
+	  "osd_oob_transfer_thread_timeout");
+	const auto longest = ceph::make_timespan(
+	  pg_pool_t::MAX_RDMA_DELIVERY_LEASE +
+	  pg_pool_t::MAX_RDMA_DELIVERY_DRAIN) +
+	  std::chrono::duration_cast<ceph::timespan>(
+	    cct->_conf.get_val<std::chrono::milliseconds>(
+	      "osd_oob_cutoff_late_tolerance"));
+	auto grace = std::chrono::duration_cast<ceph::timespan>(timeout);
+	if (oob_threads > 0 && grace <= longest) {
+	  grace = longest + std::chrono::seconds(1);
+	  derr << "WARNING: osd_oob_transfer_thread_timeout of "
+	       << timeout.count() << "s does not cover the longest "
+	       << "out-of-band transfer, " << longest << "; using " << grace
+	       << dendl;
+	}
+	// the threads that run the transfers instead of the op threads;
+	// the op threads, which already run, find them once the executors
+	// are published
+	service.oob_xfer = std::make_unique<ceph::osd::oob::Transfers>(
+	  cct, oob_threads,
+	  cct->_conf.get_val<uint64_t>("osd_oob_transfer_queue_max"),
+	  cct->_conf.get_val<Option::size_t>("osd_oob_transfer_queue_bytes"),
+	  grace,
+	  [this] {
+	    for (auto* e : service.published_oob_executors()) {
+	      e->idle();
+	    }
+	  });
+	service.oob_xfer->start();
       }
     }
     service.publish_oob_executors();
@@ -4320,6 +4426,14 @@ void OSD::final_init()
   if (service.ofi) {
     r = admin_socket->register_command(
       "ofi status", asok_hook, "libfabric out-of-band delivery statistics");
+    ceph_assert(r == 0);
+  }
+#endif
+#ifdef HAVE_OSD_OOB_DELIVERY
+  if (service.oob_xfer) {
+    r = admin_socket->register_command(
+      "dump_oob_transfers", asok_hook,
+      "show the out-of-band transfers queued and running");
     ceph_assert(r == 0);
   }
 #endif
@@ -4902,6 +5016,9 @@ int OSD::shutdown()
     // then, wait on osd_op_tp to drain (TBD: should probably add a timeout)
     osd_op_tp.drain();
     osd_op_tp.stop();
+#ifdef HAVE_OSD_OOB_DELIVERY
+    service.stop_oob_transfers();
+#endif
 
     dout(10) << "stopping agent" << dendl;
     service.agent_stop();
@@ -4974,6 +5091,12 @@ int OSD::shutdown()
   osd_op_tp.drain();
   osd_op_tp.stop();
   dout(10) << "op sharded tp stopped" << dendl;
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // the transfers the op threads handed off end too; their replies
+  // still go out
+  service.stop_oob_transfers();
+  dout(10) << "oob transfer threads stopped" << dendl;
+#endif
 
   dout(10) << "stopping agent" << dendl;
   service.agent_stop();

@@ -12,6 +12,7 @@
 #include <string>
 #include <sys/types.h>
 
+#include "common/ceph_time.h"
 #include "include/buffer.h"
 #include "osd/oob_placement.h"
 
@@ -98,6 +99,16 @@ public:
     }
     return -EOPNOTSUPP;
   }
+
+  /// a transfer thread with nothing to run: reclaim what timed-out plans
+  /// left on resources this thread owns (cuObject: its channel)
+  virtual void idle() {}
+
+  /// refuse later transfers, and return once nothing the executor posted
+  /// can still touch its staging or the arena, or `until` passed;
+  /// called before the executor is deleted, once no thread runs its
+  /// transfers or takes its windows any more
+  virtual void quiesce(ceph::mono_clock::time_point until) {}
 
   /// asok/debug counters
   virtual void dump_stats(ceph::Formatter* f) const = 0;

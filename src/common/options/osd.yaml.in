@@ -1729,3 +1729,119 @@ options:
   - osd
   flags:
   - runtime
+- name: osd_oob_transfer_threads
+  type: uint
+  level: advanced
+  desc: Threads that run an OSD's out-of-band transfers, so that its op
+    threads do not wait on the fabric
+  long_desc: With 0, each out-of-band transfer (a read pushed into a
+    client's memory, a shard read pushed into a gather window, the payload
+    of a write pulled out of a client's memory) runs on the op thread that
+    served the request, while that thread holds the PG lock. With more,
+    the op thread hands the transfer to one of these threads and goes on
+    with other requests. The reply still leaves only once the transfer
+    completed or was cut off. cuObject transfers stay on the op threads
+    unless osd_oob_cuobj_transfer_threads is set.
+  default: 0
+  services:
+  - osd
+  see_also:
+  - osd_oob_transfer_queue_max
+  - osd_oob_transfer_queue_bytes
+  - osd_oob_transfer_thread_timeout
+  - osd_oob_cuobj_transfer_threads
+  flags:
+  - startup
+- name: osd_oob_transfer_queue_max
+  type: uint
+  level: advanced
+  desc: Out-of-band transfers that may wait for or run on the transfer
+    threads
+  long_desc: Past this many, a transfer is refused, and the request is
+    served without it, as when a transfer fails before it starts. A read
+    or a shard read is then delivered inline, and the client resends a
+    write whose payload was to be pulled with the payload inline. A
+    queued transfer that cannot start before its pool's delivery lease
+    runs out is served the same way. Used only when
+    osd_oob_transfer_threads is above 0.
+  default: 64
+  services:
+  - osd
+  see_also:
+  - osd_oob_transfer_threads
+  - osd_oob_transfer_queue_bytes
+  flags:
+  - startup
+- name: osd_oob_transfer_queue_bytes
+  type: size
+  level: advanced
+  desc: Payload bytes that the out-of-band transfers waiting for or running
+    on the transfer threads may hold
+  long_desc: A transfer that would pass this is refused, as past
+    osd_oob_transfer_queue_max. Used only when osd_oob_transfer_threads is
+    above 0.
+  default: 512_M
+  services:
+  - osd
+  see_also:
+  - osd_oob_transfer_threads
+  - osd_oob_transfer_queue_max
+  flags:
+  - startup
+- name: osd_oob_transfer_thread_timeout
+  type: secs
+  level: advanced
+  desc: Heartbeat grace of an out-of-band transfer thread
+  long_desc: A transfer thread that runs one transfer for longer than this
+    marks the OSD unhealthy. It is never killed. A transfer ends within its
+    pool's rdma_delivery_lease plus rdma_delivery_drain from receipt of the
+    request, 10 seconds at most, plus osd_oob_cutoff_late_tolerance for a
+    late cut-off. A value that does not cover that is raised to one second
+    past it, with a warning.
+  default: 30
+  services:
+  - osd
+  see_also:
+  - osd_oob_transfer_threads
+  - osd_oob_cutoff_late_tolerance
+  flags:
+  - startup
+- name: osd_oob_cuobj_transfer_threads
+  type: bool
+  level: advanced
+  desc: Run cuObject transfers on the out-of-band transfer threads
+  long_desc: cuObject gives each thread that runs transfers a DC initiator
+    of its own. When false, cuObject transfers stay on the op threads,
+    and the executor takes an initiator for each op thread. When true and
+    osd_oob_transfer_threads is above 0, they run on the transfer threads,
+    and the executor takes an initiator for each op thread and each
+    transfer thread.
+  default: false
+  services:
+  - osd
+  see_also:
+  - osd_oob_transfer_threads
+  flags:
+  - startup
+- name: osd_debug_oob_delay_post_ms
+  type: millisecs
+  level: dev
+  desc: Sleep this long before an out-of-band transfer starts
+  long_desc: The time counts against the pool's delivery lease, so a long
+    delay makes transfers expire and their requests go inline. For tests.
+  default: 0
+  services:
+  - osd
+  flags:
+  - runtime
+- name: osd_debug_oob_delay_done_ms
+  type: millisecs
+  level: dev
+  desc: Sleep this long after an out-of-band transfer, before its reply
+    leaves
+  long_desc: For tests.
+  default: 0
+  services:
+  - osd
+  flags:
+  - runtime

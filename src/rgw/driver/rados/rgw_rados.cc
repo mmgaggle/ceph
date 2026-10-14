@@ -8851,29 +8851,16 @@ int RGWRados::get_obj_iterate_cb(const DoutPrefixProvider *dpp,
 
   ldpp_dout(dpp, 20) << "rados->get_obj_iterate_cb oid=" << read_obj.oid << " obj-ofs=" << obj_ofs << " read_ofs=" << read_ofs << " len=" << len << dendl;
   if (d->rdma) {
-    // the lease and drain the OSD enforces on this stripe are pool
-    // options; learn them before the op is sent so the fallback fence
-    // can cover them even if this op never comes back with a reply we
-    // can attribute
-    const int64_t pool_id = obj.ioctx.get_id();
-    auto fence = d->rdma_fence_by_pool.find(pool_id);
-    if (fence == d->rdma_fence_by_pool.end()) {
-      double lease = 0, drain = 0;
-      r = obj.ioctx.pool_rdma_delivery_lease(&lease);
-      if (r >= 0) {
-        r = obj.ioctx.pool_rdma_delivery_drain(&drain);
-      }
-      if (r < 0) {
-        // without the bounds the fence cannot be sized; nothing has
-        // been sent to this pool yet, so make the caller fall back
-        ldpp_dout(dpp, 4) << "rdma passthrough: cannot read the delivery "
-                          << "lease and drain of pool " << pool_id << ": "
-                          << cpp_strerror(-r) << ", falling back" << dendl;
-        return -EOPNOTSUPP;
-      }
-      fence = d->rdma_fence_by_pool.emplace(pool_id, lease + drain).first;
-    }
-    d->rdma_fence = std::max(d->rdma_fence, fence->second);
+    // the fence the caller waits before the window is written again
+    // must cover the lease and drain of whichever OSD serves this
+    // stripe, even if this op never comes back with a reply we can
+    // attribute. Those are options of that OSD's pool as its map has
+    // them: the Objecter sends reads to the pool's read tier when it has
+    // one, and an OSD on a newer map than ours may hold larger values.
+    // No OSD enforces more than the caps, whatever its pool and map, so
+    // wait those out
+    d->rdma_fence = pg_pool_t::MAX_RDMA_DELIVERY_LEASE +
+                    pg_pool_t::MAX_RDMA_DELIVERY_DRAIN;
     // a plain read carrying an advisory delivery descriptor: an OSD
     // that can push RDMA-writes the stripe into the client window at
     // the stripe's logical offset within the requested range and

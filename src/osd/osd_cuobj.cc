@@ -13,7 +13,7 @@
 #include <thread>
 
 #include "common/ceph_context.h"
-#include "common/Clock.h"
+#include "common/ceph_time.h"
 #include "common/config.h"
 #include "common/oob_arena.h"
 #include "common/oob_config.h"
@@ -27,10 +27,29 @@
 #define dout_prefix *_dout << "osd_cuobj "
 
 namespace {
-/// how long a posted cuObject write can keep retrying after the OSD
-/// stops waiting for it: the RC/DC retry budget at the library's
-/// defaults
-constexpr std::chrono::milliseconds CUOBJ_RETRY_BUDGET{2000};
+/// the DC initiators' transport ACK timeout, as the IB exponent: a write
+/// not acknowledged within 4.096 us * 2^14, about 67 ms, is sent again
+constexpr uint8_t CUOBJ_ACK_TIMEOUT = 14;
+/// how often a write not acknowledged is sent again before its QP fails:
+/// the most IB allows
+constexpr uint8_t CUOBJ_RETRY_COUNT = 7;
+static_assert(CUOBJ_ACK_TIMEOUT > 0 && CUOBJ_ACK_TIMEOUT < 32 &&
+	      CUOBJ_RETRY_COUNT <= 7);
+
+/// how long a posted cuObject write can go on retrying after the path
+/// last acknowledged a packet of it: the first send and each retry wait
+/// out the ACK timeout, which IB lets a NIC run at up to four times its
+/// nominal value. do_init() sets both, rather than leave them to the
+/// library's defaults (16 and 7, 8.6 s by this rule). A plan stops
+/// posting and waiting this long before its budget runs out, which
+/// bounds a write that is not acknowledged after that. One still moving
+/// then restarts the count with each acknowledged packet, and cuObject
+/// cannot cancel it: it can land past the budget by as long as it goes
+/// on moving.
+constexpr auto CUOBJ_RETRY_BUDGET =
+  std::chrono::ceil<std::chrono::milliseconds>(
+    std::chrono::nanoseconds(4096ull << CUOBJ_ACK_TIMEOUT) * 4 *
+    (CUOBJ_RETRY_COUNT + 1));
 
 /// writes posted at once, and events taken per poll() (the library
 /// caps poll() at 16 events and documents no larger per-channel bound)
@@ -90,10 +109,14 @@ int OSDCuObj::do_init(const std::string& rdma_ip, bool lend_windows,
   cuObjRDMATunable params;
   params.setNumDcis(num_dcis);
   params.setDcKey(dc_key);
+  // the retry budget that the plans' deadlines count on
+  params.setTimeout(CUOBJ_ACK_TIMEOUT);
+  params.setRetryCount(CUOBJ_RETRY_COUNT);
 
   dout(1) << "initializing cuObjServer on " << rdma_ip << ":" << rdma_port
-	  << " dcis=" << num_dcis << ", staging in " << m_arena->size()
-	  << " bytes" << dendl;
+	  << " dcis=" << num_dcis << ", DC retry budget "
+	  << CUOBJ_RETRY_BUDGET.count() << " ms, staging in "
+	  << m_arena->size() << " bytes" << dendl;
 
   try {
     m_server = std::make_unique<cuObjServer>(
@@ -501,11 +524,11 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
     return 0;
   }
   // cuObject cannot cancel a write it posted: one still in flight when
-  // the OSD stops waiting keeps retrying for the DC transport's retry
-  // budget. Stop waiting that much before the caller's budget runs out,
-  // and do not start at all when the budget does not cover it - decided
-  // before anything is staged, so that a plan refused here holds no
-  // buffer and is not counted as started.
+  // the OSD stops waiting can retry for the DC retry budget after its
+  // last acknowledged packet (CUOBJ_RETRY_BUDGET). Stop waiting that much
+  // before the caller's budget runs out, and do not start at all when the
+  // budget does not cover it - decided before anything is staged, so that
+  // a plan refused here holds no buffer and is not counted as started.
   if (budget <= CUOBJ_RETRY_BUDGET) {
     dout(10) << "budget of " << budget.count() << " ms for " << key
 	     << " does not cover the DC retry budget; nothing staged" << dendl;
@@ -513,9 +536,10 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
     return -ETIMEDOUT;
   }
   // counted from here, not from after staging: taking a channel, copying
-  // the data and registering a one-time buffer come out of the budget too
-  utime_t deadline = ceph_clock_now();
-  deadline += std::chrono::duration<double>(budget - CUOBJ_RETRY_BUDGET).count();
+  // the data and registering a one-time buffer come out of the budget too.
+  // On the monotonic clock: a step of the wall clock must not move it.
+  const auto deadline =
+    ceph::mono_clock::now() + (budget - CUOBJ_RETRY_BUDGET);
   uint16_t channel = get_channel_id();
   if (channel == invalid_channel) {
     return -EIO;
@@ -587,7 +611,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
   while (completed < items.size()) {
     while (err == 0 && next < items.size() && outstanding < POLL_BATCH) {
       // a write posted past the deadline could retry past the budget
-      if (ceph_clock_now() > deadline) {
+      if (ceph::mono_clock::now() > deadline) {
 	dout(5) << "plan for " << key << " reached its deadline with "
 		<< items.size() - next << " writes not posted" << dendl;
 	err = -ETIMEDOUT;
@@ -631,7 +655,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
     if (n == 0) {
       // nothing completed yet; don't hot-spin the op worker
       std::this_thread::sleep_for(std::chrono::microseconds(5));
-      if (ceph_clock_now() > deadline) {
+      if (ceph::mono_clock::now() > deadline) {
 	derr << "ERROR: plan " << first << " for " << key << " timed out with "
 	     << outstanding << " writes outstanding; keeping the staging "
 	     << "buffer until they complete" << dendl;
@@ -713,7 +737,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	err = err ? err : -EIO;
       }
     }
-    if (outstanding > 0 && ceph_clock_now() > deadline) {
+    if (outstanding > 0 && ceph::mono_clock::now() > deadline) {
       // wedged transport: we cannot release the staged buffer while
       // writes may still reference it - keep it until a later read on
       // this thread finds them completed. With none outstanding

@@ -4567,6 +4567,7 @@ options:
   desc: Send queue depth of each session's queue pair; bounds how many stripe
     writes a GET relay may have in flight toward the client
   default: 64
+  min: 1
   services:
   - rgw
   flags:

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <map>
 #include <sstream>
 
@@ -23,6 +24,8 @@
 #include "common/crc64nvme.h"
 #include "common/dout.h"
 #include "common/errno.h"
+#include "include/scope_guard.h"
+#include "osd/osd_types.h"
 #include "rgw_auth.h"
 #include "rgw_cksum.h"
 #include "rgw_common.h"
@@ -487,6 +490,26 @@ void GetOp::execute_ready(optional_yield y)
     return;
   }
   sess = claimed;
+  // the session ends in finish() also when the data phase throws, or the
+  // reaper never takes it; what the OSDs may still write into the buffer
+  // is not known then. A throw out of the read itself leaves no fence
+  // recorded although relayed reads may have gone out: hold the buffer
+  // for the fence RGW sizes those reads by, the caps of every pool's
+  // lease and drain
+  auto unclaim = make_scope_guard([this, svc] {
+    if (sess) {
+      std::chrono::milliseconds hold{rdma_window_hold_ms(false)};
+      if (!rdma_fence_state.sent &&
+          (rdma_mode == RdmaMode::RELAY ||
+           rdma_switched_from == RdmaMode::RELAY)) {
+        hold = std::chrono::milliseconds{static_cast<uint64_t>(std::ceil(
+          (pg_pool_t::MAX_RDMA_DELIVERY_LEASE +
+           pg_pool_t::MAX_RDMA_DELIVERY_DRAIN) * 1000.0))};
+      }
+      svc->finish(sess, Outcome::BACKEND_FAIL, 0, hold);
+      sess = nullptr;
+    }
+  });
   if (sess->client_mr_rkey == 0 && sess->client_mr_addr == 0) {
     svc->finish(sess, Outcome::VERIFY_FAIL, 0);
     sess = nullptr;
@@ -695,6 +718,14 @@ void PutOp::execute(optional_yield y)
     return;
   }
   sess = claimed;
+  // the session ends in finish() also when the store throws (a streaming
+  // signature whose HMAC fails does), or the reaper never takes it
+  auto unclaim = make_scope_guard([this, svc] {
+    if (sess) {
+      svc->finish(sess, Outcome::BACKEND_FAIL, 0);
+      sess = nullptr;
+    }
+  });
 
   // the receive was armed at PREPARE; the client writes once the pair
   // is up and signals the session cookie in the immediate. The queue

@@ -11,9 +11,13 @@
 
 #include <gtest/gtest.h>
 
+#include "acconfig.h"
 #include "common/ceph_context.h"
 #include "common/dout.h"
 #include "rgw/rgw_common.h"
+#ifdef WITH_RDMA_RC
+#include "rgw/rgw_rdma_rc_session.h"
+#endif
 
 using namespace rgw::rdma::rc;
 
@@ -389,3 +393,52 @@ TEST(RdmaRcWire, PlanPushesFinal)
   // a hole means the transfer is incomplete
   EXPECT_FALSE(plan_pushes(599, 0, 600, true, p));
 }
+
+#ifdef WITH_RDMA_RC
+TEST(RdmaRcLimits, CountsSessionsBeingPrepared)
+{
+  // prepare() takes a place, then builds the session outside the service
+  // lock before the session table holds it: the limit counts the places
+  // taken, so PREPAREs from other users in that window cannot pass it
+  Limits l(4, 2);
+  EXPECT_TRUE(l.take("a"));
+  EXPECT_TRUE(l.take("b"));
+  EXPECT_TRUE(l.take("c"));
+  EXPECT_TRUE(l.take("d"));
+  EXPECT_EQ(4u, l.sessions());
+  EXPECT_FALSE(l.take("e"));
+  EXPECT_FALSE(l.take("f"));
+  EXPECT_EQ(4u, l.sessions());
+  l.release("b");
+  EXPECT_EQ(3u, l.sessions());
+  EXPECT_TRUE(l.take("e"));
+  EXPECT_FALSE(l.take("f"));
+}
+
+TEST(RdmaRcLimits, PerUser)
+{
+  Limits l(8, 2);
+  EXPECT_TRUE(l.take("a"));
+  EXPECT_TRUE(l.take("a"));
+  EXPECT_FALSE(l.take("a"));
+  EXPECT_TRUE(l.take("b"));
+  EXPECT_EQ(3u, l.sessions());
+  l.release("a");
+  EXPECT_TRUE(l.take("a"));
+  EXPECT_EQ(3u, l.sessions());
+  // a principal that holds nothing releases nothing
+  l.release("z");
+  EXPECT_EQ(3u, l.sessions());
+}
+
+TEST(RdmaRcLimits, ZeroAdmitsNone)
+{
+  Limits none(0, 4);
+  EXPECT_FALSE(none.take("a"));
+  EXPECT_EQ(0u, none.sessions());
+  Limits no_user(4, 0);
+  EXPECT_FALSE(no_user.take("a"));
+  no_user.release("a");
+  EXPECT_EQ(0u, no_user.sessions());
+}
+#endif

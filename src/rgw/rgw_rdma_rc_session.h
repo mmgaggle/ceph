@@ -182,12 +182,58 @@ struct SessionInfo {
   uint64_t offset = 0;
 };
 
+/// the session limits. A session counts from the PREPARE that takes it
+/// until its reap, also while prepare() builds it outside the service
+/// lock, so that concurrent PREPAREs cannot all pass the limit. Takes no
+/// lock; the service calls in under its own
+class Limits {
+ public:
+  Limits() = default;
+  Limits(uint32_t max, uint32_t max_per_user)
+    : max_sessions(max), max_user_sessions(max_per_user) {}
+
+  /// count a session of principal; false when the gateway or the
+  /// principal is at its limit
+  bool take(const std::string& principal) {
+    if (total >= max_sessions) {
+      return false;
+    }
+    auto& n = per_user[principal];
+    if (n >= max_user_sessions) {
+      if (n == 0) per_user.erase(principal);
+      return false;
+    }
+    ++n;
+    ++total;
+    return true;
+  }
+  /// a session that take() counted ended
+  void release(const std::string& principal) {
+    auto it = per_user.find(principal);
+    if (it == per_user.end()) {
+      return;
+    }
+    --total;
+    if (--it->second == 0) {
+      per_user.erase(it);
+    }
+  }
+  uint32_t sessions() const { return total; }
+
+ private:
+  uint32_t max_sessions = 0;
+  uint32_t max_user_sessions = 0;
+  uint32_t total = 0;
+  std::map<std::string, uint32_t> per_user;
+};
+
 class Service {
  public:
   /// arena: the gateway's out-of-band memory, which the session buffers
   /// come from; it must outlive the service
   static int init(CephContext* cct, ceph::oob::Arena* arena);
   static void shutdown();
+  /// null until init() succeeded
   static Service* get();
 
   ~Service();
@@ -259,8 +305,6 @@ class Service {
   /// whether closing a libfabric window revokes its key
   bool ofi_close_revokes_key();
 #endif
-  bool limits_take(const std::string& principal);
-  void limits_release(const std::string& principal);
   std::string new_session_id();
 
   /// tear down and erase; caller holds the lock
@@ -282,15 +326,13 @@ class Service {
   ceph::oob::Arena* arena = nullptr;
   size_t buf_size = 0;
 
-  uint32_t max_sessions = 0;
-  uint32_t max_user_sessions = 0;
   uint32_t send_depth = 0;
   std::chrono::milliseconds t_prep{};
   std::chrono::milliseconds t_exec{};
 
   mutable std::mutex mtx;
   std::map<std::string, std::unique_ptr<Session>> sessions;
-  std::map<std::string, uint32_t> per_user;
+  Limits limits;
   /// buffers of ended sessions that an OSD write may still land in; the
   /// reaper gives each back to the arena once its held_until passes
   std::vector<std::unique_ptr<Buffer>> held;
@@ -300,7 +342,8 @@ class Service {
   std::condition_variable reaper_cv;
   bool reaper_stop = false;
 
-  static std::unique_ptr<Service> instance;
+  /// set once do_init() succeeded: the frontends take requests already
+  static std::atomic<Service*> instance;
 };
 
 const char* to_string(Error e);

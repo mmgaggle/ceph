@@ -39,7 +39,7 @@
 
 namespace rgw::rdma::rc {
 
-std::unique_ptr<Service> Service::instance;
+std::atomic<Service*> Service::instance{nullptr};
 
 namespace {
 
@@ -86,26 +86,28 @@ const char* to_string(Outcome o)
 
 int Service::init(CephContext* cct, ceph::oob::Arena* arena)
 {
-  if (instance) {
+  if (instance.load()) {
     return 0;
   }
-  instance.reset(new Service());
-  instance->arena = arena;
-  int r = instance->do_init(cct);
-  if (r < 0) {
-    instance.reset();
+  // the frontends take requests already: request threads see the service
+  // only once it is complete, and never one whose setup failed
+  std::unique_ptr<Service> svc{new Service()};
+  svc->arena = arena;
+  if (int r = svc->do_init(cct); r < 0) {
+    return r;
   }
-  return r;
+  instance.store(svc.release(), std::memory_order_release);
+  return 0;
 }
 
 void Service::shutdown()
 {
-  instance.reset();
+  delete instance.exchange(nullptr);
 }
 
 Service* Service::get()
 {
-  return instance.get();
+  return instance.load(std::memory_order_acquire);
 }
 
 Service::~Service()
@@ -118,6 +120,20 @@ int Service::do_init(CephContext* c)
   ceph_assert(arena);
   cct = c;
   const auto& conf = cct->_conf;
+
+  // a session takes a buffer of the arena at its size, at most this
+  buf_size = ceph::oob::Arena::MAX;
+  limits = Limits(conf.get_val<uint64_t>("rgw_rdma_rc_max_sessions"),
+                  conf.get_val<uint64_t>("rgw_rdma_rc_max_sessions_per_user"));
+  send_depth = conf.get_val<uint64_t>("rgw_rdma_rc_send_depth");
+  t_prep = std::chrono::milliseconds(conf.get_val<uint64_t>("rgw_rdma_rc_prepare_timeout_ms"));
+  t_exec = std::chrono::milliseconds(conf.get_val<uint64_t>("rgw_rdma_rc_exec_timeout_ms"));
+  if (send_depth == 0) {
+    lderr(cct) << "rgw_rdma_rc: rgw_rdma_rc_send_depth must be nonzero"
+               << dendl;
+    return -EINVAL;
+  }
+  static_assert(ceph::oob::Arena::MAX <= MAX_TRANSFER_SIZE);
 
   // the device, port and GID that carry the gateway's out-of-band
   // address; without one, the first device
@@ -145,19 +161,6 @@ int Service::do_init(CephContext* c)
   }
 
   const auto oob = ceph::oob::read_transports(cct);
-  // a session takes a buffer of the arena at its size, at most this
-  buf_size = ceph::oob::Arena::MAX;
-  max_sessions = conf.get_val<uint64_t>("rgw_rdma_rc_max_sessions");
-  max_user_sessions = conf.get_val<uint64_t>("rgw_rdma_rc_max_sessions_per_user");
-  send_depth = conf.get_val<uint64_t>("rgw_rdma_rc_send_depth");
-  t_prep = std::chrono::milliseconds(conf.get_val<uint64_t>("rgw_rdma_rc_prepare_timeout_ms"));
-  t_exec = std::chrono::milliseconds(conf.get_val<uint64_t>("rgw_rdma_rc_exec_timeout_ms"));
-  if (send_depth == 0) {
-    lderr(cct) << "rgw_rdma_rc: rgw_rdma_rc_send_depth must be nonzero"
-               << dendl;
-    return -EINVAL;
-  }
-  static_assert(ceph::oob::Arena::MAX <= MAX_TRANSFER_SIZE);
 
   // expose the session buffers to the OSDs over the cluster transport;
   // without one, stripes are staged through the gateway
@@ -431,33 +434,6 @@ bool Service::ofi_close_revokes_key()
 }
 #endif
 
-bool Service::limits_take(const std::string& principal)
-{
-  // caller holds mtx
-  if (sessions.size() >= max_sessions) {
-    return false;
-  }
-  auto& n = per_user[principal];
-  if (n >= max_user_sessions) {
-    if (n == 0) per_user.erase(principal);
-    return false;
-  }
-  ++n;
-  return true;
-}
-
-void Service::limits_release(const std::string& principal)
-{
-  // caller holds mtx
-  auto it = per_user.find(principal);
-  if (it == per_user.end()) {
-    return;
-  }
-  if (--it->second == 0) {
-    per_user.erase(it);
-  }
-}
-
 std::string Service::new_session_id()
 {
   std::random_device rd;
@@ -506,14 +482,14 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
 
   {
     std::lock_guard l(mtx);
-    if (!limits_take(req.principal)) {
+    if (!limits.take(req.principal)) {
       return Error::LIMIT;
     }
   }
   s->buf = make_buffer(s->op, req.size);
   if (!s->buf) {
     std::lock_guard l(mtx);
-    limits_release(req.principal);
+    limits.release(req.principal);
     // for the 503: a buffer an OSD write may still land in stays out of
     // the arena until its quarantine passes
     ldout(cct, 4) << "rgw_rdma_rc: no buffer of " << req.size << " bytes: "
@@ -528,7 +504,7 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
     s->conn.destroy();
     free_buffer(*s->buf);
     std::lock_guard l(mtx);
-    limits_release(req.principal);
+    limits.release(req.principal);
   };
 
   // the queue pair is created per session and left in INIT until READY
@@ -768,7 +744,7 @@ void Service::reap_locked(std::unique_lock<std::mutex>& lock,
   }
   std::unique_ptr<Session> s = std::move(it->second);
   sessions.erase(it);
-  limits_release(s->principal);
+  limits.release(s->principal);
   ldout(cct, 20) << "rgw_rdma_rc: reaping session " << s->id << " ("
                  << to_string(s->last_outcome) << ", quarantine "
                  << s->quarantine.count() << "ms)" << dendl;

@@ -26,7 +26,8 @@ struct location_t {
   std::string source;
   /// the network interface that carries addr, or empty
   std::string iface;
-  /// the RDMA device whose RoCE GID holds addr, or empty
+  /// the RDMA device whose RoCE GID holds addr, or under iface
+  /// (InfiniBand), or empty
   std::string rdma_device;
   unsigned rdma_port = 0;
   /// that GID's index, or -1
@@ -55,6 +56,16 @@ int resolve(CephContext* cct, std::string_view fallback, location_t* out,
  */
 bool find_rdma_gid(const std::string& sysfs, const std::string& addr,
 		   std::string* device, unsigned* port, int* gid_index);
+
+/**
+ * The RDMA device and port under a network interface, from sysfs, for an
+ * address that no GID holds, such as an IPoIB address: the interface's
+ * own device, at its dev_port plus one, or for an InfiniBand bond its
+ * active slave's, else the first of its lower interfaces by name that
+ * has one. A bond of bonds is followed too. Returns false when none does.
+ */
+bool find_rdma_port(const std::string& sysfs, const std::string& iface,
+		    std::string* device, unsigned* port);
 
 /// whether a libfabric provider runs over verbs, and so needs an RDMA
 /// device

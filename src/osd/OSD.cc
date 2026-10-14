@@ -311,6 +311,9 @@ OSDService::OSDService(OSD *osd, ceph::async::io_context_pool& poolctx) :
   boot_epoch(0), up_epoch(0), bind_epoch(0)
 {
   objecter->init();
+#ifdef HAVE_OSD_OOB_DELIVERY
+  oob_pulls_out = std::make_unique<ceph::osd::oob::pulls_out>();
+#endif
 
   for (int i = 0; i < m_objecter_finishers; i++) {
     ostringstream str;
@@ -661,6 +664,31 @@ void OSDService::stop_oob_transfers()
   if (oob_xfer) {
     oob_xfer->stop();
   }
+}
+
+void OSDService::queue_oob_pull_kick(spg_t pgid, epoch_t epoch,
+				     OpRequestRef op, const hobject_t& head)
+{
+  if (is_stopping()) {
+    // the PGs dropped their holds, or are about to (on_shutdown())
+    return;
+  }
+  // the request may run again meanwhile, on an op thread that changes
+  // its ops: only what it never changes
+  const auto m = op->get_req();
+  dout(20) << __func__ << " " << pgid << " " << op->get_reqid() << " "
+	   << head << dendl;
+  // the immediate class, ahead of the client ops of the PG: the ops in
+  // the hold wait for nothing else
+  enqueue_back(
+    OpSchedulerItem(
+      unique_ptr<OpSchedulerItem::OpQueueable>(
+	new PGOobPullKick(pgid, op, head)),
+      m->get_cost(),
+      CEPH_MSG_PRIO_HIGH,
+      ceph_clock_now(),
+      m->get_source().num(),
+      epoch));
 }
 #endif
 

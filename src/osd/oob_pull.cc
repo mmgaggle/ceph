@@ -118,6 +118,29 @@ bool pull_set::consumed() const
   return state == state_t::consumed;
 }
 
+bool pull_set::park(const kick_target& t)
+{
+  std::lock_guard l(lock);
+  if (state != state_t::in_flight) {
+    return false;
+  }
+  target = t;
+  return true;
+}
+
+void pull_set::abandon()
+{
+  std::lock_guard l(lock);
+  dropped = true;
+  target.reset();
+}
+
+bool pull_set::abandoned() const
+{
+  std::lock_guard l(lock);
+  return dropped;
+}
+
 void pull_set::clear_declined(
   std::vector<ceph::rdma::oob_result_t>& oob) const
 {
@@ -141,12 +164,14 @@ void pull_set::clear_declined(
   }
 }
 
-void pull_set::settle(std::vector<pull_result>&& r)
+std::optional<kick_target> pull_set::settle(std::vector<pull_result>&& r)
 {
   std::lock_guard l(lock);
   ceph_assert(state == state_t::in_flight);
   results = std::move(r);
   state = state_t::settled;
+  // a run that parks from now on finds the set settled, and goes on
+  return std::exchange(target, std::nullopt);
 }
 
 int pull_set::consume(std::vector<OSDOp>& ops,
@@ -169,12 +194,44 @@ int pull_set::consume(std::vector<OSDOp>& ops,
   return 0;
 }
 
+void pulls_out::add(const osd_reqid_t& reqid, std::shared_ptr<pull_set> set)
+{
+  std::lock_guard l(lock);
+  sets.emplace(reqid, std::move(set));
+}
+
+void pulls_out::remove(const osd_reqid_t& reqid, const pull_set* set)
+{
+  std::lock_guard l(lock);
+  auto [b, e] = sets.equal_range(reqid);
+  for (auto i = b; i != e; ++i) {
+    if (i->second.get() == set) {
+      sets.erase(i);
+      return;
+    }
+  }
+}
+
+std::shared_ptr<pull_set> pulls_out::find(const osd_reqid_t& reqid) const
+{
+  std::lock_guard l(lock);
+  auto i = sets.find(reqid);
+  return i == sets.end() ? nullptr : i->second;
+}
+
+size_t pulls_out::size() const
+{
+  std::lock_guard l(lock);
+  return sets.size();
+}
+
 pull_job::pull_job(CephContext* cct, std::shared_ptr<pull_set> set,
 		   std::string key, std::vector<pull_op> pulls,
-		   bounds_t bounds, bool here)
+		   bounds_t bounds, bool here, kick_fn kick, pulls_out* out,
+		   osd_reqid_t reqid)
   : cct(cct), set(std::move(set)), key(std::move(key)),
     ops(std::move(pulls)), bounds(bounds), here(here),
-    bytes(total_len(ops))
+    kick(std::move(kick)), out(out), reqid(reqid), bytes(total_len(ops))
 {
   ceph_assert(this->set);
 }
@@ -197,6 +254,15 @@ void pull_job::run()
     res.idx = p.idx;
     if (failed) {
       // all or nothing: the request fails, and no later pull starts
+      continue;
+    }
+    if (set->abandoned()) {
+      // the PG dropped the request, which no run will answer: the
+      // client sends it again, or gave it up
+      dout(10) << "op " << p.idx << " of " << key << ": the request was "
+	       << "dropped, not pulling " << p.len << " bytes" << dendl;
+      res.r = -ESHUTDOWN;
+      failed = true;
       continue;
     }
     if (ceph::mono_clock::now() >= bounds.post_by) {
@@ -280,7 +346,22 @@ void pull_job::settle(std::vector<pull_result>&& r)
   // a job runs or expires once
   ceph_assert(!settled);
   settled = true;
-  set->settle(std::move(r));
+  auto target = set->settle(std::move(r));
+  if (out) {
+    // nothing of them reads the window any more: a later attempt of the
+    // request may pull it again
+    out->remove(reqid, set.get());
+  }
+  if (!target) {
+    dout(10) << "pulls of " << key << " settled" << dendl;
+    return;
+  }
+  // the request waits for them, in a hold of its PG: run it again
+  dout(10) << "pulls of " << key << " settled, kicking " << target->pgid
+	   << dendl;
+  if (kick) {
+    kick(*target);
+  }
 }
 
 void pull_job::dump(ceph::Formatter* f) const
@@ -311,7 +392,8 @@ int pull_payloads(const pull_env& env, OpRequest& op,
     if (set->consumed()) {
       return 0;
     }
-    // a pull settles before its request runs on
+    // a pull settles before its request runs on: a run whose pulls are
+    // still out waits for them before it gets here
     ceph_assert(set->settled());
     return set->consume(ops, op.oob_pulled);
   }
@@ -347,20 +429,44 @@ int pull_payloads(const pull_env& env, OpRequest& op,
 	    << total << " pulled bytes" << dendl;
     return -EOPNOTSUPP;
   }
+  // One job runs the request's pulls, on a transfer thread when the
+  // service has them: then the request waits for it, and lets go of the
+  // object. It runs on this thread instead when the request may not
+  // wait (a coroutine runs it), and when an executor's transfers stay on
+  // the op threads; the request goes on with its payloads once it
+  // settled, as before there were transfer threads
+  bool here = env.here || !env.xfer || !env.xfer->async();
+  for (const auto& p : pulls) {
+    here = here || (env.runs_inline && env.runs_inline(p.exec));
+  }
   std::vector<size_t> pulled;
   for (const auto& p : pulls) {
     pulled.push_back(p.idx);
   }
   auto set = std::make_shared<pull_set>(std::move(pulled));
   op.oob_pull = set;
-  // the pulls run on this thread, whatever threads the service has, and
-  // the request goes on with its payloads once they settled
+  // While they run on a transfer thread, a later attempt of the request
+  // waits for them, whatever becomes of this one. Pulls that run here
+  // hold the PG until they settled, and none of its runs sees them out
+  pulls_out* out = here ? nullptr : env.out;
+  if (out) {
+    out->add(op.get_reqid(), set);
+  }
   std::unique_ptr<xfer_job> job = std::make_unique<pull_job>(
-    cct, set, key, std::move(pulls), bounds, true);
+    cct, set, key, std::move(pulls), bounds, here, env.kick, out,
+    op.get_reqid());
   if (const int r = env.xfer ? env.xfer->submit(job) : -ESHUTDOWN; r < 0) {
+    // no synchronous pull instead: the client sends the payloads inline
     dout(10) << "pulls of " << key << " refused (" << cpp_strerror(r)
 	     << ")" << dendl;
     job->expire(r);
+  }
+  // A job that settled already, on this thread or on a transfer thread
+  // before the park, is consumed here, and kicks nothing
+  if (!here && set->park(env.target)) {
+    dout(20) << "pulls of " << key << " handed off, the request waits in "
+	     << env.target.pgid << dendl;
+    return PULLS_PARKED;
   }
   ceph_assert(set->settled());
   return set->consume(ops, op.oob_pulled);

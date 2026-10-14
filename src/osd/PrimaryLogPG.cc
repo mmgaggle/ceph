@@ -1086,6 +1086,10 @@ void PrimaryLogPG::do_command(
       agent_state->dump(f.get());
     f->close_section();
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+    dump_oob_holds(f.get());
+#endif
+
     f->close_section();
   }
   else if (prefix == "log") {
@@ -1865,6 +1869,9 @@ void PrimaryLogPG::do_request(
   }
 
   if (can_discard_request(op)) {
+#ifdef HAVE_OSD_OOB_DELIVERY
+    abandon_oob_pull(op);
+#endif
     return;
   }
 
@@ -1873,11 +1880,18 @@ void PrimaryLogPG::do_request(
   int msg_type = m->get_type();
   if (m->get_connection()->has_feature(CEPH_FEATURE_RADOS_BACKOFF)) {
     auto session = ceph::ref_cast<Session>(m->get_connection()->get_priv());
-    if (!session)
+    if (!session) {
+#ifdef HAVE_OSD_OOB_DELIVERY
+      abandon_oob_pull(op);
+#endif
       return;  // drop it.
+    }
     if (msg_type == CEPH_MSG_OSD_OP) {
       if (session->check_backoff(cct, info.pgid,
 				 info.pgid.pgid.get_hobj_start(), m)) {
+#ifdef HAVE_OSD_OOB_DELIVERY
+	abandon_oob_pull(op);
+#endif
 	return;
       }
 
@@ -1892,6 +1906,9 @@ void PrimaryLogPG::do_request(
       }
       if (backoff) {
 	add_pg_backoff(session);
+#ifdef HAVE_OSD_OOB_DELIVERY
+	abandon_oob_pull(op);
+#endif
 	return;
       }
     }
@@ -2610,7 +2627,13 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op)
   if (m->has_rdma_delivery() && op->may_write()) {
     // a write whose payload is in client memory: take it now, holding
     // the object's lock, so that the request runs with its data
-    if (int r = pull_oob_payloads(ctx); r < 0) {
+    const int r = pull_oob_payloads(ctx);
+    if (r == ceph::osd::oob::PULLS_PARKED) {
+      // or wait for it, holding nothing of the object but its hold
+      park_for_oob_pull(ctx, head);
+      return;
+    }
+    if (r < 0) {
       reply_ctx(ctx, r);
       return;
     }
@@ -2653,6 +2676,16 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     op->reset_desc();
     m->clear_payload();
   }
+
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // Before anything else that can make the op wait or answer it: an op
+  // checked later could enter a list ahead of the pulled write it should
+  // follow, or answer a request whose pulls still read its window
+  // (maybe_wait_for_oob_pull())
+  if (maybe_wait_for_oob_pull(op)) {
+    return;
+  }
+#endif
 
   if (coro_op_in_flight) {
     dout(20) << __func__ << ": coroutine op in flight, queuing " << op << dendl;
@@ -9692,7 +9725,227 @@ int PrimaryLogPG::pull_oob_payloads(OpContext *ctx)
   env.max_write = cct->_conf->osd_max_write_size << 20;
   env.lease = pool.info.get_rdma_delivery_lease();
   env.drain = pool.info.get_rdma_delivery_drain();
+  env.runs_inline = [osd = osd](const OSDOobExecutor* e) {
+    return osd->oob_runs_inline(e);
+  };
+  // a coroutine's request does not park: it runs its pulls on its op
+  // thread, as it always has, and the coroutine holds the PG meanwhile
+  env.here = coro_op_in_flight && ctx->op == active_coro_op;
+  env.target.pgid = info.pgid;
+  env.target.head = m->get_hobj().get_head();
+  env.target.epoch = get_osdmap_epoch();
+  env.kick = [osd = osd, op = ctx->op](
+    const ceph::osd::oob::kick_target& t) {
+    osd->queue_oob_pull_kick(t.pgid, t.epoch, op, t.head);
+  };
+  env.out = osd->oob_pulls_out.get();
   return ceph::osd::oob::pull_payloads(env, *ctx->op, *ctx->ops);
+}
+
+bool PrimaryLogPG::maybe_wait_for_oob_pull(OpRequestRef& op)
+{
+  auto m = op->get_req<MOSDOp>();
+  const hobject_t head = m->get_hobj().get_head();
+  ceph::osd::oob::kick_target target;
+  target.pgid = info.pgid;
+  target.head = head;
+  target.epoch = get_osdmap_epoch();
+  if (const auto& set = op->oob_pull; set && !set->consumed()) {
+    // A run of a pulled write after its pulls started: the kick ran it
+    // again, or an interval change did. Until they settled, a read of
+    // the client's window may still be posted, and any check further on
+    // may answer the request, after which the client may reuse the
+    // window. So it waits for them, before any such check. A run whose
+    // pulls settled goes on, as the oldest op on its object
+    if (!set->park(target)) {
+      return false;
+    }
+    hold_for_oob_pull(op, head, set);
+    if (const auto& hold = oob_pull_holds[head]; hold.owner == op) {
+      dout(10) << __func__ << " " << *m << " waits for its pulls" << dendl;
+    } else {
+      dout(10) << __func__ << " " << *m << " waits for its pulls, behind "
+	       << *hold.owner->get_req() << dendl;
+    }
+    return true;
+  }
+  const auto& deliveries = m->get_rdma_deliveries();
+  if (!op->oob_pull &&
+      std::any_of(deliveries.begin(), deliveries.end(),
+		  [](const auto& d) { return d.is_pull(); })) {
+    // A pulled write that has not pulled, while the pulls of an earlier
+    // attempt of its request still run on a transfer thread of the OSD.
+    // That attempt waits for them in a hold, or a PG dropped it (an
+    // interval change, a split, a reset session) while its reads of the
+    // client's window may still be posted. This attempt waits for them
+    // too: until they settled nothing pulls the window again, nor
+    // answers the request. Then it pulls the window itself, unless it
+    // finds the write done
+    if (auto earlier = osd->oob_pulls_out->find(op->get_reqid());
+	earlier && earlier->park(target)) {
+      hold_for_oob_pull(op, head, std::move(earlier));
+      if (const auto& hold = oob_pull_holds[head]; hold.owner == op) {
+	dout(10) << __func__ << " " << *m << " waits for the pulls of an "
+		 << "earlier attempt" << dendl;
+      } else {
+	dout(10) << __func__ << " " << *m << " waits for the pulls of an "
+		 << "earlier attempt, behind " << *hold.owner->get_req()
+		 << dendl;
+      }
+      return true;
+    }
+  }
+  // Two kinds pass, as they pass the object's other blocks: the ops of a
+  // cache tier's flush, which deliver nothing out of band, and pg ops,
+  // which do_pg_op() runs whatever object they name. A pg op is told by
+  // its ops, as do_op_impl() routes it, not by the flag the client sets:
+  // a pulled write that passed would park in a hold that is not its own
+  if (oob_pull_holds.empty() ||
+      (m->has_flag(CEPH_OSD_FLAG_FLUSH) && !m->has_rdma_delivery()) ||
+      std::any_of(m->ops.begin(), m->ops.end(), [](const OSDOp& o) {
+	return ceph_osd_op_type_pg(o.op.op);
+      })) {
+    return false;
+  }
+  // Any other op on an object a pulled write waits on waits behind it,
+  // whatever it is. Checked here, it reaches every later list behind the
+  // pulled write too: a list it entered first, the scrub's or the one of
+  // degraded objects (which scrub and backfill can start on the object
+  // while the write holds no lock of it), would let it run first
+  auto p = oob_pull_holds.find(head);
+  if (p == oob_pull_holds.end() || p->second.owner == op) {
+    return false;
+  }
+  dout(20) << __func__ << " " << *m << " waits behind "
+	   << *p->second.owner->get_req() << dendl;
+  p->second.waiters.push_back(op);
+  op->mark_delayed("waiting for oob pull");
+  return true;
+}
+
+void PrimaryLogPG::hold_for_oob_pull(
+  OpRequestRef op, const hobject_t& head,
+  std::shared_ptr<ceph::osd::oob::pull_set> pulls)
+{
+  auto [p, created] = oob_pull_holds.try_emplace(head);
+  if (created) {
+    p->second.owner = op;
+    p->second.pulls = std::move(pulls);
+    p->second.since = ceph_clock_now();
+  } else {
+    // another pulled write waits on the object: behind it, and it
+    // kicks this one with its waiters; the kick of what this one waits
+    // for, if that settles first, finds the hold waiting for more. An op
+    // in a hold does not run, so it never finds its own
+    ceph_assert(p->second.owner != op);
+    p->second.waiters.push_back(op);
+  }
+  op->mark_delayed("waiting for oob pull");
+}
+
+void PrimaryLogPG::park_for_oob_pull(OpContext *ctx, const hobject_t& head)
+{
+  OpRequestRef op = ctx->op;
+  // a client op on the object waits at the top of do_op() while a hold
+  // is here, so this run normally found none; if it did, it waits behind
+  // the write that holds the object, as it would have there
+  hold_for_oob_pull(op, head, op->oob_pull);
+  if (const auto& hold = oob_pull_holds[head]; hold.owner == op) {
+    dout(10) << __func__ << " " << *op->get_req()
+	     << " waits for its pulls on a transfer thread" << dendl;
+  } else {
+    dout(10) << __func__ << " " << *op->get_req()
+	     << " waits for its pulls on a transfer thread, behind "
+	     << *hold.owner->get_req() << dendl;
+  }
+  // the ops this one's lock held run again, and wait in the hold
+  close_op_ctx(ctx);
+}
+
+void PrimaryLogPG::abandon_oob_pull(const OpRequestRef& op)
+{
+  if (op->oob_pull && !op->oob_pull->settled()) {
+    dout(10) << __func__ << " " << op->get_reqid() << ": dropped, its "
+	     << "pulls that did not start never will" << dendl;
+    op->oob_pull->abandon();
+  }
+}
+
+void PrimaryLogPG::oob_pull_kick(OpRequestRef op, const hobject_t& head)
+{
+  // op names the pulls that settled; whose they are does not matter:
+  // a hold whose pulls settled ends, whichever kick finds it first
+  auto p = oob_pull_holds.find(head);
+  if (p == oob_pull_holds.end() || !p->second.pulls->settled()) {
+    // an interval change requeued or dropped the hold since, and a
+    // requeued op went on, or waits again with its own kick to come; or
+    // the hold waits for other pulls, whose kick is to come
+    dout(10) << __func__ << " " << op->get_reqid() << ": no hold of "
+	     << head << " waits for pulls that settled, ignoring" << dendl;
+    return;
+  }
+  // the op ahead of the ops that waited behind it, in one call, which
+  // keeps their order whether they go back to the queue or wait for
+  // the PG to become readable
+  const bool own = p->second.pulls == p->second.owner->oob_pull;
+  std::list<OpRequestRef> ls;
+  ls.push_back(std::move(p->second.owner));
+  ls.splice(ls.end(), p->second.waiters);
+  dout(10) << __func__ << " " << *ls.front()->get_req()
+	   << (own ? " pulled" : " waited for an earlier attempt's pulls")
+	   << ", requeuing it and " << (ls.size() - 1)
+	   << " ops behind it after "
+	   << (ceph_clock_now() - p->second.since) << dendl;
+  oob_pull_holds.erase(p);
+  requeue_ops(ls);
+}
+
+void PrimaryLogPG::release_oob_pull_holds(bool requeue)
+{
+  for (auto& [head, hold] : oob_pull_holds) {
+    std::list<OpRequestRef> ls;
+    ls.push_back(std::move(hold.owner));
+    ls.splice(ls.end(), hold.waiters);
+    dout(10) << __func__ << " " << head << ": "
+	     << (requeue ? "requeuing " : "dropping ") << ls.size()
+	     << " ops" << dendl;
+    if (requeue) {
+      // an op whose pulls are still out waits for them again, at the
+      // top of do_op(), and its kick goes where it waits then
+      requeue_ops(ls);
+      continue;
+    }
+    // no run will answer them: the client sends them again, to the PG's
+    // primary. The pulls they wait for that did not start never will
+    hold.pulls->abandon();
+    for (auto& op : ls) {
+      if (op->oob_pull) {
+	op->oob_pull->abandon();
+      }
+    }
+  }
+  oob_pull_holds.clear();
+}
+
+void PrimaryLogPG::dump_oob_holds(ceph::Formatter *f) const
+{
+  const utime_t now = ceph_clock_now();
+  f->open_array_section("oob_pull_holds");
+  for (const auto& [head, hold] : oob_pull_holds) {
+    f->open_object_section("hold");
+    f->dump_stream("object") << head;
+    f->dump_stream("owner") << hold.owner->get_reqid();
+    f->dump_bool("own_pulls", hold.pulls == hold.owner->oob_pull);
+    f->dump_bool("settled", hold.pulls->settled());
+    f->dump_float("age", now - hold.since);
+    f->open_array_section("waiters");
+    for (const auto& w : hold.waiters) {
+      f->dump_stream("reqid") << w->get_reqid();
+    }
+    f->close_section();
+    f->close_section();
+  }
+  f->close_section();
 }
 #endif // HAVE_OSD_OOB_DELIVERY
 
@@ -13607,6 +13860,16 @@ void PrimaryLogPG::on_flushed()
     while (object_contexts.get_next(i.first, &i)) {
       derr << __func__ << ": object " << i.first << " obc still alive" << dendl;
     }
+#ifdef HAVE_OSD_OOB_DELIVERY
+    // on_change() let go of them, and no client op ran since
+    for (const auto& [head, hold] : oob_pull_holds) {
+      derr << __func__ << ": object " << head << " oob pull hold still held"
+	   << dendl;
+    }
+#ifndef NDEBUG
+    ceph_assert(oob_pull_holds.empty());
+#endif
+#endif
     ceph_assert(object_contexts.empty());
   }
 }
@@ -13677,6 +13940,9 @@ void PrimaryLogPG::on_shutdown()
   object_contexts.clear();
 
   clear_async_reads();
+#ifdef HAVE_OSD_OOB_DELIVERY
+  release_oob_pull_holds(false);
+#endif
 
   osd->remote_reserver.cancel_reservation(info.pgid);
   osd->local_reserver.cancel_reservation(info.pgid);
@@ -13865,6 +14131,12 @@ void PrimaryLogPG::on_change(ObjectStore::Transaction &t)
     waiting_for_cache_not_full.clear();
   }
   objects_blocked_on_cache_full.clear();
+
+#ifdef HAVE_OSD_OOB_DELIVERY
+  // the pulled writes that wait for their pulls, and the ops behind them;
+  // the reads in progress came before them
+  release_oob_pull_holds(is_primary());
+#endif
 
   for (list<pair<OpRequestRef, OpContext*> >::iterator i =
          in_progress_async_reads.begin();

@@ -5,6 +5,8 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
+#include <thread>
 
 #include "common/ceph_context.h"
 #include "common/config.h"
@@ -120,6 +122,12 @@ int OSDOfi::init(const std::string& provider,
     (pg_pool_t::DEFAULT_RDMA_DELIVERY_LEASE +
      pg_pool_t::DEFAULT_RDMA_DELIVERY_DRAIN) * 1000.0));
   cfg.cutoff_close_hook = [cct = cct] {
+    // as a provider that drains its writes on close, not discards them
+    const auto delay = cct->_conf.get_val<std::chrono::milliseconds>(
+      "osd_ofi_inject_cutoff_delay");
+    if (delay.count() > 0) {
+      std::this_thread::sleep_for(delay);
+    }
     return cct->_conf.get_val<bool>("osd_ofi_inject_cutoff_failure") ?
       -EIO : 0;
   };
@@ -160,10 +168,16 @@ int OSDOfi::init(const std::string& provider,
   dout(1) << "libfabric delivery up: " << ep->describe() << ", staging in "
 	  << arena->size() << " bytes, " << (windows ? windows->count() : 0)
 	  << " gather windows of " << WINDOW_SIZE << " bytes" << dendl;
-  if (ep->provider() == "tcp" || ep->provider() == "sockets") {
+  // the core provider, without the utility provider layered on it: tcp
+  // of "tcp;ofi_rxm"
+  const std::string_view prov = ep->provider();
+  const std::string_view core = prov.substr(0, prov.find(';'));
+  const bool kernel_sockets =
+    core == "tcp" || core == "sockets" || core == "udp";
+  if (kernel_sockets) {
     // closing a socket does not discard what the kernel already queued
     // on it, so a cut-off write can still land after the pool's drain
-    dout(0) << "WARNING: " << ep->provider() << " cannot cut off writes "
+    dout(0) << "WARNING: " << prov << " cannot cut off writes "
 	    << "that miss their deadline: the kernel still delivers what it "
 	    << "queued. Use it for tests only." << dendl;
   }
@@ -171,11 +185,19 @@ int OSDOfi::init(const std::string& provider,
     // a late write is then only cut off once the provider has drained it,
     // which the endpoint measures, and treats as unsafe when the drain
     // takes longer than the tolerance
-    dout(0) << "WARNING: " << ep->provider() << " says closing an endpoint "
+    dout(0) << "WARNING: " << prov << " says closing an endpoint "
 	    << "does not discard its writes; a write that misses its deadline "
 	    << "can land late, and a cut-off that takes longer than "
 	    << "osd_oob_cutoff_late_tolerance stops libfabric delivery"
 	    << dendl;
+  } else if (st.close_discards < 0 && core == "shm") {
+    // shm, the other provider that moves data in software, does not say
+    // either: what it queued for a peer may still run once the endpoint
+    // closed
+    dout(0) << "WARNING: " << prov << " does not say whether closing an "
+	    << "endpoint discards its writes; a write that misses its "
+	    << "deadline may still land after the pool's drain. Use it for "
+	    << "tests only." << dendl;
   }
   if (!ep->delivery_complete()) {
     dout(0) << "WARNING: " << ep->provider() << " does not promise "
@@ -475,18 +497,19 @@ void OSDOfi::get_alerts(std::map<std::string, std::string>& alerts) const
     return;
   }
   const auto s = ep->stats();
+  // an unsafe endpoint is broken too: unsafe says more
   if (s.unsafe) {
     alerts.emplace("OOB_DELIVERY_UNSAFE",
 		   "libfabric delivery could not cut off writes in time (" +
 		   ep->last_error() + "); libfabric delivery stopped");
-    return;
-  }
-  if (s.broken) {
+  } else if (s.broken) {
     alerts.emplace("OOB_DELIVERY_DOWN",
 		   "libfabric delivery could not reopen its endpoint (" +
 		   ep->last_error() + "); libfabric delivery stopped");
-    return;
   }
+  // the late cut-offs stay raised alongside: writes may have landed late
+  // whether or not delivery stopped since
+  const bool goes_on = !s.unsafe && !s.broken;
   const auto now = std::chrono::steady_clock::now();
   const auto period = std::chrono::seconds(ALERT_PERIOD);
   const auto minutes = std::to_string(
@@ -503,10 +526,14 @@ void OSDOfi::get_alerts(std::map<std::string, std::string>& alerts) const
 		   std::to_string(s.late_tolerance_ms) + " ms, the latest "
 		   "within the last " + minutes + " minutes, by up to " +
 		   std::to_string(s.max_cutoff_lateness_ms) + " ms" + pause +
-		   "; delivery goes on. A client that gave a request up and "
-		   "reused its window after the pool's lease and drain may "
-		   "have had it written");
-  } else if (s.cutoffs_late && now - s.last_late_cutoff < period) {
+		   (goes_on ? "; delivery goes on" : "") + ". A client that "
+		   "gave a request up and reused its window after the pool's "
+		   "lease and drain may have had it written");
+  } else if (!s.unsafe && s.cutoffs_late &&
+	     now - s.last_late_cutoff < period) {
+    // not next to an unsafe endpoint: a close or cancel that took longer
+    // than the tolerance made it unsafe, and counts only as late although
+    // it ended past the tolerance. The unsafe alert says how late.
     alerts.emplace("OOB_CUTOFF_LATE",
 		   std::to_string(s.cutoffs_late) + " write cut-off(s) ended "
 		   "after their budget, the latest within the last " + minutes +

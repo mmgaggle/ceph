@@ -3,7 +3,10 @@
 
 #include "osd/osd_ofi.h"
 
+#include <atomic>
 #include <cstring>
+#include <map>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -106,13 +109,13 @@ struct client_t {
   std::string token;
 };
 
-client_t lend(size_t n, unsigned access)
+client_t lend(size_t n, unsigned access, bool progress = true)
 {
   client_t c;
   ceph::ofi::config_t cfg;
   cfg.provider = "tcp";
   cfg.node = "127.0.0.1";
-  cfg.progress_thread = true;  // tcp serves remote reads only when polled
+  cfg.progress_thread = progress;  // tcp serves remote reads only when polled
   cfg.reads = true;
   std::string err;
   c.ep = ceph::ofi::Endpoint::open(cfg, &err);
@@ -126,6 +129,30 @@ client_t lend(size_t n, unsigned access)
   if (c.ep->register_window(c.mem.data(), n, ceph::ofi::memory_t{}, access,
 			    &c.w) == 0) {
     c.token = c.ep->window_token(c.w, 0, n);
+  }
+  return c;
+}
+
+/// a client that stops polling once the executor reached it: over tcp, a
+/// write into its window then cannot complete, and is cut off
+client_t stalled(OSDOfi& ofi, size_t n)
+{
+  auto c = lend(n, ceph::ofi::Endpoint::remote_write, false);
+  if (!c.ep || c.token.empty()) {
+    return c;
+  }
+  std::atomic<bool> stop{false};
+  std::thread poller([&] { while (!stop) c.ep->progress(); });
+  ceph::buffer::list first;
+  first.append_zero(4096);
+  const ssize_t r = ofi.execute_plan(
+    "obj", c.token, first, ceph::osd::oob::linear_plan(0, 4096),
+    std::chrono::seconds(5), nullptr);
+  stop = true;
+  poller.join();
+  EXPECT_EQ(4096, r);
+  if (r != 4096) {
+    c.token.clear();
   }
   return c;
 }
@@ -192,4 +219,88 @@ TEST(OSDOfi, PullsAWritePayload)
   EXPECT_FALSE(started_huge);
   EXPECT_EQ(0u, big.length());
   EXPECT_TRUE(ofi.is_available());
+}
+
+// The executor reads osd_oob_cutoff_policy when it opens its endpoint,
+// which judges a late cut-off by it from then on: a change at runtime
+// would apply only in part, so a running daemon refuses one. One stored
+// in the monitors applies when the daemon next starts.
+TEST(OSDOfi, CutoffPolicyIsSetAtStartup)
+{
+  auto& conf = g_ceph_context->_conf;
+  EXPECT_EQ(-EPERM, conf.set_val("osd_oob_cutoff_policy", "disable"));
+  EXPECT_EQ("warn", conf.get_val<std::string>("osd_oob_cutoff_policy"));
+}
+
+// A cut-off that fails leaves writes that may still land. The executor
+// stops, and raises OOB_DELIVERY_UNSAFE alone: not OOB_DELIVERY_DOWN too,
+// although its endpoint is broken as well.
+TEST(OSDOfi, FailedCutOffRaisesUnsafe)
+{
+  auto a = arena(1);
+  OSDOfi ofi(g_ceph_context, nullptr);
+  if (ofi.init("tcp", loopback(), false, a.get()) != 0) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  const size_t n = 4 << 20;
+  auto c = stalled(ofi, n);
+  ASSERT_TRUE(c.ep);
+  ASSERT_FALSE(c.token.empty()) << c.ep->last_error();
+  std::map<std::string, std::string> alerts;
+  ofi.get_alerts(alerts);
+  EXPECT_TRUE(alerts.empty());
+
+  // the provider fails to close the endpoint in the cut-off
+  auto& conf = g_ceph_context->_conf;
+  ASSERT_EQ(0, conf.set_val("osd_ofi_inject_cutoff_failure", "true"));
+  ceph::buffer::list data;
+  data.append_zero(n);
+  const ssize_t r = ofi.execute_plan(
+    "obj", c.token, data, ceph::osd::oob::linear_plan(0, n),
+    std::chrono::milliseconds(600), nullptr);
+  conf.set_val("osd_ofi_inject_cutoff_failure", "false");
+  EXPECT_EQ(-ENOTRECOVERABLE, r);
+  EXPECT_FALSE(ofi.is_available());
+  EXPECT_FALSE(ofi.handles(c.token));
+  ofi.get_alerts(alerts);
+  ASSERT_EQ(1u, alerts.size());
+  EXPECT_EQ("OOB_DELIVERY_UNSAFE", alerts.begin()->first);
+}
+
+// A cut-off whose close takes longer than the tolerance, as with a
+// provider that drains its writes on close, ends past the tolerance too.
+// The executor stops, and raises OOB_DELIVERY_UNSAFE, which says how late
+// it ended: not OOB_CUTOFF_LATE, which would say within the tolerance.
+TEST(OSDOfi, SlowCutOffRaisesUnsafeNotLate)
+{
+  auto a = arena(1);
+  OSDOfi ofi(g_ceph_context, nullptr);
+  if (ofi.init("tcp", loopback(), false, a.get()) != 0) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  const size_t n = 4 << 20;
+  auto c = stalled(ofi, n);
+  ASSERT_TRUE(c.ep);
+  ASSERT_FALSE(c.token.empty()) << c.ep->last_error();
+
+  auto& conf = g_ceph_context->_conf;
+  const auto tolerance = conf.get_val<std::chrono::milliseconds>(
+    "osd_oob_cutoff_late_tolerance");
+  ASSERT_EQ(0, conf.set_val("osd_ofi_inject_cutoff_delay",
+			    std::to_string(tolerance.count() + 500)));
+  ceph::buffer::list data;
+  data.append_zero(n);
+  const ssize_t r = ofi.execute_plan(
+    "obj", c.token, data, ceph::osd::oob::linear_plan(0, n),
+    std::chrono::milliseconds(600), nullptr);
+  conf.set_val("osd_ofi_inject_cutoff_delay", "0");
+  // it ended after the write's budget, so it was counted late as well
+  EXPECT_EQ(-ENOTRECOVERABLE, r);
+  EXPECT_FALSE(ofi.is_available());
+  std::map<std::string, std::string> alerts;
+  ofi.get_alerts(alerts);
+  ASSERT_EQ(1u, alerts.count("OOB_DELIVERY_UNSAFE"));
+  EXPECT_NE(std::string::npos, alerts["OOB_DELIVERY_UNSAFE"].find(
+	      "took longer than the tolerance"));
+  EXPECT_EQ(1u, alerts.size());
 }

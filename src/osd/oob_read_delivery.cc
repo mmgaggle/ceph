@@ -9,6 +9,7 @@
 #include "common/ceph_context.h"
 #include "common/crc64nvme.h"
 #include "common/debug.h"
+#include "common/errno.h"
 #include "common/Formatter.h"
 #include "include/ceph_assert.h"
 #include "messages/MOSDOpReply.h"
@@ -257,6 +258,42 @@ void push_job::dump(ceph::Formatter* f) const
   f->dump_unsigned("op", push.idx);
   f->dump_unsigned("bytes", push.payload.length());
   f->dump_unsigned("ranges", push.plan.size());
+}
+
+bool submit_pushes(CephContext* cct, Transfers* x,
+		   const std::shared_ptr<oob_reply>& join,
+		   const std::string& key, std::vector<read_push>&& pushes,
+		   const std::function<bool(const OSDOobExecutor*)>& runs_inline)
+{
+  bool handed_off = false;
+  for (auto& p : pushes) {
+    const size_t idx = p.idx;
+    // with transfer threads the push runs on one of them, unless its
+    // executor keeps its transfers on the op threads (cuObject without
+    // osd_oob_cuobj_transfer_threads)
+    const bool here = runs_inline(p.exec);
+    std::unique_ptr<xfer_job> job =
+      std::make_unique<push_job>(cct, join, key, std::move(p), here);
+    const int r = x ? x->submit(job) : -ESHUTDOWN;
+    if (r < 0) {
+      // refused, so nothing of it started: declined
+      dout(10) << "op " << idx << " of " << key << ": push refused ("
+	       << cpp_strerror(r) << "), delivering inline" << dendl;
+      job->expire(r);
+    } else if (!here && x->async()) {
+      handed_off = true;
+    }
+  }
+  return handed_off;
+}
+
+void hand_off(const std::shared_ptr<oob_reply>& join,
+	      const std::function<void()>& let_go)
+{
+  let_go();
+  // the guard goes last: the reply waits for it, so it cannot leave
+  // while the request still holds anything
+  join->put();
 }
 
 } // namespace ceph::osd::oob

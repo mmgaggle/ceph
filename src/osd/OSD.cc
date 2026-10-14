@@ -1809,7 +1809,19 @@ void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
 				       !m->has_flag(CEPH_OSD_FLAG_RETURNVEC));
   reply->set_reply_versions(v, uv);
   reply->set_op_returns(op_returns);
-  if (m->has_rdma_delivery()) {
+  bool declined = m->has_rdma_delivery();
+#ifdef HAVE_OSD_OOB_DELIVERY
+  if (op->oob_push_started) {
+    // a push of the request may still be writing the client's windows.
+    // No path answers a request here once its pushes started; should
+    // one, the reply says nothing of the descriptors, and the client
+    // fences its windows
+    dout(1) << __func__ << " " << *m << " already pushed, replying "
+	    << cpp_strerror(err) << dendl;
+    declined = false;
+  }
+#endif
+  if (declined) {
     // an op answered here never reached complete_read_ctx, the only
     // place a transfer starts: say so, so that a client bounced off a
     // laggy replica can retry without fencing its window

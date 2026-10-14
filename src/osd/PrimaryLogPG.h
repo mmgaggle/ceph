@@ -1350,11 +1350,17 @@ protected:
     OpContext *ctx, const std::vector<OSDOp>& rops,
     std::vector<ceph::rdma::oob_result_t>& oob);
   /**
-   * Run the pushes deliver_oob_prepare() returned, and send the reply,
-   * with rops and oob back in it, once every push is over. A push that
-   * placed its op's data strips it from the op, and each records its
-   * result in oob. The pushes run on this thread, so the reply has
-   * left when this returns.
+   * Run the pushes deliver_oob_prepare() returned, send the reply, with
+   * rops and oob back in it, once every push is over, and close ctx. A
+   * push that placed its op's data strips it from the op, and each
+   * records its result in oob. With transfer threads the pushes run
+   * there: ctx is closed, releasing the object's lock, before the
+   * reply leaves, and the reply leaves once the last push is over, from
+   * the transfer thread that ran it, or from this thread, before this
+   * returns, when every push ended first. A push that runs on this
+   * thread (no transfer threads, or an executor whose transfers stay on
+   * the op threads) runs before this returns, and when all do, the
+   * reply leaves before ctx is closed.
    */
   void deliver_oob(OpContext *ctx, MOSDOpReply *reply,
 		   std::vector<OSDOp>&& rops,

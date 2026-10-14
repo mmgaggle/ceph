@@ -100,6 +100,7 @@ target_link_libraries(unittest_oob_read_delivery osd global)
 # unittest_ec_gather
 add_executable(unittest_ec_gather
   test_ec_gather.cc
+  $<TARGET_OBJECTS:unit-main>
   )
 add_ceph_unittest(unittest_ec_gather)
 target_link_libraries(unittest_ec_gather osd global)

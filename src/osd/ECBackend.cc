@@ -16,6 +16,8 @@
 #include "ECBackend.h"
 #include "osd/ec_gather.h"
 #include "osd/oob_placement.h"
+#include "osd/oob_read_delivery.h"
+#include "osd/oob_xfer.h"
 
 #include <iostream>
 
@@ -283,10 +285,45 @@ bool ECBackend::_handle_message(
     reply->pgid = get_parent()->primary_spg_t();
     reply->map_epoch = switcher->get_osdmap_epoch();
     reply->min_epoch = get_parent()->get_interval_start_epoch();
-    handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace,
-		    _op->get_req()->get_recv_stamp());
+    handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace);
     reply->trace = _op->pg_trace;
     reply->pgid.reset_shard(op->op.from.shard);
+    // the push comes after the reads: the primary returns its window
+    // clean when the reply carries no bytes, so nothing may drop read
+    // bytes after a push was attempted, and a failed push leaves
+    // buffers_read as it was
+    if (!op->op.push_token.empty()) {
+      const utime_t received = _op->get_req()->get_recv_stamp();
+      if (auto push = prepare_sub_read_push(
+	    op->op, &reply->op,
+	    received.is_zero() ? ceph_clock_now() : received); push) {
+	// the reply follows the push: the job sends it once the push is
+	// over, from a transfer thread, or from this one before the
+	// submit returns. Everything in it but the push's outcome was
+	// fixed here, under the PG lock; the job holds nothing of the PG,
+	// so an interval change meanwhile leaves it be, and the primary
+	// drops a reply from before the change
+	auto *l = get_parent()->get_eclistener();
+	const bool here = l->oob_runs_inline(push->exec);
+	std::unique_ptr<ceph::osd::oob::xfer_job> job =
+	  std::make_unique<ceph::osd::oob::sub_read_push_job>(
+	    cct, reply, std::move(*push),
+	    [_op, con = _op->get_req()->get_connection()](
+	      MOSDECSubOpReadReply *r) {
+	      _op->mark_event("oob_settled");
+	      con->send_message(r);
+	    },
+	    here);
+	if (const int r = l->oob_submit(job); r < 0) {
+	  // refused, so nothing of it started: the data goes inline
+	  dout(10) << __func__ << ": push of sub-read " << op->op.tid
+		   << " refused (" << cpp_strerror(r) << "), replying inline"
+		   << dendl;
+	  job->expire(r);
+	}
+	return true;
+      }
+    }
     get_parent()->send_message_osd_cluster(
       reply, _op->get_req()->get_connection());
     return true;
@@ -521,8 +558,7 @@ void ECBackend::handle_sub_read(
   pg_shard_t from,
   const ECSubRead &op,
   ECSubReadReply *reply,
-  const ZTracer::Trace &trace,
-  utime_t received) {
+  const ZTracer::Trace &trace) {
   trace.event("handle sub read");
   shard_id_t shard = get_parent()->whoami_shard().shard;
   for (auto &&[hoid, to_read]: op.to_read) {
@@ -743,18 +779,10 @@ void ECBackend::handle_sub_read(
 
   reply->from = get_parent()->whoami_shard();
   reply->tid = op.tid;
-
-  // the push stays last: the primary returns its window clean when the
-  // reply carries no bytes, so nothing may drop read bytes after a push
-  // was attempted, and a failed push leaves buffers_read as it was
-  if (!op.push_token.empty()) {
-    push_sub_read(op, reply,
-		  received.is_zero() ? ceph_clock_now() : received);
-  }
 }
 
-void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
-			      utime_t received)
+std::optional<ceph::osd::oob::sub_read_push> ECBackend::prepare_sub_read_push(
+  const ECSubRead &op, ECSubReadReply *reply, utime_t received)
 {
   // the primary lent us a window: place everything read there, back to
   // back in reply order, and return only the extents. Any refusal or
@@ -765,18 +793,17 @@ void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
   OSDOobExecutor* exec =
     get_parent()->get_eclistener()->oob_executor_for(op.push_token);
   if (!exec || reply->buffers_read.empty()) {
-    return;
+    return std::nullopt;
   }
-  bufferlist all;
-  std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
+  ceph::osd::oob::sub_read_push p;
   for (auto &&[hoid, extents] : reply->buffers_read) {
     for (auto &&[offset, bl] : extents) {
-      pushed[hoid].emplace_back(offset, bl.length());
-      all.append(bl);
+      p.pushed[hoid].emplace_back(offset, bl.length());
+      p.all.append(bl);
     }
   }
-  if (all.length() == 0) {
-    return;
+  if (p.all.length() == 0) {
+    return std::nullopt;
   }
   // the same bounds as client delivery: start within the pool's lease
   // of receipt, land (or be cut off) within lease plus drain. The
@@ -786,34 +813,15 @@ void ECBackend::push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
   if (age > pool.get_rdma_delivery_lease()) {
     dout(10) << __func__ << ": lease expired (" << age << "s), replying inline"
 	     << dendl;
-    return;
+    return std::nullopt;
   }
-  const double bound = pool.get_rdma_delivery_lease() +
-    pool.get_rdma_delivery_drain() - age;
-  auto plan = ceph::osd::oob::linear_plan(0, all.length());
-  // from here only the executor's word returns the window clean: until
-  // it says it started nothing, a write may have gone out
-  reply->push_declined = false;
-  // an executor that cannot say counts as having started
-  bool started = true;
-  ssize_t r = exec->execute_plan(
-    "ec gather", op.push_token, all, plan,
-    std::chrono::milliseconds(static_cast<int64_t>(bound * 1000.0)),
-    &started);
-  reply->push_declined = !started;
-  if (r != static_cast<ssize_t>(all.length())) {
-    dout(10) << __func__ << ": push to the primary failed (" << r
-	     << (started ? "" : ", nothing sent") << "), replying inline"
-	     << dendl;
-    return;
-  }
-  dout(20) << __func__ << ": pushed " << all.length()
-	   << " bytes to the primary" << dendl;
-  reply->pushed = std::move(pushed);
-  // what the primary finds in its window has to match this before it
-  // passes for our data
-  reply->pushed_crc = all.crc32c(-1);
-  reply->buffers_read.clear();
+  p.exec = exec;
+  p.token = op.push_token;
+  p.plan = ceph::osd::oob::linear_plan(0, p.all.length());
+  p.bounds = ceph::osd::oob::make_bounds(
+    received, pool.get_rdma_delivery_lease(), pool.get_rdma_delivery_drain(),
+    std::nullopt, ceph::signedspan::zero());
+  return p;
 }
 
 void ECBackend::handle_sub_read_n_reply(
@@ -821,6 +829,9 @@ void ECBackend::handle_sub_read_n_reply(
   ECSubRead &op,
   const ZTracer::Trace &trace)
 {
+  // our own shard is never lent a window (ReadPipeline::do_read_op()),
+  // and nothing here would push into one
+  ceph_assert(op.push_token.empty());
   ECSubReadReply reply;
   handle_sub_read(from, op, &reply, trace);
   handle_sub_read_reply(from, reply, trace);
@@ -892,14 +903,15 @@ void ECBackend::handle_sub_read_reply(
     if (op.pushed.empty()) {
       // the shard replied inline: a push it attempted may still land.
       // One that read no bytes - every object failed, a media error
-      // say - attempted none (push_sub_read pushes only what it read),
-      // so its window goes back clean. Quarantining it would let one
-      // object a shard cannot read, read over and over, take every
-      // window this OSD can lend. The window of a shard whose reply
-      // says that its executor refused the push before sending
-      // anything - its endpoint busy adding a client, say - goes back
-      // clean too: quarantining it would keep every window a busy shard
-      // was lent out of use.
+      // say - attempted none (prepare_sub_read_push() pushes only what
+      // it read), so its window goes back clean. Quarantining it would
+      // let one object a shard cannot read, read over and over, take
+      // every window this OSD can lend. The window of a shard whose
+      // reply says that nothing of the push went out - its executor
+      // refused it, its endpoint busy adding a client, say, or it never
+      // left the shard's transfer queue - goes back clean too:
+      // quarantining it would keep every window a busy shard was lent
+      // out of use.
       uint64_t read = 0;
       for (auto &&[hoid, extents] : op.buffers_read) {
 	for (auto &&[offset, bl] : extents) {

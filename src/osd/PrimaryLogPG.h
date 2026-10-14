@@ -2044,6 +2044,8 @@ public:
   struct ECListener *get_eclistener() override;
 #ifdef HAVE_OSD_OOB_DELIVERY
   OSDOobExecutor* oob_executor_for(const std::string& token) override;
+  int oob_submit(std::unique_ptr<ceph::osd::oob::xfer_job>& j) override;
+  bool oob_runs_inline(const OSDOobExecutor* e) const override;
   OSDOobExecutor* oob_gather_executor() override;
 #endif
   const pg_missing_const_i * maybe_get_shard_missing(

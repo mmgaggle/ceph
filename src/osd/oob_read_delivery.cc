@@ -12,6 +12,7 @@
 #include "common/errno.h"
 #include "common/Formatter.h"
 #include "include/ceph_assert.h"
+#include "messages/MOSDECSubOpReadReply.h"
 #include "messages/MOSDOpReply.h"
 #include "osd/oob_executor.h"
 
@@ -294,6 +295,89 @@ void hand_off(const std::shared_ptr<oob_reply>& join,
   // the guard goes last: the reply waits for it, so it cannot leave
   // while the request still holds anything
   join->put();
+}
+
+sub_read_push_job::sub_read_push_job(CephContext* cct,
+				     MOSDECSubOpReadReply* reply,
+				     sub_read_push push, send_fn send,
+				     bool here)
+  : cct(cct), reply(reply), push(std::move(push)), send(std::move(send)),
+    here(here), pgid(reply->pgid.pgid, reply->op.from.shard),
+    tid(reply->op.tid),
+    bytes(this->push.all.length())
+{
+  ceph_assert(this->push.exec);
+}
+
+sub_read_push_job::~sub_read_push_job()
+{
+  if (reply) {
+    // dropped without running: nothing of it started
+    decline();
+    send_reply();
+  }
+}
+
+void sub_read_push_job::run()
+{
+  // a job runs or expires once: a second push could land after the
+  // primary took its window back
+  ceph_assert(reply);
+  // an executor that cannot say counts as having started
+  bool started = true;
+  const ssize_t r = push.exec->execute_plan("ec gather", push.token,
+					    push.all, push.plan,
+					    budget_left(push.bounds),
+					    &started);
+  debug_delay_done(cct);
+  auto& op = reply->op;
+  // only the executor's word returns the window clean: until it says
+  // it started nothing, a write may have gone out
+  op.push_declined = !started;
+  if (r != static_cast<ssize_t>(bytes)) {
+    // buffers_read stays as it was read, which is what the primary
+    // decodes from
+    dout(10) << "sub-read " << tid << " of " << pgid
+	     << ": push to the primary failed (" << r
+	     << (started ? "" : ", nothing sent") << "), replying inline"
+	     << dendl;
+  } else {
+    dout(20) << "sub-read " << tid << " of " << pgid << ": pushed "
+	     << bytes << " bytes to the primary" << dendl;
+    op.pushed = std::move(push.pushed);
+    // what the primary finds in its window has to match this before it
+    // passes for our data
+    op.pushed_crc = push.all.crc32c(-1);
+    op.buffers_read.clear();
+  }
+  send_reply();
+}
+
+void sub_read_push_job::expire(int r)
+{
+  ceph_assert(reply);
+  dout(10) << "sub-read " << tid << " of " << pgid << ": push not started ("
+	   << r << "), replying inline" << dendl;
+  decline();
+  send_reply();
+}
+
+void sub_read_push_job::decline()
+{
+  reply->op.push_declined = true;
+}
+
+void sub_read_push_job::send_reply()
+{
+  ceph_assert(reply);
+  send(std::exchange(reply, nullptr));
+}
+
+void sub_read_push_job::dump(ceph::Formatter* f) const
+{
+  f->dump_stream("pgid") << pgid;
+  f->dump_unsigned("sub_read", tid);
+  f->dump_unsigned("bytes", bytes);
 }
 
 } // namespace ceph::osd::oob

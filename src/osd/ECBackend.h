@@ -40,6 +40,9 @@ struct ECSubWriteReply;
 struct ECSubRead;
 struct ECSubReadReply;
 class ECSwitch;
+namespace ceph::osd::oob {
+struct sub_read_push;
+}
 
 class ECSwitch;
 
@@ -78,19 +81,23 @@ class ECBackend : public ECCommon {
       const ZTracer::Trace &trace,
       ECListener &eclistener
     ) override;
-  /// received: when the sub-read arrived, which the pool's delivery
-  /// lease and drain bound a push from (now, for a local read)
   void handle_sub_read(
       pg_shard_t from,
       const ECSubRead &op,
       ECSubReadReply *reply,
-      const ZTracer::Trace &trace,
-      utime_t received = utime_t()
+      const ZTracer::Trace &trace
     );
-  /// push a sub-read's data into the primary's gather window (the
-  /// op's push_token), returning only extents in the reply
-  void push_sub_read(const ECSubRead &op, ECSubReadReply *reply,
-		     utime_t received);
+  /**
+   * The push of a sub-read's data into the primary's gather window (the
+   * op's push_token), once handle_sub_read() filled in reply: checks
+   * it, finds the executor, takes the data read and fixes the bounds of
+   * the transfer, from received, when the sub-read arrived. Marks the
+   * reply as having sent nothing into the window, which a push that
+   * starts revises, and returns the push, or nullopt when the reply
+   * goes inline as it is. Starts no transfer.
+   */
+  std::optional<ceph::osd::oob::sub_read_push> prepare_sub_read_push(
+    const ECSubRead &op, ECSubReadReply *reply, utime_t received);
 
   void handle_sub_read_n_reply(
     pg_shard_t from,

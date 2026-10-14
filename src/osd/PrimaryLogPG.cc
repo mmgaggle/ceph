@@ -16974,6 +16974,17 @@ OSDOobExecutor* PrimaryLogPG::oob_executor_for(const std::string& token)
   return osd->oob_executor_for(token);
 }
 
+int PrimaryLogPG::oob_submit(std::unique_ptr<ceph::osd::oob::xfer_job>& j)
+{
+  auto *xfer = osd->oob_transfers();
+  return xfer ? xfer->submit(j) : -ESHUTDOWN;
+}
+
+bool PrimaryLogPG::oob_runs_inline(const OSDOobExecutor* e) const
+{
+  return osd->oob_runs_inline(e);
+}
+
 OSDOobExecutor* PrimaryLogPG::oob_gather_executor()
 {
   return osd->oob_gather_executor();

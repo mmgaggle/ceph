@@ -7,11 +7,13 @@
 #include <cerrno>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <sys/types.h>
+#include <utility>
 #include <vector>
 
 #include "common/rdma_token.h"
@@ -21,6 +23,7 @@
 #include "osd/oob_xfer.h"
 #include "osd/osd_types.h"
 
+class MOSDECSubOpReadReply;
 class MOSDOpReply;
 class OSDOobExecutor;
 namespace ceph { class Formatter; }
@@ -204,5 +207,84 @@ bool submit_pushes(CephContext* cct, Transfers* x,
  */
 void hand_off(const std::shared_ptr<oob_reply>& join,
 	      const std::function<void()>& let_go);
+
+/**
+ * The EC shard push: a shard that the primary lent a gather window
+ * (ECSubRead::push_token) writes the data of its sub-read there, rather
+ * than return it in its reply.
+ *
+ * Under the shard's PG lock, ECBackend::prepare_sub_read_push() checks
+ * the sub-read, finds the executor, and takes the data read, its plan
+ * and the bounds of the transfer; the reply is complete then, but for
+ * what the push changes in it. A sub_read_push_job runs the push, puts
+ * its outcome in the reply, and only then sends it: the primary reads
+ * the window once it has the reply, and not before. With transfer
+ * threads the push and the reply leave from one of them, and the op
+ * thread goes on at once. Without them, or for an executor whose
+ * transfers stay on the op threads, both happen before the submit
+ * returns, as they always have.
+ */
+struct sub_read_push {
+  OSDOobExecutor* exec = nullptr;
+  std::string token;  ///< the primary's window
+  /// what the sub-read read, back to back in reply order: what the
+  /// window gets. It shares its buffers with the reply's buffers_read
+  ceph::buffer::list all;
+  placement_plan plan;
+  /// the extents of all, by object, for the reply's pushed
+  std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
+  bounds_t bounds;
+};
+
+/**
+ * The push of a shard's sub-read into the primary's gather window, then
+ * its reply. A push that places every byte returns only the extents and
+ * their crc32c; any other outcome leaves the data in buffers_read, as
+ * read. The reply says that nothing went into the window
+ * (push_declined) when the executor says so, and when the job never ran
+ * (refused, expired, shed or dropped): the primary then lends the
+ * window again at once.
+ */
+class sub_read_push_job final : public xfer_job {
+public:
+  /// sends the finished reply; consumes the message reference
+  using send_fn = std::function<void(MOSDECSubOpReadReply*)>;
+
+  /// reply: the sub-read's reply, its reference now the job's, complete
+  /// but for the push; here: run on the thread that submits it (see
+  /// inline_only())
+  sub_read_push_job(CephContext* cct, MOSDECSubOpReadReply* reply,
+		    sub_read_push push, send_fn send, bool here);
+  ~sub_read_push_job() override;
+
+  sub_read_push_job(const sub_read_push_job&) = delete;
+  sub_read_push_job& operator=(const sub_read_push_job&) = delete;
+
+  uint64_t pinned_bytes() const override { return bytes; }
+  ceph::mono_clock::time_point post_by() const override {
+    return push.bounds.post_by;
+  }
+  bool inline_only() const override { return here; }
+  void run() override;
+  void expire(int r) override;
+  void dump(ceph::Formatter* f) const override;
+
+private:
+  /// the data stays inline, and nothing went into the window
+  void decline();
+  void send_reply();
+
+  CephContext* const cct;
+  MOSDECSubOpReadReply* reply;
+  sub_read_push push;
+  const send_fn send;
+  const bool here;
+  /// fixed before the job runs, for the log and dump_oob_transfers: the
+  /// PG instance of this shard, which runs the push, where the reply's
+  /// pgid names the primary's
+  const spg_t pgid;
+  const ceph_tid_t tid;
+  const uint64_t bytes;
+};
 
 } // namespace ceph::osd::oob

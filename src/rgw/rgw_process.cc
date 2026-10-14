@@ -176,6 +176,21 @@ bool rate_limit(rgw::sal::Driver* driver, req_state* s) {
   return (limit_user || limit_bucket);
 }
 
+// out-of-band bytes never pass through dump_body() or recv_body(), so
+// charge them once the op has run. The op gives the direction, not the
+// method: an RC GET is a POST.
+static void charge_rdma_bytes(req_state* s, RGWOp* op)
+{
+  if (!op || s->rdma_bytes_transferred == 0) {
+    return;
+  }
+  const bool is_read = op->op_mask() & RGW_OP_TYPE_READ;
+  const int64_t len = s->rdma_bytes_transferred;
+  s->ratelimit_data->decrease_bytes(is_read, s->ratelimit_user_name, len, &s->user_ratelimit);
+  if (!rgw::sal::Bucket::empty(s->bucket.get()))
+    s->ratelimit_data->decrease_bytes(is_read, s->ratelimit_bucket_marker, len, &s->bucket_ratelimit);
+}
+
 int rgw_process_authenticated(RGWHandler_REST * const handler,
                               RGWOp *& op,
                               RGWRequest * const req,
@@ -534,6 +549,7 @@ done:
   if (rdma_bytes != nullptr) {
     *rdma_bytes = s->rdma_bytes_transferred;
   }
+  charge_rdma_bytes(s, op);
   int op_ret = 0;
 
   if (user && !rgw::sal::User::empty(s->user.get())) {

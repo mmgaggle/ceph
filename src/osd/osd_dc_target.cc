@@ -147,7 +147,9 @@ int OSDDcTarget::open(CephContext* cct, const std::string& rdma_ip,
   qpa.min_rnr_timer = 12;
   qpa.ah_attr.is_global = 1;
   qpa.ah_attr.port_num = static_cast<uint8_t>(port);
-  qpa.ah_attr.grh.hop_limit = 4;
+  // the DCT's ACKs carry this as their RoCE v2 TTL; leave room for a
+  // routed multi-tier fabric, as the gateway's RC transport does
+  qpa.ah_attr.grh.hop_limit = 64;
   qpa.ah_attr.grh.sgid_index = static_cast<uint8_t>(gid_index);
   if (ibv_modify_qp(m_dct, &qpa, IBV_QP_STATE | IBV_QP_MIN_RNR_TIMER |
 		    IBV_QP_AV | IBV_QP_PATH_MTU)) {

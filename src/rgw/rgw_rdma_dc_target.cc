@@ -102,7 +102,9 @@ int Target::open(CephContext* cct, rc::Device& dev, uint64_t dc_key)
   qpa.min_rnr_timer = 12;
   qpa.ah_attr.is_global = 1;
   qpa.ah_attr.port_num = dev.port_num();
-  qpa.ah_attr.grh.hop_limit = 4;
+  // the DCT's ACKs carry this as their RoCE v2 TTL; leave room for a
+  // routed multi-tier fabric, as the RC transport does
+  qpa.ah_attr.grh.hop_limit = 64;
   qpa.ah_attr.grh.sgid_index = static_cast<uint8_t>(dev.gid_idx());
   qpa.ah_attr.grh.traffic_class = 0;
   if (ibv_modify_qp(dct, &qpa, IBV_QP_STATE | IBV_QP_MIN_RNR_TIMER |

@@ -68,6 +68,9 @@ using RawObjSet = std::set<rgw_raw_obj>;
 class RadosWriter : public rgw::sal::DataProcessor {
   Aio *const aio;
   RGWRados *const store;
+  // the window of aio, the most a pulled stripe costs against it: a
+  // larger cost would never fit (see process_pulled())
+  const uint64_t pull_window;
   const RGWBucketInfo& bucket_info;
   RGWObjectCtx& obj_ctx;
   rgw_obj head_obj;
@@ -81,10 +84,7 @@ class RadosWriter : public rgw::sal::DataProcessor {
   RadosWriter(Aio *aio, RGWRados *store,
               const RGWBucketInfo& bucket_info,
               RGWObjectCtx& obj_ctx, const rgw_obj& _head_obj,
-              const DoutPrefixProvider *dpp, optional_yield y, jspan_context& _trace)
-    : aio(aio), store(store), bucket_info(bucket_info),
-      obj_ctx(obj_ctx), head_obj(_head_obj), dpp(dpp), y(y), trace(_trace)
-  {}
+              const DoutPrefixProvider *dpp, optional_yield y, jspan_context& _trace);
   ~RadosWriter();
 
   // add alloc hint to osd

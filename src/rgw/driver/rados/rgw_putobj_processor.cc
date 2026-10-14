@@ -145,6 +145,19 @@ static int process_completed(const AioResultList& completed, RawObjSet *written)
   return error.value_or(0);
 }
 
+RadosWriter::RadosWriter(Aio *aio, RGWRados *store,
+                         const RGWBucketInfo& bucket_info,
+                         RGWObjectCtx& obj_ctx, const rgw_obj& _head_obj,
+                         const DoutPrefixProvider *dpp, optional_yield y,
+                         jspan_context& _trace)
+  : aio(aio), store(store),
+    // the window RadosStore::get_atomic_writer() makes aio with: only
+    // its writer pulls
+    pull_window(store->ctx()->_conf->rgw_put_obj_min_window_size),
+    bucket_info(bucket_info), obj_ctx(obj_ctx), head_obj(_head_obj),
+    dpp(dpp), y(y), trace(_trace)
+{}
+
 void RadosWriter::add_write_hint(librados::ObjectWriteOperation& op) {
   const RGWObjStateManifest *sm = obj_ctx.get_state(head_obj);
   const bool compressed = sm->state.compressed;
@@ -203,10 +216,15 @@ int RadosWriter::process_pulled(
   op.write_full_pulled(len, token, client_ofs, want, result);
   constexpr uint64_t id = 0; // unused
   // the stripe's bytes count against the throttle window as if they
-  // passed through: pulls in flight are bounded the same way
+  // passed through: pulls in flight are bounded the same way. A stripe
+  // larger than the window (rgw_obj_stripe_size over
+  // rgw_put_obj_min_window_size) costs the whole window, so that it
+  // waits for the others to drain instead of failing with -EDEADLK. A
+  // window of 0 fits no write: the pull fails, as it would over HTTP
+  const uint64_t cost = pull_window ? std::min(len, pull_window) : len;
   auto c = aio->get(stripe_obj.obj, Aio::librados_op(stripe_obj.ioctx,
                                                      std::move(op), y, &trace),
-                    len, id);
+                    cost, id);
   return process_completed(c, &written);
 }
 

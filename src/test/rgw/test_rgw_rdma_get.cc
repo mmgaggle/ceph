@@ -23,6 +23,11 @@
 #include "common/ceph_context.h"
 #include "global/global_context.h"
 
+// rgw_op.cc
+std::optional<rgw::cksum::Cksum> stored_full_crc(
+  const rgw::sal::Attrs& attrs, const std::optional<int>& part_num,
+  const std::optional<int>& parts_count);
+
 namespace {
 
 // a cuObject descriptor (raddr:rsize:rkey:lid:qp:has_gid:gid) of a 1 MiB
@@ -94,6 +99,47 @@ public:
   RGWEnv e; \
   req_state s(cct, pe, &e, 0); \
   s.op = OP_GET
+
+using rgw::cksum::Cksum;
+
+// the ETags of a PUT and of a multipart upload of 3 parts
+const std::string ETAG = "0123456789abcdef0123456789abcdef";
+const std::string ETAG_3 = ETAG + "-3";
+
+constexpr char RAW[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+/// the attrs of an object with a stored checksum of the given type and
+/// flags, and the ETag as an attr holds it
+rgw::sal::Attrs cksum_attrs(rgw::cksum::Type type, uint16_t flags,
+                            const std::string& etag)
+{
+  Cksum ck(type, RAW, Cksum::CtorStyle::raw);
+  ck.flags = flags;
+  rgw::sal::Attrs attrs;
+  ck.encode(attrs[RGW_ATTR_CKSUM]);
+  attrs[RGW_ATTR_ETAG].append(etag.c_str(), etag.size() + 1);
+  return attrs;
+}
+
+/// the same, as a release before CRC combining encoded the checksum:
+/// version 1, without flags
+rgw::sal::Attrs legacy_cksum_attrs(rgw::cksum::Type type,
+                                   const std::string& etag)
+{
+  const uint16_t size = Cksum::checksums[uint16_t(type)].digest_size;
+  rgw::sal::Attrs attrs;
+  bufferlist& bl = attrs[RGW_ATTR_CKSUM];
+  ENCODE_START(1, 1, bl);
+  encode(uint16_t(type), bl);
+  encode(size, bl);
+  bl.append(RAW, size);
+  ENCODE_FINISH(bl);
+  attrs[RGW_ATTR_ETAG].append(etag.c_str(), etag.size() + 1);
+  return attrs;
+}
+
+constexpr std::optional<int> WHOLE; // no partNumber
+constexpr std::optional<int> NO_PARTS; // an atomic manifest
 
 } // anonymous namespace
 
@@ -215,6 +261,81 @@ TEST(RgwRdmaGet, OnlyGetObjectIsEligible)
   // which the S3 endpoint ignores
   s.prot_flags &= ~RGW_REST_WEBSITE;
   EXPECT_TRUE(op.rdma_eligible());
+}
+
+TEST(RgwRdmaGet, NoErrorDocumentIsEligible)
+{
+  // the website endpoint serves an ErrorDocument with the 404 of the
+  // error it answers, which the client window cannot carry
+  DEFINE_REQ_STATE(g_ceph_context);
+  s.prot_flags |= RGW_REST_WEBSITE;
+  TestGetObjS3 op(&s);
+  EXPECT_TRUE(op.rdma_eligible());
+  op.set_custom_http_response(404);
+  EXPECT_FALSE(op.rdma_eligible());
+}
+
+TEST(RgwRdmaGet, StoredCrcOfAWholeObject)
+{
+  using rgw::cksum::Type;
+  // a PUT over HTTP stores its CRC without flags
+  auto attrs = cksum_attrs(Type::crc32c, 0, ETAG);
+  auto stored = stored_full_crc(attrs, WHOLE, NO_PARTS);
+  ASSERT_TRUE(stored);
+  EXPECT_EQ(Type::crc32c, stored->type);
+  // and a release before CRC combining with version 1
+  EXPECT_TRUE(stored_full_crc(legacy_cksum_attrs(Type::crc32c, ETAG),
+                              WHOLE, NO_PARTS));
+  // an OSD-direct PUT stores the CRC its OSDs report, under an ETag of
+  // the multipart form
+  attrs = cksum_attrs(Type::crc64nvme, Cksum::FLAG_V2, ETAG_3);
+  stored = stored_full_crc(attrs, WHOLE, NO_PARTS);
+  ASSERT_TRUE(stored);
+  EXPECT_EQ(Type::crc64nvme, stored->type);
+  // CRCs combined from those of the parts
+  EXPECT_TRUE(stored_full_crc(
+      cksum_attrs(Type::crc32c, Cksum::FLAG_V2 | Cksum::FULL_OBJECT_MASK,
+                  ETAG_3),
+      WHOLE, 3));
+
+  // no CRC the OSDs compute
+  EXPECT_FALSE(stored_full_crc(
+      cksum_attrs(Type::sha256, Cksum::FLAG_V2, ETAG), WHOLE, NO_PARTS));
+  attrs.erase(RGW_ATTR_CKSUM);
+  EXPECT_FALSE(stored_full_crc(attrs, WHOLE, NO_PARTS));
+}
+
+TEST(RgwRdmaGet, NoStoredCrcThatIsComposite)
+{
+  using rgw::cksum::Type;
+  // composite by its flags, with or without a multipart manifest
+  const uint16_t composite = Cksum::FLAG_V2 | Cksum::COMPOSITE_MASK;
+  EXPECT_FALSE(stored_full_crc(cksum_attrs(Type::crc32c, composite, ETAG_3),
+                               WHOLE, 3));
+  EXPECT_FALSE(stored_full_crc(cksum_attrs(Type::crc32c, composite, ETAG),
+                               WHOLE, NO_PARTS));
+
+  // a multipart upload's from before CRC combining has no flags
+  const auto legacy = legacy_cksum_attrs(Type::crc32c, ETAG_3);
+  EXPECT_FALSE(stored_full_crc(legacy, WHOLE, 3));
+  // nor once a transition, sync or copy rewrote it with an atomic
+  // manifest, which keeps the ETag
+  EXPECT_FALSE(stored_full_crc(legacy, WHOLE, NO_PARTS));
+  // where part 1 is the whole object
+  EXPECT_FALSE(stored_full_crc(legacy, 1, NO_PARTS));
+}
+
+TEST(RgwRdmaGet, StoredCrcOfAPart)
+{
+  using rgw::cksum::Type;
+  // a part's attrs are its own, but for the ETag of the whole upload
+  EXPECT_TRUE(stored_full_crc(
+      cksum_attrs(Type::crc32c, Cksum::FLAG_FULL_OBJECT, ETAG_3), 2, 3));
+  EXPECT_TRUE(stored_full_crc(legacy_cksum_attrs(Type::crc32c, ETAG_3),
+                              2, 3));
+  // one of a composite upload is reported as composite
+  EXPECT_FALSE(stored_full_crc(
+      cksum_attrs(Type::crc32c, Cksum::FLAG_COMPOSITE, ETAG_3), 2, 3));
 }
 
 #ifdef WITH_CUOBJ

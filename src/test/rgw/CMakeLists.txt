@@ -148,6 +148,17 @@ target_include_directories(unittest_rgw_rdma_get
   SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
 target_link_libraries(unittest_rgw_rdma_get unit-main ${rgw_libs})
 
+# unittest_rgw_sal_filter_rdma
+add_executable(unittest_rgw_sal_filter_rdma test_rgw_sal_filter_rdma.cc)
+add_ceph_unittest(unittest_rgw_sal_filter_rdma)
+target_include_directories(unittest_rgw_sal_filter_rdma
+  SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw")
+if(WITH_RADOSGW_D4N)
+  target_include_directories(unittest_rgw_sal_filter_rdma
+    SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/src/rgw/driver/d4n")
+endif()
+target_link_libraries(unittest_rgw_sal_filter_rdma unit-main ${rgw_libs})
+
 if(WITH_RADOSGW_RADOS)
 # unittest_rgw_etag_verifier
 add_executable(unittest_rgw_etag_verifier test_rgw_etag_verifier.cc)

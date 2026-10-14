@@ -89,6 +89,14 @@ add_executable(unittest_oob_xfer
 add_ceph_unittest(unittest_oob_xfer)
 target_link_libraries(unittest_oob_xfer osd global)
 
+# unittest_oob_read_delivery
+add_executable(unittest_oob_read_delivery
+  test_oob_read_delivery.cc
+  $<TARGET_OBJECTS:unit-main>
+  )
+add_ceph_unittest(unittest_oob_read_delivery)
+target_link_libraries(unittest_oob_read_delivery osd global)
+
 # unittest_ec_gather
 add_executable(unittest_ec_gather
   test_ec_gather.cc

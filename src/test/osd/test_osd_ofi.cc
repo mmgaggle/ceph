@@ -166,6 +166,8 @@ TEST(OSDOfi, PullsAWritePayload)
   EXPECT_LT(ofi.execute_pull("obj", wo.token, ceph::osd::oob::linear_plan(0, n),
 			     n, &none, std::chrono::seconds(2), nullptr), 0);
   EXPECT_EQ("untouched", none.to_str());
+  // the endpoint is whole, and the executor goes on
+  EXPECT_TRUE(ofi.is_available());
 
   // the staging buffer went back to the arena
   EXPECT_EQ(0u, a->stats().in_use);
@@ -179,4 +181,15 @@ TEST(OSDOfi, PullsAWritePayload)
   EXPECT_EQ(-E2BIG, ofi.execute_pull(
 	      "obj", large.token, ceph::osd::oob::linear_plan(0, over),
 	      over, &big, std::chrono::seconds(2), nullptr));
+
+  // nor is one larger than a buffer can hold: it is refused before any
+  // buffer is taken or any read is sent, whatever the window
+  const uint64_t huge = (1ull << 32) + 4096;
+  bool started_huge = true;
+  EXPECT_EQ(-E2BIG, ofi.execute_pull(
+	      "obj", c.token, ceph::osd::oob::linear_plan(0, huge),
+	      huge, &big, std::chrono::seconds(2), &started_huge));
+  EXPECT_FALSE(started_huge);
+  EXPECT_EQ(0u, big.length());
+  EXPECT_TRUE(ofi.is_available());
 }

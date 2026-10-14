@@ -38,6 +38,31 @@ constexpr uint64_t WINDOW_SIZE = 8 << 20;
 constexpr size_t WINDOW_COUNT = 16;
 /// how long OOB_CUTOFF_LATE and OOB_CUTOFF_PAST_TOLERANCE stay raised
 constexpr std::chrono::hours ALERT_PERIOD{1};
+/// the staging allocations and frees that threw, each of which may have
+/// lost a buffer of the arena, which every executor of the daemon shares
+std::atomic<uint64_t> staging_leaked{0};
+
+/// A cut-off that could not reopen the endpoint leaves it broken, though
+/// not unsafe: no write is at risk, but it fails every transfer from then
+/// on. Stop, as for an unsafe endpoint, and say so once. Asked only once
+/// a transfer failed, since the endpoint's stats take a lock.
+void stop_if_broken(CephContext* cct, const LogChannelRef& clog,
+		    const ceph::ofi::Endpoint& ep, std::atomic<bool>& stopped)
+{
+  // broken before unsafe: the endpoint sets unsafe first, and an unsafe
+  // one is check_unsafe()'s to stop, under osd_oob_cutoff_policy
+  if (stopped || !ep.stats().broken || ep.unsafe() ||
+      stopped.exchange(true)) {
+    return;
+  }
+  const std::string why = ep.last_error();
+  derr << "libfabric delivery could not reopen its endpoint: " << why
+       << "; libfabric delivery stopped on this osd" << dendl;
+  if (clog) {
+    clog->error() << "libfabric delivery could not reopen its endpoint: "
+		  << why << "; libfabric delivery stopped";
+  }
+}
 }
 
 int OSDOfi::init(const std::string& provider,
@@ -54,16 +79,28 @@ int OSDOfi::init(const std::string& provider,
   cfg.stage_mem = arena->base();
   cfg.stage_mem_len = arena->size();
   cfg.stage_size = ceph::oob::Arena::MAX;
-  cfg.stage_alloc = [arena](size_t len, uint64_t* off) {
-    const auto s = arena->alloc(len);
-    if (!s) {
-      return -EBUSY;
+  // ofi-rma calls these from C with the endpoint's lock held, stage_free
+  // on its progress thread too, so no exception may leave them; the
+  // arena's free lists allocate as its buffers split and join
+  cfg.stage_alloc = [arena](size_t len, uint64_t* off) noexcept {
+    try {
+      const auto s = arena->alloc(len);
+      if (!s) {
+	return -EBUSY;
+      }
+      *off = s.offset;
+      return 0;
+    } catch (...) {
+      staging_leaked++;
+      return -ENOMEM;
     }
-    *off = s.offset;
-    return 0;
   };
-  cfg.stage_free = [arena](uint64_t off, size_t len) {
-    arena->free(off, len);
+  cfg.stage_free = [arena](uint64_t off, size_t len) noexcept {
+    try {
+      arena->free(off, len);
+    } catch (...) {
+      staging_leaked++;
+    }
   };
   // windows only fill while someone polls a manual-progress provider
   cfg.progress_thread = lend_windows;
@@ -245,6 +282,7 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
 		r == -ENOTRECOVERABLE ?
 		" (" + ep->last_error() + ")" :
 		std::string{}) << dendl;
+    stop_if_broken(cct, clog, *ep, stopped);
     return r;
   }
   plans_completed++;
@@ -277,6 +315,11 @@ ssize_t OSDOfi::execute_pull(const std::string& key,
   if (!ep->reads()) {
     return -EOPNOTSUPP;
   }
+  if (total > ceph::oob::Arena::MAX) {
+    // larger than a staging buffer, which ofi-rma refuses too: take no
+    // buffer of its size for nothing
+    return -E2BIG;
+  }
   std::vector<ceph::ofi::Endpoint::read_t> reads;
   reads.reserve(plan.size());
   for (const auto& tr : plan) {
@@ -300,6 +343,7 @@ ssize_t OSDOfi::execute_pull(const std::string& key,
 		r == -ENOTRECOVERABLE || r == -EACCES ?
 		" (" + ep->last_error() + ")" :
 		std::string{}) << dendl;
+    stop_if_broken(cct, clog, *ep, stopped);
     return r;
   }
   pulls_completed++;
@@ -384,6 +428,7 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("reads_failed", s.reads_failed);
   f->dump_unsigned("peers_inserted", s.peers_inserted);
   f->dump_unsigned("staging_busy", s.staging_busy);
+  f->dump_unsigned("staging_leaked", staging_leaked);
   f->dump_unsigned("timeouts", s.timeouts);
   f->dump_unsigned("cutoffs", s.resets);
   f->dump_unsigned("plans_cut_off", s.plans_cut_off);

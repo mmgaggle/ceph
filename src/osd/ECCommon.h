@@ -210,6 +210,9 @@ struct ECCommon {
     /// shards whose own store failed the read with a media error (-EIO)
     /// and that the decode did without: a client read has them repaired
     std::set<pg_shard_t> media_errors;
+    /// shards read again, inline, after their push into a gather window
+    /// failed (-EBADMSG): a second failure is final
+    std::set<pg_shard_t> gather_rereads;
     std::optional<std::map<std::string, ceph::buffer::list, std::less<>>> attrs;
     std::optional<ceph::buffer::list> omap_header;
     std::optional<std::map<std::string, ceph::buffer::list>> omap_entries;
@@ -226,6 +229,9 @@ struct ECCommon {
       os << "read_result_t(r=" << r << ", errors=" << errors;
       if (!media_errors.empty()) {
         os << ", media_errors=" << media_errors;
+      }
+      if (!gather_rereads.empty()) {
+        os << ", gather_rereads=" << gather_rereads;
       }
       if (attrs) {
         os << ", attrs=" << *(attrs);
@@ -303,11 +309,17 @@ struct ECCommon {
    * returned with that quarantine.
    */
   struct gather_windows_t {
+    /// a sub-read of fewer bytes comes back in its reply: a push would
+    /// cost it a staging buffer, an RDMA write, a crc32c on each side
+    /// and the window's new key, more than the messenger's copy, and
+    /// hold one of the few windows the OSD can lend
+    static constexpr uint64_t min_bytes = 64 << 10;
+
     OSDOobExecutor* exec = nullptr;
     uint64_t quarantine_ms = 0;
     std::map<pg_shard_t, OSDOobExecutor::window_t> windows;
-    /// a window held something other than its shard's push: the reads
-    /// this gather still sends, to rebuild what it lost, come back inline
+    /// a push failed: the reads this gather still sends, to read that
+    /// shard again or to rebuild what it lost, come back inline
     bool inline_only = false;
 
     gather_windows_t() = default;
@@ -366,10 +378,13 @@ struct ECCommon {
 
     /// windows peer shards push their reads into (oob_cluster_transport)
     gather_windows_t gather;
-    /// whether this read lends gather windows. Only a client read does:
-    /// when a push fails its checksum, that shard's read fails, and a
-    /// client read decodes from the other shards, which the read of a
-    /// partial write, needing those very shards, cannot
+    /// whether this read lends gather windows. Only a client read that
+    /// is not a fast read does. When a push fails its checksum, a client
+    /// read reads that shard again inline, and if that fails too
+    /// decodes from the other shards, which the read of a partial
+    /// write, needing those very shards, cannot. A fast read completes
+    /// once enough shards replied, and the windows of those that had
+    /// not would stay out of use for the quarantine
     bool lends_windows = false;
 
     ReadOp(

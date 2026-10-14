@@ -156,8 +156,9 @@ public:
   virtual void window_sync() {}
 
   /// a shard's push into one of our windows did not match the shard's
-  /// checksum of it: the read went to the other shards instead. Counted
-  /// here, whichever transport lent the window.
+  /// checksum of it: the shard is read again once, inline, and the read
+  /// decodes around it only if that fails too. Counted here, whichever
+  /// transport lent the window.
   void note_gather_crc_mismatch() { gather_crc_mismatch++; }
   uint64_t get_gather_crc_mismatch() const { return gather_crc_mismatch; }
 

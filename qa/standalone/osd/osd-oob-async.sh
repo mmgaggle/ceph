@@ -514,10 +514,10 @@ function TEST_gather_pushes_match() {
 }
 
 ##
-# (S3) A fast read completes with the shards that replied first: one
-# whose push is held does not hold it up. The primary returns the window
-# it lent that shard quarantined, since the push may still land, and
-# drops the shard's late reply.
+# (S3) A fast read lends no gather windows: it completes with the shards
+# that replied first, and a window lent to a later shard would stay
+# quarantined. Its shards reply inline, so a held push has nothing to
+# hold, and the read does not wait.
 #
 function TEST_fast_read_with_held_shard() {
     local dir=$1
@@ -530,32 +530,20 @@ function TEST_fast_read_with_held_shard() {
     local shard
     shard=$(gather_shard ecpool obj) || return 1
     ceph tell osd.$shard config set osd_debug_oob_delay_done_ms 3000 || return 1
+    local started=$(ofi_stat $shard plans_started)
+    local completed=$(ofi_stat $shard plans_completed)
+    local acquired=$(ofi_stat $primary windows_acquired)
     local quarantined=$(ofi_stat $primary windows_rekeyed_quarantined)
-    local pushed=$(ofi_stat $shard plans_completed)
 
     local out
     out=$(ceph_test_osd_oob_read get ecpool $SIZE obj) || return 1
     echo "$out"
     expect_landed "$out" obj || return 1
     test $(read_field "$out" obj ms) -lt 2000 || return 1
-    # the held push ends, and its reply comes in after the read
-    for i in $(seq 100) ; do
-        test $(ofi_stat $shard plans_completed) -gt $pushed && \
-            test $(running_transfers $shard) = 0 && break
-        sleep 0.1
-    done
-    test $(running_transfers $shard) = 0 || return 1
-    sleep 1
-    test $(ofi_stat $shard plans_completed) = $((pushed + 1)) || return 1
-    test $(ofi_stat $primary windows_rekeyed_quarantined) -gt $quarantined || return 1
-    # the read was over when the shard's reply came, with the extents it
-    # pushed: the primary dropped it
-    local log=$dir/osd.$primary.log
-    local tid=$(grep -o "<== osd.$shard .* MOSDECSubOpReadReply(.*ECSubReadReply(tid=[0-9]*" \
-        $log | tail -1 | grep -o "[0-9]*$")
-    test -n "$tid" || return 1
-    grep -q "handle_sub_read_reply: dropped ECSubReadReply(tid=$tid, .*pushed=1" \
-        $log || return 1
+    test $(ofi_stat $shard plans_started) = $started || return 1
+    test $(ofi_stat $shard plans_completed) = $completed || return 1
+    test $(ofi_stat $primary windows_acquired) = $acquired || return 1
+    test $(ofi_stat $primary windows_rekeyed_quarantined) = $quarantined || return 1
     test $(ofi_stat $primary gather_crc_mismatch) = 0 || return 1
 }
 

@@ -3,11 +3,13 @@
 # Out-of-band read pushes on the OSD's transfer threads
 # (osd_oob_transfer_threads): an op thread hands the push off and goes
 # on, and the reply leaves from the transfer thread once the push is
-# over. The client windows are on the libfabric tcp provider, on
-# 127.0.0.1, so this needs a build with WITH_OOB_OFI, whose
-# ceph_test_osd_oob_read is the client. A libfabric whose memory
-# registration cache monitor needs a GPU wants FI_MR_CACHE_MONITOR=disabled
-# in the environment.
+# over. The same for the push of an erasure-coded shard into its
+# primary's gather window (oob_cluster_transport), whose sub-read reply
+# leaves once the push is over. The client windows and the gather
+# windows are on the libfabric tcp provider, on 127.0.0.1, so this needs
+# a build with WITH_OOB_OFI, whose ceph_test_osd_oob_read is the client.
+# A libfabric whose memory registration cache monitor needs a GPU wants
+# FI_MR_CACHE_MONITOR=disabled in the environment.
 #
 # Each pool has one PG, so that every object of a test shares the PG of
 # the read whose push is held (osd_debug_oob_delay_done_ms).
@@ -82,6 +84,23 @@ function xfer_stat() {
         perf dump oob_xfer | jq -r ".oob_xfer.$field"
 }
 
+# the transfers osd.**id** runs now, on its transfer threads or inline
+function running_transfers() {
+    local id=$1
+    CEPH_ARGS='' ceph --admin-daemon $(get_asok_path osd.$id) \
+        dump_oob_transfers | jq -r '(.oob_transfers // .).running | length'
+}
+
+# wait up to 10 s until osd.**id** runs a transfer
+function wait_for_transfer() {
+    local id=$1
+    for i in $(seq 100) ; do
+        test $(running_transfers $id) -gt 0 && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 # a replicated pool of one PG, on all three OSDs
 function create_repl_pool() {
     local pool=$1
@@ -98,6 +117,27 @@ function create_ec_pool_k2m1() {
     ceph osd pool set $pool allow_ec_overwrites true || return 1
     ceph osd pool set $pool allow_ec_optimizations true || return 1
     wait_for_clean || return 1
+}
+
+# the OSD that holds shard **shard** of the PG of **oid**
+function shard_osd() {
+    local pool=$1
+    local oid=$2
+    local shard=$3
+    ceph osd map $pool $oid -f json | jq -r ".acting[$shard]"
+}
+
+##
+# The OSD whose push into the primary's gather window an object of
+# **pool** needs: the primary reads its own shard, shard 0, and the
+# other data shard, shard 1, from its OSD. A 4 KiB read at offset 0
+# needs shard 0 only, so it involves no push.
+#
+function gather_shard() {
+    local pool=$1
+    local oid=$2
+    test "$(shard_osd $pool $oid 0)" = "$(get_primary $pool $oid)" || return 1
+    shard_osd $pool $oid 1
 }
 
 ##
@@ -359,6 +399,345 @@ function TEST_push_past_lease_declines() {
     echo "$out"
     expect_landed "$out" obj || return 1
     test $(ofi_stat $primary plans_started) = $((started + 1)) || return 1
+}
+
+##
+# (S3) While a peer shard holds its push into the primary's gather window
+# for 4 s, its PG serves other ops: 100 writes of whole stripes, which
+# reach every shard, finish, and no op thread of the shard times out.
+# The held read gets its object once the push is over. With **threads**
+# at 0 the shard's op thread holds the PG for the push, and the writes
+# wait for it. Reads of the PG would wait either way: an
+# erasure-coded primary completes the client reads of a PG in order.
+#
+function held_shard_push() {
+    local dir=$1
+    local threads=$2
+
+    run_oob_cluster $dir $threads --oob_cluster_transport=tcp || return 1
+    create_ec_pool_k2m1 ecpool || return 1
+    ceph_test_osd_oob_read write ecpool $SIZE obj || return 1
+    local primary=$(get_primary ecpool obj)
+    local shard
+    shard=$(gather_shard ecpool obj) || return 1
+    ceph tell osd.$shard config set osd_debug_oob_delay_done_ms 4000 || return 1
+    local queued=$(xfer_stat $shard queue_lat.avgcount)
+    local pushed=$(ofi_stat $shard plans_completed)
+    local others=$(for i in $(seq 100) ; do echo -n "other.$i " ; done)
+
+    timeout 60 ceph_test_osd_oob_read get ecpool $SIZE obj > $dir/get.out &
+    local pid=$!
+    wait_for_transfer $shard || return 1
+    local start=$(date +%s%3N)
+    ceph_test_osd_oob_read write ecpool 65536 $others || return 1
+    local took=$(( $(date +%s%3N) - start ))
+    local held=$(running_transfers $shard)
+    echo "the writes took $took ms"
+    wait $pid || return 1
+    cat $dir/get.out
+    expect_landed "$(cat $dir/get.out)" obj || return 1
+    test $(read_field "$(cat $dir/get.out)" obj ms) -ge 4000 || return 1
+    test $(ofi_stat $shard plans_completed) = $((pushed + 1)) || return 1
+    test $(ofi_stat $primary gather_crc_mismatch) = 0 || return 1
+    if [ $threads = 0 ] ; then
+        # the writes waited for the shard's op thread
+        test $took -ge 2000 || return 1
+        test $(xfer_stat $shard queue_lat.avgcount) = 0 || return 1
+        return 0
+    fi
+    # the writes were done while the push was still held, and did not
+    # wait for it
+    test $held -gt 0 || return 1
+    test $took -lt 2000 || return 1
+    # on a transfer thread
+    test $(xfer_stat $shard queue_lat.avgcount) -gt $queued || return 1
+    grep -q "sub-read .* pushed $((SIZE / 2)) bytes to the primary" \
+        $dir/osd.$shard.log || return 1
+    # past the 3 s of osd_op_thread_timeout, heartbeat checks included
+    sleep 2
+    ! grep -q "osd_op_tp.*had timed out" $dir/osd.$shard.log || return 1
+}
+
+function TEST_held_shard_push_frees_shard() {
+    held_shard_push $1 4
+}
+
+function TEST_inline_shard_push_holds_the_pg() {
+    held_shard_push $1 0
+}
+
+##
+# (S3) Many reads of an erasure-coded pool whose shards push from their
+# transfer threads, ten at a time: every one gets its object, and no
+# window the primary takes holds anything but its shard's push.
+#
+function TEST_gather_pushes_match() {
+    local dir=$1
+
+    run_oob_cluster $dir 4 --oob_cluster_transport=tcp || return 1
+    create_ec_pool_k2m1 ecpool || return 1
+    local objs="obj0 obj1 obj2 obj3 obj4 obj5 obj6 obj7 obj8 obj9"
+    ceph_test_osd_oob_read write ecpool $SIZE $objs || return 1
+    local primary=$(get_primary ecpool obj0)
+    local shard
+    shard=$(gather_shard ecpool obj0) || return 1
+    local pushed=$(ofi_stat $shard plans_completed)
+    local queued=$(xfer_stat $shard queue_lat.avgcount)
+
+    for i in $(seq 100) ; do
+        ceph_test_osd_oob_read get ecpool $SIZE $objs > $dir/get.out || {
+            cat $dir/get.out ; return 1 ; }
+    done
+    cat $dir/get.out
+    # 1000 reads, each pushed by the shard from a transfer thread
+    test $(( $(ofi_stat $shard plans_completed) - pushed )) -ge 1000 || return 1
+    test $(( $(xfer_stat $shard queue_lat.avgcount) - queued )) -ge 1000 || return 1
+    test $(ofi_stat $shard plans_failed) = 0 || return 1
+    for id in 0 1 2 ; do
+        test $(ofi_stat $id gather_crc_mismatch) = 0 || return 1
+    done
+}
+
+##
+# (S3) A fast read completes with the shards that replied first: one
+# whose push is held does not hold it up. The primary returns the window
+# it lent that shard quarantined, since the push may still land, and
+# drops the shard's late reply.
+#
+function TEST_fast_read_with_held_shard() {
+    local dir=$1
+
+    run_oob_cluster $dir 4 --oob_cluster_transport=tcp || return 1
+    create_ec_pool_k2m1 ecpool || return 1
+    ceph osd pool set ecpool fast_read 1 || return 1
+    ceph_test_osd_oob_read write ecpool $SIZE obj || return 1
+    local primary=$(get_primary ecpool obj)
+    local shard
+    shard=$(gather_shard ecpool obj) || return 1
+    ceph tell osd.$shard config set osd_debug_oob_delay_done_ms 3000 || return 1
+    local quarantined=$(ofi_stat $primary windows_rekeyed_quarantined)
+    local pushed=$(ofi_stat $shard plans_completed)
+
+    local out
+    out=$(ceph_test_osd_oob_read get ecpool $SIZE obj) || return 1
+    echo "$out"
+    expect_landed "$out" obj || return 1
+    test $(read_field "$out" obj ms) -lt 2000 || return 1
+    # the held push ends, and its reply comes in after the read
+    for i in $(seq 100) ; do
+        test $(ofi_stat $shard plans_completed) -gt $pushed && \
+            test $(running_transfers $shard) = 0 && break
+        sleep 0.1
+    done
+    test $(running_transfers $shard) = 0 || return 1
+    sleep 1
+    test $(ofi_stat $shard plans_completed) = $((pushed + 1)) || return 1
+    test $(ofi_stat $primary windows_rekeyed_quarantined) -gt $quarantined || return 1
+    # the read was over when the shard's reply came, with the extents it
+    # pushed: the primary dropped it
+    local log=$dir/osd.$primary.log
+    local tid=$(grep -o "<== osd.$shard .* MOSDECSubOpReadReply(.*ECSubReadReply(tid=[0-9]*" \
+        $log | tail -1 | grep -o "[0-9]*$")
+    test -n "$tid" || return 1
+    grep -q "handle_sub_read_reply: dropped ECSubReadReply(tid=$tid, .*pushed=1" \
+        $log || return 1
+    test $(ofi_stat $primary gather_crc_mismatch) = 0 || return 1
+}
+
+##
+# (S3) An interval change while a shard holds its push: the shard sends
+# its reply once the push is over, from the old interval, and the
+# primary drops it. The read runs again in the new interval, and gets
+# its object.
+#
+function TEST_repeer_during_held_shard_push() {
+    local dir=$1
+
+    run_oob_cluster $dir 4 --oob_cluster_transport=tcp || return 1
+    create_ec_pool_k2m1 ecpool || return 1
+    ceph_test_osd_oob_read write ecpool $SIZE obj || return 1
+    local primary=$(get_primary ecpool obj)
+    local pgid=$(get_pg ecpool obj)
+    local shard
+    shard=$(gather_shard ecpool obj) || return 1
+    ceph tell osd.$shard config set osd_debug_oob_delay_done_ms 3000 || return 1
+    local pushed=$(ofi_stat $shard plans_completed)
+
+    timeout 60 ceph_test_osd_oob_read get ecpool $SIZE obj > $dir/get.out &
+    local pid=$!
+    wait_for_transfer $shard || return 1
+    ceph pg repeer $pgid || return 1
+    wait $pid || return 1
+    cat $dir/get.out
+    test $(grep -c '^get ' $dir/get.out) = 1 || return 1
+    expect_landed "$(cat $dir/get.out)" obj || return 1
+    # both pushes ran to their end on the shard
+    test $(ofi_stat $shard plans_completed) = $((pushed + 2)) || return 1
+    test $(ofi_stat $primary gather_crc_mismatch) = 0 || return 1
+    # the reply to the first came from before the repeer: the primary
+    # dropped it, and its read pipeline saw only the other shards'
+    # replies to that read
+    local log=$dir/osd.$primary.log
+    local late=$(grep -m1 "<== osd.$shard .* MOSDECSubOpReadReply(" $log)
+    local tid=$(echo "$late" | grep -o "ECSubReadReply(tid=[0-9]*" | \
+        grep -o "[0-9]*$")
+    local epoch=$(echo "$late" | grep -o "MOSDECSubOpReadReply([^ ]* [0-9]*" | \
+        grep -o "[0-9]*$")
+    test -n "$tid" -a -n "$epoch" || return 1
+    grep -q "can_discard_replica_op pg changed .* after $epoch, dropping" \
+        $log || return 1
+    local got=$(grep -c "<== osd.* MOSDECSubOpReadReply(.*ECSubReadReply(tid=$tid," $log)
+    local seen=$(grep -c "handle_sub_read_reply: reply ECSubReadReply(tid=$tid," $log)
+    test $seen = $((got - 1)) || return 1
+    for id in 0 1 2 ; do
+        kill -0 $(cat $dir/osd.$id.pid) || return 1
+        ! grep -q "FAILED ceph_assert\|Caught signal" $dir/osd.$id.log || return 1
+    done
+}
+
+##
+# (S3) A slow stop of a shard while it holds its push: the stop waits for
+# the push, at most until its land_by, and the reply still goes out. The
+# primary, which learns that the shard is down, reads the object from
+# the other shards.
+#
+function TEST_slow_stop_during_held_shard_push() {
+    local dir=$1
+
+    run_oob_cluster $dir 4 --oob_cluster_transport=tcp \
+        --osd_fast_shutdown=false || return 1
+    create_ec_pool_k2m1 ecpool || return 1
+    ceph_test_osd_oob_read write ecpool $SIZE obj || return 1
+    local shard
+    shard=$(gather_shard ecpool obj) || return 1
+    # long enough that the stop reaches the transfer threads before the
+    # held push ends, and within the lease plus drain
+    ceph tell osd.$shard config set osd_debug_oob_delay_done_ms 6000 || return 1
+
+    timeout 60 ceph_test_osd_oob_read get ecpool $SIZE obj > $dir/get.out &
+    local pid=$!
+    wait_for_transfer $shard || return 1
+    kill_daemons $dir TERM osd.$shard || return 1
+    wait $pid || return 1
+    cat $dir/get.out
+    test "$(read_field "$(cat $dir/get.out)" obj r)" = 0 || return 1
+    test "$(read_field "$(cat $dir/get.out)" obj data)" = ok || return 1
+
+    local log=$dir/osd.$shard.log
+    grep -q "stopping: shedding 0 queued jobs, waiting for 1 running" $log || return 1
+    grep -q "sub-read .* pushed $((SIZE / 2)) bytes to the primary" $log || return 1
+    grep -q "oob transfer threads stopped" $log || return 1
+    ! grep -q "FAILED ceph_assert\|Caught signal" $log || return 1
+    local shed=$(grep -m1 "stopping: shedding" $log | cut -d' ' -f1)
+    local stopped=$(grep -m1 "oob transfer threads stopped" $log | cut -d' ' -f1)
+    local waited=$(( $(date -d "$stopped" +%s%3N) - $(date -d "$shed" +%s%3N) ))
+    echo "the transfer threads stopped ${waited} ms after the shed"
+    test $waited -le 8000 || return 1
+}
+
+##
+# (S3) A shard push that a transfer thread can start only after the
+# pool's lease, counted from when the shard received the sub-read,
+# starts nothing: the shard replies inline and says so, and the primary
+# takes its window back clean. Within the lease, the shard pushes again.
+#
+function TEST_shard_push_past_lease_declines() {
+    local dir=$1
+
+    run_oob_cluster $dir 4 --oob_cluster_transport=tcp || return 1
+    create_ec_pool_k2m1 ecpool || return 1
+    ceph osd pool set ecpool rdma_delivery_lease 1 || return 1
+    ceph_test_osd_oob_read write ecpool $SIZE obj || return 1
+    local primary=$(get_primary ecpool obj)
+    local pgid=$(get_pg ecpool obj)
+    local shard
+    shard=$(gather_shard ecpool obj) || return 1
+    # each push waits 1.5 s on the shard's transfer thread before it may
+    # start
+    ceph tell osd.$shard config set osd_debug_oob_delay_post_ms 1500 || return 1
+    local started=$(ofi_stat $shard plans_started)
+    local pushed=$(ofi_stat $shard plans_completed)
+    local expired=$(xfer_stat $shard expired)
+    local lent=$(ofi_stat $primary windows_acquired)
+    local quarantined=$(ofi_stat $primary windows_rekeyed_quarantined)
+
+    local out
+    out=$(ceph_test_osd_oob_read get ecpool $SIZE obj) || return 1
+    echo "$out"
+    # the primary's own push was past the lease by then too
+    expect_declined "$out" obj || return 1
+    test $(ofi_stat $shard plans_started) = $started || return 1
+    test $(xfer_stat $shard expired) = $((expired + 1)) || return 1
+    grep -q "sub-read [0-9]* of ${pgid}s1: push not started (-110), replying inline" \
+        $dir/osd.$shard.log || return 1
+    # the primary lent the shard a window, and took it back clean
+    test $(ofi_stat $primary windows_acquired) -gt $lent || return 1
+    test $(ofi_stat $primary windows_rekeyed_quarantined) = $quarantined || return 1
+
+    # within the lease, it goes out of band again
+    ceph tell osd.$shard config set osd_debug_oob_delay_post_ms 0 || return 1
+    out=$(ceph_test_osd_oob_read get ecpool $SIZE obj) || return 1
+    echo "$out"
+    expect_landed "$out" obj || return 1
+    test $(ofi_stat $shard plans_started) = $((started + 1)) || return 1
+    test $(ofi_stat $shard plans_completed) = $((pushed + 1)) || return 1
+    test $(ofi_stat $primary windows_rekeyed_quarantined) = $quarantined || return 1
+    test $(ofi_stat $primary gather_crc_mismatch) = 0 || return 1
+}
+
+##
+# (S3) A shard push that the shard's transfer service refuses starts
+# nothing: the shard replies inline and says so, and the primary takes
+# its window back clean. Each OSD takes one transfer at a time
+# (osd_oob_transfer_queue_max), and the shard holds the push of a first
+# read when a second read of the same PG comes. The second read waits
+# for the first on the primary, and its own push from there may be
+# refused too, so it gets its object either way.
+#
+function TEST_refused_shard_push_declines() {
+    local dir=$1
+
+    run_oob_cluster $dir 4 --oob_cluster_transport=tcp \
+        --osd_oob_transfer_queue_max=1 || return 1
+    create_ec_pool_k2m1 ecpool || return 1
+    ceph_test_osd_oob_read write ecpool $SIZE obj obj2 || return 1
+    local primary=$(get_primary ecpool obj)
+    local pgid=$(get_pg ecpool obj)
+    local shard
+    shard=$(gather_shard ecpool obj) || return 1
+    ceph tell osd.$shard config set osd_debug_oob_delay_done_ms 3000 || return 1
+    local started=$(ofi_stat $shard plans_started)
+    local pushed=$(ofi_stat $shard plans_completed)
+    local refused=$(xfer_stat $shard refused)
+    local lent=$(ofi_stat $primary windows_acquired)
+    local quarantined=$(ofi_stat $primary windows_rekeyed_quarantined)
+
+    timeout 60 ceph_test_osd_oob_read get ecpool $SIZE obj > $dir/get.out &
+    local pid=$!
+    wait_for_transfer $shard || return 1
+    # the held push, under the shard's own PG
+    test "$(CEPH_ARGS='' ceph --admin-daemon $(get_asok_path osd.$shard) \
+        dump_oob_transfers | jq -r '(.oob_transfers // .).running[0].pgid')" \
+        = ${pgid}s1 || return 1
+    local out
+    out=$(timeout 60 ceph_test_osd_oob_read get ecpool $SIZE obj2) || return 1
+    echo "$out"
+    test "$(read_field "$out" obj2 r)" = 0 || return 1
+    test "$(read_field "$out" obj2 data)" = ok || return 1
+    wait $pid || return 1
+    cat $dir/get.out
+    expect_landed "$(cat $dir/get.out)" obj || return 1
+
+    test $(xfer_stat $shard refused) = $((refused + 1)) || return 1
+    grep -q "push of sub-read [0-9]* refused (.*), replying inline" \
+        $dir/osd.$shard.log || return 1
+    # only the first read's push went out
+    test $(ofi_stat $shard plans_started) = $((started + 1)) || return 1
+    test $(ofi_stat $shard plans_completed) = $((pushed + 1)) || return 1
+    # the primary lent a window for each read, and took both back clean
+    test $(ofi_stat $primary windows_acquired) -ge $((lent + 2)) || return 1
+    test $(ofi_stat $primary windows_rekeyed_quarantined) = $quarantined || return 1
+    test $(ofi_stat $primary gather_crc_mismatch) = 0 || return 1
 }
 
 main osd-oob-async "$@"

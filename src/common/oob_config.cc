@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -119,6 +120,45 @@ std::string device_of_iface(const std::string& sysfs, const std::string& iface)
   return devs.empty() ? std::string{} : devs.front();
 }
 
+/// find_rdma_port(), following at most depth levels of bonds
+bool port_under(const std::string& sysfs, const std::string& iface,
+		int depth, std::string* device, unsigned* port)
+{
+  const auto dir = fs::path(sysfs) / "class/net" / iface;
+  if (auto d = device_of_iface(sysfs, iface); !d.empty()) {
+    // dev_port numbers the ports of the device from 0, as IPoIB and
+    // mlx4 set it
+    const auto s = read_line(dir / "dev_port");
+    unsigned p = 0;
+    const auto [end, err] = std::from_chars(s.data(), s.data() + s.size(), p);
+    *device = std::move(d);
+    *port = err == std::errc{} && end == s.data() + s.size() && p < 255 ?
+      p + 1 : 1;
+    return true;
+  }
+  // a bond names no device, but its slaves do. Only for InfiniBand
+  // (ARPHRD_INFINIBAND): an Ethernet address that no RoCE GID holds has
+  // no GID to use
+  if (depth == 0 || read_line(dir / "type") != "32") {
+    return false;
+  }
+  std::vector<std::string> lower;
+  std::error_code ec;
+  for (const auto& e : fs::directory_iterator(dir, ec)) {
+    const auto n = e.path().filename().string();
+    if (n.starts_with("lower_")) {
+      lower.push_back(n.substr(6));
+    }
+  }
+  std::sort(lower.begin(), lower.end());
+  if (auto a = read_line(dir / "bonding/active_slave"); !a.empty()) {
+    lower.insert(lower.begin(), std::move(a));
+  }
+  return std::any_of(lower.begin(), lower.end(), [&](const auto& l) {
+    return port_under(sysfs, l, depth - 1, device, port);
+  });
+}
+
 /// what is wrong with oob_network, empty when nothing is: an entry that
 /// is not a subnet, on which find_ip_in_subnet_list() would exit rather
 /// than return, or no entry, which would match every address (and with
@@ -214,8 +254,11 @@ bool find_rdma_gid(const std::string& sysfs, const std::string& addr,
       for (const unsigned p : numbered(pdir)) {
 	const auto gdir = pdir / std::to_string(p);
 	for (const unsigned i : numbered(gdir / "gids")) {
+	  // an unused entry is all zeros, and holds no address
+	  static constexpr uint8_t unused[16] = {};
 	  uint8_t gid[16];
 	  if (!parse_gid(read_line(gdir / "gids" / std::to_string(i)), gid) ||
+	      std::memcmp(gid, unused, 16) == 0 ||
 	      std::memcmp(gid, want, 16) != 0) {
 	    continue;
 	  }
@@ -233,6 +276,13 @@ bool find_rdma_gid(const std::string& sysfs, const std::string& addr,
     }
   }
   return false;
+}
+
+bool find_rdma_port(const std::string& sysfs, const std::string& iface,
+		    std::string* device, unsigned* port)
+{
+  // a bond of bonds is as deep as it goes
+  return port_under(sysfs, iface, 2, device, port);
 }
 
 int resolve(CephContext* cct, std::string_view fallback, location_t* out,
@@ -298,11 +348,8 @@ int resolve(CephContext* cct, std::string_view fallback, location_t* out,
 		     &out->gid_index) &&
       !out->iface.empty()) {
     // InfiniBand: the GIDs do not hold the IPoIB address, but the
-    // interface names its device
-    out->rdma_device = device_of_iface("/sys", out->iface);
-    if (!out->rdma_device.empty()) {
-      out->rdma_port = 1;
-    }
+    // interface, or a bond's slave, names its device and port
+    find_rdma_port("/sys", out->iface, &out->rdma_device, &out->rdma_port);
   }
   return 0;
 }

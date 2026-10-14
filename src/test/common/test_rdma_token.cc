@@ -145,7 +145,8 @@ TEST(RdmaToken, OobTransports)
 
 namespace {
 
-/// a fake sysfs with one RoCE device, two ports, and GID tables
+/// a fake sysfs with RDMA devices, their GID tables, and network
+/// interfaces
 struct fake_sysfs {
   std::filesystem::path root;
   fake_sysfs() {
@@ -164,6 +165,33 @@ struct fake_sysfs {
     if (!type.empty()) {
       std::ofstream(p / "gid_attrs/types" / std::to_string(i)) << type << "\n";
     }
+  }
+  /// a network interface of a type (32 for InfiniBand, 1 for Ethernet),
+  /// on a port of an RDMA device, or on none
+  void netdev(const std::string& name, const std::string& type,
+	      const std::string& dev_port, const std::string& rdma_dev) {
+    const auto p = root / "class/net" / name;
+    std::filesystem::create_directories(p);
+    std::ofstream(p / "type") << type << "\n";
+    if (!dev_port.empty()) {
+      std::ofstream(p / "dev_port") << dev_port << "\n";
+    }
+    if (!rdma_dev.empty()) {
+      std::filesystem::create_directories(p / "device/infiniband" / rdma_dev);
+    }
+  }
+  /// a slave of a bond
+  void slave(const std::string& bond, const std::string& name) {
+    const auto p = root / "class/net" / bond;
+    std::filesystem::create_directories(p);
+    std::filesystem::create_directory_symlink("../" + name,
+					      p / ("lower_" + name));
+  }
+  /// the active slave of a bond, or none
+  void active(const std::string& bond, const std::string& name) {
+    const auto p = root / "class/net" / bond / "bonding";
+    std::filesystem::create_directories(p);
+    std::ofstream(p / "active_slave") << name << "\n";
   }
 };
 
@@ -204,6 +232,85 @@ TEST(OobConfig, FindRdmaGid)
   EXPECT_FALSE(find_rdma_gid(fs.root.string(), "mlx5_0", &dev, &port, &idx));
   EXPECT_FALSE(find_rdma_gid((fs.root / "none").string(), "10.90.0.1", &dev, &port,
 			     &idx));
+  // an unused entry holds no address, not even the unspecified one
+  EXPECT_FALSE(find_rdma_gid(fs.root.string(), "::", &dev, &port, &idx));
+}
+
+// No GID holds an IPoIB address: the interface names the device, its
+// dev_port the port, and for a bond its active slave both, else its
+// first slave by name that has a device.
+TEST(OobConfig, FindRdmaPort)
+{
+  using ceph::oob::find_rdma_port;
+  fake_sysfs fs;
+  // the two ports of one device, and a device with one port
+  fs.netdev("ib0", "32", "0", "mlx4_0");
+  fs.netdev("ib1", "32", "1", "mlx4_0");
+  fs.netdev("ib2", "32", "0", "mlx5_0");
+  // no dev_port
+  fs.netdev("ib3", "32", "", "mlx5_1");
+
+  std::string dev;
+  unsigned port = 0;
+  ASSERT_TRUE(find_rdma_port(fs.root.string(), "ib0", &dev, &port));
+  EXPECT_EQ("mlx4_0", dev);
+  EXPECT_EQ(1u, port);
+  ASSERT_TRUE(find_rdma_port(fs.root.string(), "ib1", &dev, &port));
+  EXPECT_EQ("mlx4_0", dev);
+  EXPECT_EQ(2u, port);
+  ASSERT_TRUE(find_rdma_port(fs.root.string(), "ib2", &dev, &port));
+  EXPECT_EQ("mlx5_0", dev);
+  EXPECT_EQ(1u, port);
+  ASSERT_TRUE(find_rdma_port(fs.root.string(), "ib3", &dev, &port));
+  EXPECT_EQ("mlx5_1", dev);
+  EXPECT_EQ(1u, port);
+
+  // an active-backup bond of IPoIB interfaces: its active slave
+  fs.netdev("bond0", "32", "0", "");
+  fs.slave("bond0", "ib0");
+  fs.slave("bond0", "ib1");
+  fs.slave("bond0", "ib2");
+  fs.active("bond0", "ib2");
+  ASSERT_TRUE(find_rdma_port(fs.root.string(), "bond0", &dev, &port));
+  EXPECT_EQ("mlx5_0", dev);
+  EXPECT_EQ(1u, port);
+  // and its port
+  fs.active("bond0", "ib1");
+  ASSERT_TRUE(find_rdma_port(fs.root.string(), "bond0", &dev, &port));
+  EXPECT_EQ("mlx4_0", dev);
+  EXPECT_EQ(2u, port);
+  // with no active slave, the first slave by name that has a device
+  fs.netdev("ia0", "32", "0", "");
+  fs.slave("bond0", "ia0");
+  fs.active("bond0", "");
+  ASSERT_TRUE(find_rdma_port(fs.root.string(), "bond0", &dev, &port));
+  EXPECT_EQ("mlx4_0", dev);
+  EXPECT_EQ(1u, port);
+  // a bond of bonds, but no deeper
+  fs.netdev("bond2", "32", "0", "");
+  fs.slave("bond2", "bond0");
+  fs.active("bond0", "ib1");
+  ASSERT_TRUE(find_rdma_port(fs.root.string(), "bond2", &dev, &port));
+  EXPECT_EQ("mlx4_0", dev);
+  EXPECT_EQ(2u, port);
+  fs.netdev("bond3", "32", "0", "");
+  fs.slave("bond3", "bond2");
+  EXPECT_FALSE(find_rdma_port(fs.root.string(), "bond3", &dev, &port));
+
+  // an Ethernet bond: a RoCE GID holds its address, or nothing does
+  fs.netdev("eth0", "1", "0", "mlx5_2");
+  fs.netdev("bond1", "1", "0", "");
+  fs.slave("bond1", "eth0");
+  fs.active("bond1", "eth0");
+  dev.clear();
+  port = 0;
+  EXPECT_FALSE(find_rdma_port(fs.root.string(), "bond1", &dev, &port));
+  // no RDMA device, or no such interface
+  fs.netdev("eth1", "1", "0", "");
+  EXPECT_FALSE(find_rdma_port(fs.root.string(), "eth1", &dev, &port));
+  EXPECT_FALSE(find_rdma_port(fs.root.string(), "ib9", &dev, &port));
+  EXPECT_EQ("", dev);
+  EXPECT_EQ(0u, port);
 }
 
 TEST(OobConfig, OfiWhere)

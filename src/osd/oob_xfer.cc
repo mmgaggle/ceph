@@ -89,11 +89,13 @@ Transfers::Transfers(CephContext* cct, unsigned threads, unsigned max_jobs,
 	    "Out-of-band transfers running");
   b.add_u64_counter(l_oob_xfer_refused, "refused",
 		    "Out-of-band transfers refused over a cap or while "
-		    "stopping, and delivered inline", nullptr,
+		    "stopping: a push is delivered inline, a pull fails its "
+		    "write", nullptr,
 		    PerfCountersBuilder::PRIO_USEFUL);
   b.add_u64_counter(l_oob_xfer_expired, "expired",
 		    "Out-of-band transfers taken past the time they could "
-		    "start, and delivered inline", nullptr,
+		    "start: a push is delivered inline, a pull fails its "
+		    "write", nullptr,
 		    PerfCountersBuilder::PRIO_USEFUL);
   b.add_u64_counter(l_oob_xfer_shed, "shed",
 		    "Out-of-band transfers still queued when the OSD stopped",

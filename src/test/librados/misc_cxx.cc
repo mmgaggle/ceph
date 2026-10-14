@@ -886,10 +886,12 @@ TEST_P(LibRadosMiscPP, CmpExtPP) {
 TEST_P(LibRadosMiscPP, RdmaDeliveryInlineFallbackPP) {
   // exercises the advisory rdma delivery descriptor against an OSD
   // without an executor for the token (no transport in
-  // oob_client_transports, or an OSD that predates the MOSDOp field): the read must
-  // succeed with the data returned INLINE and zero bytes reported as
-  // delivered out of band - the transparent degradation the RGW
-  // passthrough fallback keys on
+  // oob_client_transports, or built without one): the read must succeed
+  // with the data returned INLINE, zero bytes reported as delivered out
+  // of band, and the result marked declined, since no transfer started -
+  // the transparent degradation the RGW passthrough fallback keys on, and
+  // the bit that lets it skip the fence. An OSD that predates the result
+  // field would report no flags at all
   const std::string payload = "0123456789";
   bufferlist write_bl;
   write_bl.append(payload);
@@ -919,9 +921,10 @@ TEST_P(LibRadosMiscPP, RdmaDeliveryInlineFallbackPP) {
   ASSERT_EQ(0, rval1);
   ASSERT_EQ(0, rval2);
   ASSERT_EQ(0u, res1.bytes);  // nothing was delivered out of band
-  ASSERT_EQ(0u, res1.flags);  // and no crc came back
+  // declined, and no crc came back
+  ASSERT_EQ(ObjectReadOperation::RDMA_DELIVERY_DECLINED, res1.flags);
   ASSERT_EQ(0u, res2.bytes);
-  ASSERT_EQ(0u, res2.flags);
+  ASSERT_EQ(ObjectReadOperation::RDMA_DELIVERY_DECLINED, res2.flags);
   bufferlist expected1, expected2;
   expected1.append(payload.substr(0, 4));
   expected2.append(payload.substr(4));

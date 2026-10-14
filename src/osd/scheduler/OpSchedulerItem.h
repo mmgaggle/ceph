@@ -596,6 +596,47 @@ public:
   }
 };
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+/**
+ * The pulls that a hold of a PG waits for settled: those of the pulled
+ * write that holds the object, or of an earlier attempt of its request.
+ * The PG runs it again, with the ops behind it
+ * (PrimaryLogPG::oob_pull_kick()). The transfer thread that settled
+ * them queues it, since it takes no PG lock. It holds no PG reference:
+ * a PG that went away drops it, as it does any item.
+ */
+class PGOobPullKick : public PGOpQueueable {
+  utime_t time_queued;
+  OpRequestRef op;
+  hobject_t head;
+public:
+  PGOobPullKick(spg_t pgid, OpRequestRef op, hobject_t head)
+    : PGOpQueueable(pgid),
+      time_queued(ceph_clock_now()),
+      op(std::move(op)), head(std::move(head)) {}
+  // printed on the transfer thread that queues it too, while the request
+  // may run again on an op thread that changes its ops: only what never
+  // changes
+  std::ostream &print(std::ostream &rhs) const final {
+    return rhs << "PGOobPullKick(pgid=" << get_pgid()
+	       << " reqid=" << op->get_reqid() << " head=" << head << ")";
+  }
+  std::string print() const final {
+    return fmt::format(
+	"PGOobPullKick(pgid={} reqid={} head={})", get_pgid(),
+	op->get_reqid(), head);
+  }
+  utime_t get_time_queued() const final {
+    return time_queued;
+  }
+  void run(
+    OSD *osd, OSDShard *sdata, PGRef& pg, ThreadPool::TPHandle &handle) final;
+  SchedulerClass get_scheduler_class() const final {
+    return SchedulerClass::immediate;
+  }
+};
+#endif
+
 class PGDelete : public PGOpQueueable {
   epoch_t epoch_queued;
 public:

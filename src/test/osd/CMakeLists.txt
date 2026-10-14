@@ -124,8 +124,8 @@ if(WITH_OOB_OFI)
     )
   add_ceph_unittest(unittest_osd_ofi)
   target_link_libraries(unittest_osd_ofi osd global)
-  # ceph_test_osd_oob_read: reads with out-of-band delivery over the tcp
-  # provider, for qa/standalone/osd/osd-oob-async.sh
+  # ceph_test_osd_oob_read: reads and pulled writes with out-of-band
+  # delivery over the tcp provider, for qa/standalone/osd/osd-oob-async.sh
   add_executable(ceph_test_osd_oob_read
     ceph_test_osd_oob_read.cc
     )

@@ -82,6 +82,7 @@ class Arena;
 }
 namespace ceph::osd::oob {
 class Transfers;
+class pulls_out;
 }
 class OSDMap;
 class MLog;
@@ -167,6 +168,11 @@ public:
   /// the executor lending windows for EC gathers (oob_cluster_transport),
   /// or null
   OSDOobExecutor* oob_gather_executor() const;
+  /// the pulled writes whose pulls run on a transfer thread, by request,
+  /// for every PG: an attempt of a request that a PG dropped may still
+  /// pull, and a later one waits for it. Before oob_xfer, whose jobs
+  /// leave it as they settle
+  std::unique_ptr<ceph::osd::oob::pulls_out> oob_pulls_out;
   /// the threads that run the executors' transfers instead of the op
   /// threads (osd_oob_transfer_threads), built with the executors; null
   /// when none started
@@ -185,6 +191,13 @@ public:
   /// running ones, and stop the transfer threads, before the executors
   /// go
   void stop_oob_transfers();
+  /// the pulls of op, a pulled write, settled, and a hold of head in PG
+  /// pgid waits for them (op's, or a later attempt's of its request):
+  /// queue the kick that runs the hold's ops again (PGOobPullKick), from
+  /// the transfer thread that settled them. Nothing once stopping, since
+  /// the PGs drop their holds then
+  void queue_oob_pull_kick(spg_t pgid, epoch_t epoch, OpRequestRef op,
+			   const hobject_t& head);
 #endif
 
   void enqueue_back(OpSchedulerItem&& qi);

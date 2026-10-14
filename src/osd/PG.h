@@ -729,6 +729,11 @@ public:
   virtual int get_cache_obj_count() = 0;
 
   virtual void snap_trimmer(epoch_t epoch_queued) = 0;
+#ifdef HAVE_OSD_OOB_DELIVERY
+  /// the pulls of op, a pulled write, settled: if the hold of head waits
+  /// for them, run its ops again (PGOobPullKick)
+  virtual void oob_pull_kick(OpRequestRef op, const hobject_t& head) {}
+#endif
   virtual void do_command(
     std::string_view prefix,
     const cmdmap_t& cmdmap,

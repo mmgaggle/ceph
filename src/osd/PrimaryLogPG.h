@@ -1376,9 +1376,56 @@ protected:
    * is checked before any starts, and a run of the request after they
    * started pulls nothing (ceph::osd::oob::pull_payloads()). Returns 0,
    * or a negative errno that fails the whole request, with nothing
-   * written.
+   * written, or ceph::osd::oob::PULLS_PARKED when the pulls run on a
+   * transfer thread: the caller then parks the request
+   * (park_for_oob_pull()).
    */
   int pull_oob_payloads(OpContext *ctx);
+
+  /**
+   * A pulled write that waits for its pulls on a transfer thread, and
+   * the client ops on its object that came after it: each waits here
+   * until the pulls settled and the transfer thread kicked the PG
+   * (oob_pull_kick()). A hold has ops and the pulls they wait for only:
+   * no object context, no lock of the object and no OpContext, so that
+   * nothing of it outlives an interval change, which requeues or drops
+   * its ops as it does the other ops that wait.
+   */
+  struct oob_pull_hold {
+    OpRequestRef owner;  ///< the pulled write
+    /// what the owner waits for: its pulls, or those of an earlier
+    /// attempt of its request that a PG of the OSD dropped
+    std::shared_ptr<ceph::osd::oob::pull_set> pulls;
+    std::list<OpRequestRef> waiters;
+    utime_t since;  ///< when the owner parked
+  };
+  /// the holds, by the head of their object
+  std::map<hobject_t, oob_pull_hold> oob_pull_holds;
+  /**
+   * The checks at the top of do_op(), before every list an op can wait
+   * in and every check that can answer it. A run of a pulled write whose
+   * pulls are still out waits for them: until they settled its client
+   * may not reuse the window, so nothing may answer it. So does a pulled
+   * write while the pulls of an earlier attempt of its request are out
+   * on this OSD (pulls_out). Any other client op on an object a pulled
+   * write waits on waits behind it, so that it reaches every later list
+   * behind it too. Returns true when op waits.
+   */
+  bool maybe_wait_for_oob_pull(OpRequestRef& op);
+  /// op waits for pulls in the hold of head: its owner, or one of the
+  /// ops behind it when another op holds the object
+  void hold_for_oob_pull(OpRequestRef op, const hobject_t& head,
+			 std::shared_ptr<ceph::osd::oob::pull_set> pulls);
+  /// the pull step parked ctx's request: hold its object, and let go of
+  /// the object's lock and of ctx
+  void park_for_oob_pull(OpContext *ctx, const hobject_t& head);
+  /// do_request() drops op, which nothing here will answer: those of its
+  /// pulls that did not start never will
+  void abandon_oob_pull(const OpRequestRef& op);
+  /// requeue (is_primary) or drop the ops of every hold, and clear them;
+  /// a dropped request's pulls that did not start never will
+  void release_oob_pull_holds(bool requeue);
+  void dump_oob_holds(ceph::Formatter *f) const;
 #endif
 
   // pg on-disk content
@@ -1640,6 +1687,9 @@ public:
   void stop_coroutine();
   void do_op_impl(OpRequestRef op);
   void do_op(OpRequestRef& op);
+#ifdef HAVE_OSD_OOB_DELIVERY
+  void oob_pull_kick(OpRequestRef op, const hobject_t& head) override;
+#endif
   void on_coroutine_complete();
   void record_write_error(OpRequestRef op, const hobject_t &soid,
 			  MOSDOpReply *orig_reply, int r,

@@ -731,6 +731,57 @@ TEST(RdmaDelivery, WithheldDescriptorsReadDeclined)
   o->put();
 }
 
+// FLAG_PRIOR_SETTLED is the client library's to set, from the attempts it
+// sent, and the OSD keeps a resend inline without it. A request that
+// carries it already (librados's RDMA_DELIVERY_COMBINABLE result flag has
+// its value) goes out without it, on a first attempt and on a resend of
+// an unanswered one, and so cannot switch off that guard. A resend of a
+// settled attempt carries it, the caller's own bits kept.
+TEST(RdmaDelivery, OnlyTheClientLibraryVouchesForEarlierAttempts)
+{
+  using D = ceph::rdma::delivery_t;
+  auto make_op = [](uint32_t flags) {
+    ::ObjectOperation op;
+    op.write_full_pulled(4096);
+    op.set_rdma_delivery("t0", 0, flags | D::FLAG_PULL, nullptr);
+    auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                               std::move(op.ops), CEPH_OSD_FLAG_WRITE,
+                               (Context*)nullptr, nullptr);
+    Objecter::take_rdma(o, op);
+    return o;
+  };
+
+  auto* o = make_op(D::FLAG_CRC64NVME | D::FLAG_PRIOR_SETTLED);
+  o->attempts = 1;
+  auto d = Objecter::stamp_rdma_attempt(o, true);
+  ASSERT_EQ(1u, d.size());
+  EXPECT_EQ(D::FLAG_CRC64NVME | D::FLAG_PULL, d[0].flags);
+
+  // no reply came: a write of that attempt may still land, and its
+  // resend goes out unvouched
+  o->attempts = 2;
+  d = Objecter::stamp_rdma_attempt(o, true);
+  ASSERT_EQ(1u, d.size());
+  EXPECT_EQ(D::FLAG_CRC64NVME | D::FLAG_PULL, d[0].flags);
+  EXPECT_FALSE(ceph::rdma::prior_attempts_settled(d));
+  o->put();
+
+  auto* s = make_op(D::FLAG_CRC32C);
+  s->attempts = 1;
+  d = Objecter::stamp_rdma_attempt(s, true);
+  ASSERT_EQ(1u, d.size());
+  EXPECT_EQ(D::FLAG_CRC32C | D::FLAG_PULL, d[0].flags);
+  // its reply declined the op, as handle_osd_op_reply() records
+  s->rdma_attempt_unsettled = false;
+  s->attempts = 2;
+  d = Objecter::stamp_rdma_attempt(s, true);
+  ASSERT_EQ(1u, d.size());
+  EXPECT_EQ(D::FLAG_CRC32C | D::FLAG_PULL | D::FLAG_PRIOR_SETTLED,
+            d[0].flags);
+  EXPECT_TRUE(ceph::rdma::prior_attempts_settled(d));
+  s->put();
+}
+
 // ObjectOperation::dup() takes over another request's ops, as an OSD
 // does when it proxies a read or copies a manifest object's chunks, and
 // keeps every per-op vector aligned with them, so that an op added

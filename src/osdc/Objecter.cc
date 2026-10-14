@@ -3692,20 +3692,33 @@ void Objecter::_send_op(Op *op)
 
 int Objecter::calc_op_budget(const bc::small_vector_base<OSDOp>& ops)
 {
-  int op_budget = 0;
+  // count in 64 bits and saturate: a pulled write or a read may name
+  // any length, and a budget that wrapped negative would trip the
+  // throttle's asserts
+  constexpr uint64_t max_budget = std::numeric_limits<int>::max();
+  uint64_t op_budget = 0;
+  auto charge = [&](uint64_t bytes) {
+    op_budget += std::min(bytes, max_budget);
+  };
   for (auto i = ops.begin(); i != ops.end(); ++i) {
-    if (i->op.op & CEPH_OSD_OP_MODE_WR) {
-      op_budget += i->indata.length();
+    if ((i->op.op == CEPH_OSD_OP_WRITE || i->op.op == CEPH_OSD_OP_WRITEFULL) &&
+	i->indata.length() == 0) {
+      // a pulled write (ObjectOperation::write_pulled()) carries no
+      // data: the primary reads its bytes out of the client window, and
+      // they are in flight all the same
+      charge(i->op.extent.length);
+    } else if (i->op.op & CEPH_OSD_OP_MODE_WR) {
+      charge(i->indata.length());
     } else if (ceph_osd_op_mode_read(i->op.op)) {
       if (ceph_osd_op_uses_extent(i->op.op)) {
         if ((int64_t)i->op.extent.length > 0)
-          op_budget += (int64_t)i->op.extent.length;
+          charge(i->op.extent.length);
       } else if (ceph_osd_op_type_attr(i->op.op)) {
-        op_budget += i->op.xattr.name_len + i->op.xattr.value_len;
+        charge(uint64_t(i->op.xattr.name_len) + i->op.xattr.value_len);
       }
     }
   }
-  return op_budget;
+  return std::min(op_budget, max_budget);
 }
 
 void Objecter::_throttle_op(Op *op,
@@ -4101,11 +4114,12 @@ Objecter::stamp_rdma_attempt(Op *op, bool send)
   }
   ceph_assert(op->rdma_delivery.size() == op->ops.size());
   deliveries.assign(op->rdma_delivery.begin(), op->rdma_delivery.end());
-  if (op->rdma_retry_settled) {
-    for (auto& d : deliveries) {
-      if (!d.empty()) {
-	d.flags |= ceph::rdma::delivery_t::FLAG_PRIOR_SETTLED;
-      }
+  for (auto& d : deliveries) {
+    // only this attempt's history vouches for it, whatever the caller
+    // put in the request's flags
+    d.flags &= ~ceph::rdma::delivery_t::FLAG_PRIOR_SETTLED;
+    if (op->rdma_retry_settled && !d.empty()) {
+      d.flags |= ceph::rdma::delivery_t::FLAG_PRIOR_SETTLED;
     }
   }
   op->rdma_attempt_unsettled = true;

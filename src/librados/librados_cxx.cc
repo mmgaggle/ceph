@@ -239,6 +239,17 @@ void copy_rdma_result(const ceph::rdma::oob_result_t& r,
     out->ranges.push_back({x.ofs, x.len, x.crc64, x.crc32c});
   }
 }
+
+/// the wire request flags for a caller's: only the RDMA_DELIVERY_WANT_*
+/// bits are its to set. The other wire bits belong to the client
+/// library (FLAG_PRIOR_SETTLED vouches for a resend's earlier attempts,
+/// FLAG_PULL marks a pulled write), and share their values with result
+/// flags a caller may pass by mistake
+uint32_t rdma_request_flags(uint32_t flags)
+{
+  return flags & (librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC64 |
+		  librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC32C);
+}
 } // anonymous namespace
 
 void librados::ObjectReadOperation::set_rdma_delivery(
@@ -267,7 +278,7 @@ void librados::ObjectReadOperation::set_rdma_delivery(
 		ceph::rdma::oob_result_t::FLAG_LANDED);
   static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_RESENT ==
 		ceph::rdma::oob_result_t::FLAG_RESENT);
-  o->set_rdma_delivery(token, base_offset, flags,
+  o->set_rdma_delivery(token, base_offset, rdma_request_flags(flags),
 		       [result](const ceph::rdma::oob_result_t& r) {
 			 if (result) {
 			   copy_rdma_result(r, result);
@@ -541,7 +552,8 @@ void librados::ObjectWriteOperation::write_full_pulled(
   ::ObjectOperation *o = &impl->o;
   o->write_full_pulled(len);
   o->set_rdma_delivery(token, base_offset,
-		       flags | ceph::rdma::delivery_t::FLAG_PULL,
+		       rdma_request_flags(flags) |
+		       ceph::rdma::delivery_t::FLAG_PULL,
 		       [result](const ceph::rdma::oob_result_t& r) {
 			 if (result) {
 			   copy_rdma_result(r, result);
@@ -557,7 +569,8 @@ void librados::ObjectWriteOperation::write_pulled(
   ::ObjectOperation *o = &impl->o;
   o->write_pulled(off, len);
   o->set_rdma_delivery(token, base_offset,
-		       flags | ceph::rdma::delivery_t::FLAG_PULL,
+		       rdma_request_flags(flags) |
+		       ceph::rdma::delivery_t::FLAG_PULL,
 		       [result](const ceph::rdma::oob_result_t& r) {
 			 if (result) {
 			   copy_rdma_result(r, result);

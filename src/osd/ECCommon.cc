@@ -643,7 +643,8 @@ void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
 	  bytes += e.get<1>();
 	}
       }
-      if (bytes > 0) {
+      // a small sub-read comes back in its reply (@see gather_windows_t)
+      if (bytes >= gather_windows_t::min_bytes) {
 	if (auto w = gather_exec->acquire_window(bytes); w) {
 	  read.push_token = w->token;
 	  rop.gather.windows.emplace(pg_shard, std::move(*w));
@@ -878,7 +879,7 @@ void ECCommon::ReadPipeline::objects_read_and_reconstruct(
     false,
     std::make_unique<ClientReadCompleter>(
       *this, &(in_progress_client_reads.back())),
-    true);
+    !fast_read);
 }
 
 void ECCommon::ReadPipeline::objects_read_and_reconstruct_for_rmw(
@@ -943,10 +944,30 @@ int ECCommon::ReadPipeline::send_all_remaining_reads(
     dout(10) << __func__ << " want omap_keys again" << dendl;
   }
 
+  // A shard whose push into a gather window failed (-EBADMSG) read its
+  // copy fine: read it again, once, rather than decode around it, as
+  // more such faults than the pool has parity shards would fail a read
+  // that every shard can serve. The failed push set gather.inline_only,
+  // so the shard replies inline. Dropping its error makes it a source
+  // again, and has its reply taken; its buffers and processed extents
+  // went when the error came (@see ECBackend::handle_sub_read_reply).
+  read_result_t &read_result = rop.complete.at(hoid);
+  for (auto it = read_result.errors.begin();
+       it != read_result.errors.end();) {
+    if (it->second == -EBADMSG &&
+        read_result.gather_rereads.insert(it->first).second) {
+      dout(10) << __func__ << " reading shard " << it->first
+               << " again after its push failed" << dendl;
+      it = read_result.errors.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
   read_request_t &read_request = rop.to_read.at(hoid);
   // reset the old shard reads, we are going to read them again.
   read_request.shard_reads.clear();
-  return get_remaining_shards(hoid, rop.complete.at(hoid), read_request,
+  return get_remaining_shards(hoid, read_result, read_request,
                               rop.for_recovery, want_attrs, want_omap_header,
                               want_omap_keys);
 }

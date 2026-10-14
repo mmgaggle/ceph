@@ -931,24 +931,24 @@ void ECBackend::handle_sub_read_reply(
       if (t.mismatch) {
 	// whatever is in the window, it is not what the shard placed: a
 	// push that completed short, or a write that landed after it.
-	// Read the object from the other shards instead.
+	// Read the shard again, inline.
 	dout(0) << __func__ << ": the " << t.bytes << " bytes shard " << from
 		<< " pushed into gather window " << w->id << " (" << w->token
 		<< ") do not match its checksum: crc32c 0x" << std::hex
 		<< t.crc << " != 0x" << *op.pushed_crc << std::dec
-		<< "; reading from the other shards" << dendl;
+		<< "; reading it again inline" << dendl;
 	rop.gather.exec->note_gather_crc_mismatch();
       } else if (t.overrun) {
 	dout(0) << __func__ << ": shard " << from << " pushed more than "
 		<< "gather window " << w->id << " holds ("
-		<< w->size << " bytes); reading from the other shards"
-		<< dendl;
+		<< w->size << " bytes); reading it again inline" << dendl;
       }
       // a window holding anything but the push may still take writes:
-      // it goes back quarantined, and the reads that rebuild what this
-      // shard's push should have brought come back inline. The fault is
-      // the fabric's, not the shard's media: -EBADMSG, unlike the -EIO
-      // of a failed store read, never has the shard repaired.
+      // it goes back quarantined. The fault is the fabric's, not the
+      // shard's media: -EBADMSG, unlike the -EIO of a failed store
+      // read, has the shard read again once (@see
+      // send_all_remaining_reads) and never repaired, and that read
+      // and any other this gather still sends come back inline.
       rop.gather.release(from, t.ok());
       if (!t.ok()) {
 	rop.gather.inline_only = true;
@@ -960,7 +960,9 @@ void ECBackend::handle_sub_read_reply(
     }
   } else if (!op.pushed.empty()) {
     // pushed data with no window of ours to find it in: lost in
-    // transport, like a push that does not match its checksum
+    // transport, like a push that does not match its checksum, and
+    // read again inline the same way
+    rop.gather.inline_only = true;
     for (auto &&[hoid, extents] : op.pushed) {
       op.errors[hoid] = -EBADMSG;
     }
@@ -1153,8 +1155,12 @@ void ECBackend::handle_sub_read_reply(
           // so getting EIO from one may result in multiple passes through this code path.
 
           rop.debug_log.emplace_back(ECUtil::REQUEST_MISSING, op.from);
+          const auto rereads = read_result.gather_rereads.size();
           int r = read_pipeline.send_all_remaining_reads(oid, rop);
-          if (r == 0 && !rop.do_redundant_reads) {
+          // a fast read has read every shard already: it reads again
+          // only one whose push failed
+          if (r == 0 && (!rop.do_redundant_reads ||
+                         read_result.gather_rereads.size() > rereads)) {
             // We found that new reads are required to do a decode.
             need_resend = true;
             continue;

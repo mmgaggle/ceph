@@ -93,6 +93,9 @@ public:
   /// what oob_gather_executor() returns: the executor that lends the EC
   /// read pipeline its gather windows, or null
   OSDOobExecutor* gather_executor = nullptr;
+  /// oob_gather_executor() calls: the read pipeline asks only when it
+  /// sends the sub-reads of a read that lends windows, executor or not
+  int gather_executor_asked = 0;
 
   MockPGBackendListener(OSDMapRef osdmap, int64_t pool_id, DoutPrefixProvider *dpp, pg_shard_t pg_whoami, PeeringState *ps = nullptr) :
     osdmap(osdmap), pool_id(pool_id), log(g_ceph_context), dpp(dpp), pg_whoami(pg_whoami), peering_state(ps) {
@@ -798,6 +801,7 @@ public:
   }
 
   OSDOobExecutor* oob_gather_executor() override {
+    ++gather_executor_asked;
     return gather_executor;
   }
 };

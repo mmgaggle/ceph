@@ -3357,8 +3357,10 @@ void PGMap::get_health_checks(
         summary += " cut off out-of-band writes later than the tolerance";
       }
 
-      // writes may have landed after the fence a client counts on
-      const auto severity = asum.first == "OOB_CUTOFF_PAST_TOLERANCE" ?
+      // writes may have landed after the fence a client counts on, and
+      // after a failed cut-off may still land
+      const auto severity = (asum.first == "OOB_CUTOFF_PAST_TOLERANCE" ||
+                             asum.first == "OOB_DELIVERY_UNSAFE") ?
         HEALTH_ERR : HEALTH_WARN;
       auto& d = checks->add(asum.first, severity, summary, asum.second.first);
       for (auto& s : asum.second.second) {

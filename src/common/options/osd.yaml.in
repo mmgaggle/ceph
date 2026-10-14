@@ -1707,7 +1707,8 @@ options:
     libfabric executor and raises OOB_DELIVERY_UNSAFE, and a quick cut-off
     that ends later than the tolerance raises OOB_CUTOFF_PAST_TOLERANCE while
     delivery goes on. With "disable", a late cut-off also stops the executor.
-    With "abort", the OSD exits in both cases.
+    With "abort", the OSD exits in both cases. A change takes effect when the
+    OSD restarts.
   default: warn
   enum_values:
   - warn
@@ -1718,7 +1719,7 @@ options:
   see_also:
   - osd_oob_cutoff_late_tolerance
   flags:
-  - runtime
+  - startup
 - name: osd_ofi_inject_cutoff_failure
   type: bool
   level: dev
@@ -1727,6 +1728,19 @@ options:
   default: false
   services:
   - osd
+  flags:
+  - runtime
+- name: osd_ofi_inject_cutoff_delay
+  type: millisecs
+  level: dev
+  desc: Make the libfabric executor take this much longer to close its
+    endpoint in a cut-off, as a provider that drains its writes on close
+    does, to test osd_oob_cutoff_late_tolerance
+  default: 0
+  services:
+  - osd
+  see_also:
+  - osd_oob_cutoff_late_tolerance
   flags:
   - runtime
 - name: osd_oob_transfer_threads

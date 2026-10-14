@@ -441,4 +441,29 @@ TEST(RdmaRcLimits, ZeroAdmitsNone)
   no_user.release("a");
   EXPECT_EQ(0u, no_user.sessions());
 }
+
+TEST(RdmaRcTransport, PathMtu)
+{
+  // 0 takes the port's active MTU
+  EXPECT_EQ(IBV_MTU_4096, path_mtu_of(0, IBV_MTU_4096));
+  EXPECT_EQ(IBV_MTU_1024, path_mtu_of(0, IBV_MTU_1024));
+  // the clients' path MTU, below the port's
+  EXPECT_EQ(IBV_MTU_256, path_mtu_of(256, IBV_MTU_4096));
+  EXPECT_EQ(IBV_MTU_512, path_mtu_of(512, IBV_MTU_4096));
+  EXPECT_EQ(IBV_MTU_1024, path_mtu_of(1024, IBV_MTU_4096));
+  EXPECT_EQ(IBV_MTU_2048, path_mtu_of(2048, IBV_MTU_4096));
+  EXPECT_EQ(IBV_MTU_4096, path_mtu_of(4096, IBV_MTU_4096));
+  // sizes between the path MTUs round down. The option takes the
+  // clients' path MTU, not their interface MTU, which this does not
+  // map: an interface MTU of 4096 carries a RoCE path MTU of 2048
+  EXPECT_EQ(IBV_MTU_1024, path_mtu_of(1500, IBV_MTU_4096));
+  EXPECT_EQ(IBV_MTU_4096, path_mtu_of(9000, IBV_MTU_4096));
+  EXPECT_EQ(IBV_MTU_256, path_mtu_of(511, IBV_MTU_4096));
+  // never above the port's
+  EXPECT_EQ(IBV_MTU_1024, path_mtu_of(4096, IBV_MTU_1024));
+  EXPECT_EQ(IBV_MTU_1024, path_mtu_of(9000, IBV_MTU_1024));
+  // no path MTU is that small
+  EXPECT_FALSE(path_mtu_of(1, IBV_MTU_4096));
+  EXPECT_FALSE(path_mtu_of(255, IBV_MTU_4096));
+}
 #endif

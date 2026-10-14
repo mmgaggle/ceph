@@ -4590,6 +4590,23 @@ options:
   - rgw
   flags:
   - startup
+- name: rgw_rdma_rc_path_mtu
+  type: uint
+  level: advanced
+  desc: Path MTU in bytes of the queue pairs that hipobj-rc-v2 sessions pair
+    with clients; 0 takes the gateway port's active MTU
+  long_desc: Both ends of a pairing must use the same path MTU, and the
+    protocol does not carry it. When the clients' path MTU is below the
+    gateway port's, every transfer longer than it fails. Set this to the
+    clients' path MTU, for example 1024 for clients on a 1500-byte Ethernet
+    MTU. The value is rounded down to 256, 512, 1024, 2048 or 4096 and never
+    exceeds the port's active MTU. A value from 1 to 255 keeps the RC server
+    from starting.
+  default: 0
+  services:
+  - rgw
+  flags:
+  - startup
 - name: rgw_topic_persistency_time_to_live
   type: uint
   level: advanced

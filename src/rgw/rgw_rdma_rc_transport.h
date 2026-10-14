@@ -13,11 +13,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -47,7 +49,26 @@ struct DeviceConfig {
   std::string gid_hint;     ///< dotted GID prefix selecting the device
   uint8_t port = 1;
   int gid_index = -1;       ///< -1 = pick a RoCEv2 (or the port) GID
+  uint64_t client_mtu = 0;  ///< bytes, see path_mtu_of(); 0 = the port's
 };
+
+/// the path MTU of at most bytes: the largest of 256, 512, 1024, 2048
+/// and 4096 bytes that exceeds neither bytes nor active. 0 bytes takes
+/// active; nullopt for 1 to 255 bytes
+inline std::optional<ibv_mtu> path_mtu_of(uint64_t bytes, ibv_mtu active)
+{
+  if (bytes == 0) {
+    return active;
+  }
+  if (bytes < 256) {
+    return std::nullopt;
+  }
+  ibv_mtu m = IBV_MTU_256;
+  while (m < IBV_MTU_4096 && (128ull << (m + 1)) <= bytes) {
+    m = static_cast<ibv_mtu>(m + 1);
+  }
+  return std::min(m, active);
+}
 
 class Device {
  public:
@@ -68,7 +89,11 @@ class Device {
   int gid_idx() const { return gid_index; }
   const ibv_gid& gid() const { return local_gid; }
   uint16_t lid() const { return local_lid; }
+  /// the port's active MTU
   ibv_mtu path_mtu() const { return mtu; }
+  /// the path MTU of the queue pairs paired with clients: the port's,
+  /// or lower when DeviceConfig::client_mtu sets it
+  ibv_mtu client_path_mtu() const { return client_mtu; }
   const std::string& name() const { return dev_name; }
 
   /// a protection domain apart from the device's: memory registered on
@@ -126,6 +151,7 @@ class Device {
   ibv_gid local_gid = {};
   uint16_t local_lid = 0;
   ibv_mtu mtu = IBV_MTU_1024;
+  ibv_mtu client_mtu = IBV_MTU_1024;
   std::string dev_name;
 };
 

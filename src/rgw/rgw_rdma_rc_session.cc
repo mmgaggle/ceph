@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
 
 #include <fmt/format.h>
@@ -156,6 +157,7 @@ int Service::do_init(CephContext* c)
     dcfg.port = static_cast<uint8_t>(loc.rdma_port);
   }
   dcfg.gid_index = loc.gid_index;
+  dcfg.client_mtu = conf.get_val<uint64_t>("rgw_rdma_rc_path_mtu");
   if (int r = dev.open(cct, dcfg); r < 0) {
     return r;
   }
@@ -445,8 +447,11 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
   if (closing) {
     return Error::UNSUPPORTED;
   }
+  // the cap is on the size only: the offset places the range in the
+  // object, and the range need only fit the signed offsets of a read
+  constexpr uint64_t max_end = std::numeric_limits<int64_t>::max();
   if (req.size == 0 || req.size > MAX_TRANSFER_SIZE ||
-      req.offset > MAX_TRANSFER_SIZE - req.size) {
+      req.offset > max_end - req.size) {
     return Error::ARG;
   }
   if (req.size > buf_size) {

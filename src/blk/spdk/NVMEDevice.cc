@@ -161,7 +161,7 @@ class SharedDriverQueueData {
     uint32_t current_queue_depth = 0;
     std::atomic_ulong completed_op_seq, queue_op_seq;
     bi::slist<data_cache_buf, bi::constant_time_size<true>> data_buf_list;
-    void _aio_handle(Task *t, IOContext *ioc);
+    void _aio_handle(Task *t);
 
     SharedDriverQueueData(NVMEDevice *bdev, SharedDriverData *driver)
       : bdev(bdev),
@@ -351,7 +351,7 @@ int SharedDriverQueueData::alloc_buf_from_pool(Task *t, bool write)
   return 0;
 }
 
-void SharedDriverQueueData::_aio_handle(Task *t, IOContext *ioc)
+void SharedDriverQueueData::_aio_handle(Task *t)
 {
   dout(20) << __func__ << " start" << dendl;
 
@@ -360,7 +360,11 @@ void SharedDriverQueueData::_aio_handle(Task *t, IOContext *ioc)
   uint32_t max_io_completion = (uint32_t)g_conf().get_val<uint64_t>("bluestore_spdk_max_io_completion");
   uint64_t io_sleep_in_us = g_conf().get_val<uint64_t>("bluestore_spdk_io_sleep");
 
-  while (ioc->num_running) {
+  // Run until every task is issued and the queue drains. Don't loop on
+  // the ioc's num_running: the last completion's aio callback may hand
+  // the ioc's owner to another thread that frees it. The queue is
+  // per-thread, so the I/O on it is the I/O submitted here.
+  while (t || current_queue_depth) {
  again:
     dout(40) << __func__ << " polling" << dendl;
     if (current_queue_depth) {
@@ -914,7 +918,7 @@ void NVMEDevice::aio_submit(IOContext *ioc)
     ioc->nvme_task_first = ioc->nvme_task_last = nullptr;
 
     thread_local SharedDriverQueueData queue_t = SharedDriverQueueData(this, driver);
-    queue_t._aio_handle(t, ioc);
+    queue_t._aio_handle(t);
   }
 }
 

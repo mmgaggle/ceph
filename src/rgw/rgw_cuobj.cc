@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <iostream>
 
 #include "common/ceph_context.h"
 #include "common/config.h"
@@ -89,15 +90,24 @@ int RGWCuObjServer::do_init(CephContext* cct)
                 << " dcis=" << m_num_dcis << ", staging in "
                 << m_arena->size() << " bytes" << dendl;
 
+  // the library logs to stderr: its errors only, and its info and debug
+  // paths too at debug_rgw 20 or more. Set up before the server, so that
+  // its construction logs under these flags as well. A gateway that
+  // daemonized has already closed stderr, so only one run with -f keeps
+  // these lines
+  unsigned telem_flags = CUOBJ_LOG_PATH_ERROR;
+  if (cct->_conf->subsys.get_log_level(ceph_subsys_rgw) >= 20) {
+    telem_flags |= CUOBJ_LOG_PATH_INFO | CUOBJ_LOG_PATH_DEBUG;
+  }
+  cuObjServer::setupTelemetry(false, &std::cerr);
+  cuObjServer::setTelemFlags(telem_flags);
+
   try {
     m_server = std::make_unique<cuObjServer>(rdma_ip.c_str(), rdma_port, CUOBJ_PROTO_RDMA_DC_V1, params);
   } catch (const std::exception& e) {
     lderr(cct) << "rgw_cuobj: ERROR: cuObjServer construction failed: " << e.what() << dendl;
     return -EIO;
   }
-
-  cuObjServer::setupTelemetry(false, &std::cerr);
-  cuObjServer::setTelemFlags(CUOBJ_LOG_PATH_INFO | CUOBJ_LOG_PATH_DEBUG | CUOBJ_LOG_PATH_ERROR);
 
   if (!m_server->isConnected()) {
     lderr(cct) << "rgw_cuobj: ERROR: cuObjServer failed to connect" << dendl;

@@ -421,8 +421,9 @@ void ECSubReadReply::encode(bufferlist &p_bl,
 			    uint64_t features) const
 {
   // only a primary that sent a push token reads pushed, pushed_crc and
-  // push_declined, and such a primary is new enough to decode v6
-  uint8_t ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 6 : 1;
+  // push_declined, and such a primary is new enough to decode v4; an
+  // older one skips them
+  uint8_t ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 4 : 1;
   uint8_t compat_ver = HAVE_FEATURE(features, SERVER_TENTACLE) ? 2 : 1;
   ENCODE_START(ver, compat_ver, p_bl);
   encode(from, p_bl);
@@ -455,11 +456,7 @@ void ECSubReadReply::encode(bufferlist &p_bl,
   }
   if (ver >= 4) {
     encode(pushed, p_bl);
-  }
-  if (ver >= 5) {
     encode(pushed_crc, p_bl);
-  }
-  if (ver >= 6) {
     encode(push_declined, p_bl);
   }
   ENCODE_FINISH(p_bl);
@@ -473,7 +470,7 @@ void ECSubReadReply::decode(bufferlist::const_iterator &bl)
 void ECSubReadReply::decode(bufferlist::const_iterator &p_bl,
 			    bufferlist::const_iterator &d_bl)
 {
-  DECODE_START(6, p_bl);
+  DECODE_START(4, p_bl);
   decode(from, p_bl);
   decode(tid, p_bl);
   if (struct_v < 2) {
@@ -516,17 +513,11 @@ void ECSubReadReply::decode(bufferlist::const_iterator &p_bl,
   }
   if (struct_v >= 4) {
     decode(pushed, p_bl);
-  } else {
-    pushed.clear();
-  }
-  if (struct_v >= 5) {
     decode(pushed_crc, p_bl);
-  } else {
-    pushed_crc.reset();
-  }
-  if (struct_v >= 6) {
     decode(push_declined, p_bl);
   } else {
+    pushed.clear();
+    pushed_crc = 0;
     push_declined = false;
   }
 
@@ -556,8 +547,8 @@ std::ostream &operator<<(
   lhs << "]";
   if (!rhs.pushed.empty() || rhs.push_declined) {
     lhs << ", pushed=" << rhs.pushed.size();
-    if (rhs.pushed_crc) {
-      lhs << ", pushed_crc=0x" << std::hex << *rhs.pushed_crc << std::dec;
+    if (!rhs.pushed.empty()) {
+      lhs << ", pushed_crc=0x" << std::hex << rhs.pushed_crc << std::dec;
     }
     if (rhs.push_declined) {
       lhs << ", push_declined";
@@ -647,8 +638,8 @@ void ECSubReadReply::dump(Formatter* f) const
   // what a gather shard placed in the primary's window, or that it
   // placed nothing
   f->dump_unsigned("pushed_objects", pushed.size());
-  if (pushed_crc) {
-    f->dump_unsigned("pushed_crc", *pushed_crc);
+  if (!pushed.empty()) {
+    f->dump_unsigned("pushed_crc", pushed_crc);
   }
   f->dump_bool("push_declined", push_declined);
 }

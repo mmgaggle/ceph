@@ -21,7 +21,8 @@ struct token_window {
 
 /// Maximum token length accepted anywhere in ceph. The cuObject
 /// descriptor is 81 characters today, and an ofi1 token at most 618
-/// (OFI_RMA_TOKEN_MAX is 640); this bounds untrusted input.
+/// (OFI_RMA_TOKEN_MAX is 640 with its NUL, and rdma_token.cc checks it
+/// against this); this bounds untrusted input.
 inline constexpr size_t RDMA_TOKEN_MAX_LEN = 640;
 
 /// Parse the addr and size fields of an RDMA descriptor token as
@@ -234,23 +235,19 @@ struct crc_range_t {
   bool operator==(const crc_range_t&) const = default;
 
   void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(2, 1, bl);
+    ENCODE_START(1, 1, bl);
     ceph::encode(ofs, bl);
     ceph::encode(len, bl);
     ceph::encode(crc64, bl);
-    ceph::encode(crc32c, bl);  // v2
+    ceph::encode(crc32c, bl);
     ENCODE_FINISH(bl);
   }
   void decode(ceph::buffer::list::const_iterator& p) {
-    DECODE_START(2, p);
+    DECODE_START(1, p);
     ceph::decode(ofs, p);
     ceph::decode(len, p);
     ceph::decode(crc64, p);
-    if (struct_v >= 2) {
-      ceph::decode(crc32c, p);
-    } else {
-      crc32c = 0;
-    }
+    ceph::decode(crc32c, p);
     DECODE_FINISH(p);
   }
 };
@@ -264,7 +261,7 @@ WRITE_CLASS_ENCODER(crc_range_t)
  *
  * Three separate properties, because they have separate consumers.
  * FLAG_CRC64NVME says crc64 covers the bytes this OSD moved, which is
- * what a caller verifying one transfer needs. FLAG_CRC64_COMBINABLE
+ * what a caller verifying one transfer needs. FLAG_COMBINABLE
  * additionally says those bytes are one contiguous logical extent,
  * so crc64 concatenate-combines with adjacent results in logical
  * order - what a caller reassembling a whole object's checksum out
@@ -272,7 +269,7 @@ WRITE_CLASS_ENCODER(crc_range_t)
  * EC-direct chunks, sparse extents) cannot offer that for its single
  * crc64: a CRC over the concatenation of every other chunk is not a
  * function of the per-chunk values. But each of its ranges is one
- * contiguous extent, so FLAG_CRC64_RANGES carries one crc_range_t per
+ * contiguous extent, so FLAG_RANGES carries one crc_range_t per
  * placement triple instead, and a caller that has every range of a
  * window can fold them in ofs order regardless of which OSD moved
  * which chunk. crc64 alone is the N=1 special case of that.
@@ -288,10 +285,8 @@ struct oob_result_t {
   /// ...and those bytes are one contiguous logical extent, so crc64 and
   /// crc32c may be concatenate-combined in logical order
   static constexpr uint32_t FLAG_COMBINABLE = 1u << 1;
-  static constexpr uint32_t FLAG_CRC64_COMBINABLE = FLAG_COMBINABLE;
   /// ranges holds one crc_range_t per contiguous placed extent
   static constexpr uint32_t FLAG_RANGES = 1u << 2;
-  static constexpr uint32_t FLAG_CRC64_RANGES = FLAG_RANGES;
   /// set by the OSD, or by the client library for an op whose descriptor
   /// it withheld (require_osd_release below umbrella): no transfer was
   /// started for this op, so nothing of it reached the window; a read's
@@ -318,30 +313,21 @@ struct oob_result_t {
   uint32_t crc32c = 0;  ///< valid with FLAG_CRC32C
 
   void encode(ceph::buffer::list& bl) const {
-    ENCODE_START(3, 1, bl);
+    ENCODE_START(1, 1, bl);
     ceph::encode(bytes, bl);
     ceph::encode(crc64, bl);
     ceph::encode(flags, bl);
-    ceph::encode(ranges, bl);  // v2
-    ceph::encode(crc32c, bl);  // v3
+    ceph::encode(ranges, bl);
+    ceph::encode(crc32c, bl);
     ENCODE_FINISH(bl);
   }
   void decode(ceph::buffer::list::const_iterator& p) {
-    DECODE_START(3, p);
+    DECODE_START(1, p);
     ceph::decode(bytes, p);
     ceph::decode(crc64, p);
     ceph::decode(flags, p);
-    if (struct_v >= 2) {
-      ceph::decode(ranges, p);
-    } else {
-      ranges.clear();
-    }
-    if (struct_v >= 3) {
-      ceph::decode(crc32c, p);
-    } else {
-      crc32c = 0;
-      flags &= ~FLAG_CRC32C;
-    }
+    ceph::decode(ranges, p);
+    ceph::decode(crc32c, p);
     DECODE_FINISH(p);
   }
 };

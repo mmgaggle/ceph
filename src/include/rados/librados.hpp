@@ -375,12 +375,8 @@ inline namespace v14_2_0 {
     /// result flag: the bytes are one contiguous logical extent, so crc64
     /// and crc32c may be concatenate-combined with adjacent results
     static constexpr uint32_t RDMA_DELIVERY_COMBINABLE = 2;
-    static constexpr uint32_t RDMA_DELIVERY_CRC64_COMBINABLE =
-      RDMA_DELIVERY_COMBINABLE;
     /// result flag: ranges is populated
     static constexpr uint32_t RDMA_DELIVERY_RANGES = 4;
-    static constexpr uint32_t RDMA_DELIVERY_CRC64_RANGES =
-      RDMA_DELIVERY_RANGES;
     /// result flag: no transfer was started for this operation, so
     /// nothing of it reached the window; a read's data came back inline.
     /// The OSD sets it, and so does the client library for an operation
@@ -723,11 +719,11 @@ inline namespace v14_2_0 {
      * only when result->flags has RDMA_DELIVERY_CRC64_VALID set (best
      * effort - older OSDs omit it). A caller folding several results
      * into the checksum of a larger range must additionally check
-     * RDMA_DELIVERY_CRC64_COMBINABLE on each: a result whose bytes
+     * RDMA_DELIVERY_COMBINABLE on each: a result whose bytes
      * are not one contiguous logical extent carries a valid checksum
      * of what that OSD moved, but one that cannot be concatenated
      * with its neighbours. Such a result instead carries one entry
-     * per contiguous range it placed when RDMA_DELIVERY_CRC64_RANGES
+     * per contiguous range it placed when RDMA_DELIVERY_RANGES
      * is set; a caller holding every range of a window can fold them
      * in offset order regardless of how the OSDs interleaved them.
      *

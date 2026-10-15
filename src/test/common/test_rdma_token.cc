@@ -5,6 +5,7 @@
 #include "common/oob_arena.h"
 #include "common/oob_config.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -19,8 +20,11 @@
 
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 
+#include <ofi_rma/ofi_rma.h>
+
 #include "common/ceph_context.h"
 #include "common/config.h"
+#include "include/crc32c.h"
 #include "gtest/gtest.h"
 
 using ceph::rdma::parse_rdma_token;
@@ -448,6 +452,8 @@ TEST(RdmaToken, OfiShape)
     "7f0012345000:c00000:ofi1:rxm.1:020012340a00000100ff:1f";
   EXPECT_TRUE(is_ofi_token(ofi));
   EXPECT_TRUE(is_ofi_token("0:10:ofi1:xnet.1:0200:1"));
+  // the family of the tag ofi-rma writes
+  EXPECT_TRUE(is_ofi_token("0:10:" OFI_RMA_TOKEN_TAG ":xnet.1:0200:1"));
   // any version of the family: one this build cannot parse is still not
   // a cuObject descriptor, and is declined by the libfabric executor
   EXPECT_TRUE(is_ofi_token("0:10:ofi10:xnet.1:0200:1"));
@@ -484,6 +490,48 @@ TEST(RdmaToken, CuobjDescriptor)
   EXPECT_FALSE(is_cuobj_descriptor(""));
   EXPECT_FALSE(is_cuobj_descriptor("xyz:1234:rkey"));
   EXPECT_FALSE(is_cuobj_descriptor("0:10"));
+}
+
+TEST(RdmaToken, LongestOfiTokenFits)
+{
+  // a token as long as ofi-rma writes one, without its NUL
+  std::string t = "7f0012345000:c00000:" OFI_RMA_TOKEN_TAG ":rxm.1:";
+  t.resize(OFI_RMA_TOKEN_MAX - 1, 'a');
+  ASSERT_LE(t.size(), RDMA_TOKEN_MAX_LEN);
+  auto w = parse_rdma_token(t);
+  ASSERT_TRUE(w);
+  EXPECT_EQ(0xc00000ull, w->size);
+  EXPECT_TRUE(ceph::rdma::is_ofi_token(t));
+}
+
+// crc32c_combine() takes B's length whole, past 4 GiB too, where
+// ceph_crc32c_zeros() runs a GiB at a time
+TEST(RdmaToken, Crc32cCombineLongB)
+{
+  using ceph::rdma::crc32c_canonical;
+  using ceph::rdma::crc32c_combine;
+  // the CRC-32C register, without the final inversion, after n zeros
+  auto zeros = [](uint32_t crc, uint64_t n) {
+    while (n > 0) {
+      const unsigned c =
+	static_cast<unsigned>(std::min<uint64_t>(n, 1u << 30));
+      crc = ceph_crc32c_zeros(crc, c);
+      n -= c;
+    }
+    return crc;
+  };
+  ceph::buffer::list a;
+  a.append("123456789");
+  const uint32_t crc_a = crc32c_canonical(a);
+  const uint32_t reg_a = a.crc32c(0xffffffff);
+  for (uint64_t n : {uint64_t(0), uint64_t(1), uint64_t(1) << 30,
+		     (uint64_t(1) << 32) - 1, uint64_t(1) << 32,
+		     (uint64_t(5) << 30) + 7}) {
+    // B is n zero bytes
+    const uint32_t crc_b = zeros(0xffffffff, n) ^ 0xffffffff;
+    const uint32_t crc_ab = zeros(reg_a, n) ^ 0xffffffff;
+    EXPECT_EQ(crc_ab, crc32c_combine(crc_a, crc_b, n)) << "len_b " << n;
+  }
 }
 
 TEST(OobArena, BuddyBuffers)

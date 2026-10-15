@@ -3,15 +3,31 @@
 
 #include "common/rdma_token.h"
 #include "common/crc64nvme.h"
-#include "include/crc32c.h"
 
 #include <algorithm>
 #include <cctype>
 #include <charconv>
 
+#include <ofi_rma/ofi_rma.h>
+
+extern "C" {
+#include "common/madler/crc32iscsi.h"
+}
+
 namespace ceph::rdma {
 
+// the longest token ofi-rma writes, without its NUL, is not refused
+static_assert(RDMA_TOKEN_MAX_LEN >= OFI_RMA_TOKEN_MAX - 1);
+
 namespace {
+
+/// the libfabric token family without its version: "ofi" of "ofi1"
+constexpr std::string_view ofi_family = [] {
+  constexpr std::string_view tag = OFI_RMA_TOKEN_TAG;
+  return tag.substr(0, tag.find_first_of("0123456789"));
+}();
+static_assert(!ofi_family.empty() &&
+	      ofi_family.size() < std::string_view(OFI_RMA_TOKEN_TAG).size());
 
 std::optional<uint64_t> parse_hex_field(std::string_view field)
 {
@@ -60,13 +76,16 @@ bool is_ofi_token(std::string_view token)
     return false;
   }
   // the third field runs to the next colon, or to the end: "ofi" and a
-  // version, which no cuObject memory key can be, since 'o' is not hex
+  // version, which no cuObject memory key can be, since 'o' is not hex.
+  // ofi-rma's ofi_rma_token_family() also wants a fourth field and a
+  // version from 1 up. This is looser, so that the libfabric code, not
+  // the cuObject code, declines a malformed libfabric token
   auto tag = token.substr(second + 1);
   tag = tag.substr(0, tag.find(':'));
-  if (tag.size() < 4 || tag.substr(0, 3) != "ofi") {
+  if (tag.size() <= ofi_family.size() || !tag.starts_with(ofi_family)) {
     return false;
   }
-  return std::all_of(tag.begin() + 3, tag.end(), [](char c) {
+  return std::all_of(tag.begin() + ofi_family.size(), tag.end(), [](char c) {
     return c >= '0' && c <= '9';
   });
 }
@@ -130,18 +149,8 @@ uint32_t crc32c_canonical(const ceph::buffer::list& bl)
 
 uint32_t crc32c_combine(uint32_t crc_a, uint32_t crc_b, uint64_t len_b)
 {
-  // The register update is linear in the register and the data, so
-  // with canonical values (init and xorout all ones) the inversions
-  // cancel: crc(A B) = crc(B) ^ raw(crc(A), len_b zero bytes).
-  // ceph_crc32c_zeros() runs over the zeros in O(log n).
-  uint32_t shifted = crc_a;
-  while (len_b > 0) {
-    const unsigned n = static_cast<unsigned>(
-      std::min<uint64_t>(len_b, 1u << 30));
-    shifted = ceph_crc32c_zeros(shifted, n);
-    len_b -= n;
-  }
-  return crc_b ^ shifted;
+  // madler's, which rgw combines multipart CRC32C checksums with too
+  return crc32iscsi_comb(crc_a, crc_b, len_b);
 }
 
 std::string libfabric_name(std::string_view name)

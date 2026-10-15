@@ -95,8 +95,7 @@ TEST(ECGather, TakesWhatTheShardPushed)
   std::vector<char> win(64 << 10, 'x');
   std::memcpy(win.data(), p.data.data(), p.data.size());
   out_t out;
-  auto t = take_pushed(win.data(), win.size(), p.pushed,
-		       std::optional<uint32_t>(p.crc), out);
+  auto t = take_pushed(win.data(), win.size(), p.pushed, p.crc, out);
   ASSERT_TRUE(t.ok());
   EXPECT_EQ(p.data.size(), t.bytes);
   EXPECT_EQ(p.crc, t.crc);
@@ -128,8 +127,7 @@ TEST(ECGather, RefusesAWindowThatIsNotThePush)
 
   for (auto* w : {&stray, &short_push, &other}) {
     out_t out;
-    auto t = take_pushed(w->data(), w->size(), p.pushed,
-			 std::optional<uint32_t>(p.crc), out);
+    auto t = take_pushed(w->data(), w->size(), p.pushed, p.crc, out);
     EXPECT_TRUE(t.mismatch);
     EXPECT_FALSE(t.ok());
     EXPECT_NE(p.crc, t.crc);
@@ -143,25 +141,10 @@ TEST(ECGather, RefusesExtentsPastTheWindow)
   std::vector<char> win(p.data.size() - 1);
   std::memcpy(win.data(), p.data.data(), win.size());
   out_t out;
-  auto t = take_pushed(win.data(), win.size(), p.pushed,
-		       std::optional<uint32_t>(p.crc), out);
+  auto t = take_pushed(win.data(), win.size(), p.pushed, p.crc, out);
   EXPECT_TRUE(t.overrun);
   EXPECT_FALSE(t.ok());
   EXPECT_TRUE(out.empty());
-}
-
-TEST(ECGather, AShardWithoutAChecksumIsTaken)
-{
-  // a shard from before the checksum: what is in the window is taken as
-  // it was before
-  auto p = two_objects();
-  std::vector<char> win(64 << 10, 'q');
-  out_t out;
-  auto t = take_pushed(win.data(), win.size(), p.pushed,
-		       std::optional<uint32_t>(), out);
-  EXPECT_TRUE(t.ok());
-  EXPECT_EQ(std::string(8192, 'q') + std::string(4096, 'q'),
-	    flatten(out, "a"));
 }
 
 TEST(ECGather, AppendsToWhatIsThere)
@@ -173,8 +156,7 @@ TEST(ECGather, AppendsToWhatIsThere)
   ceph::buffer::list keep;
   keep.append("k");
   out["d"].emplace_back(7, keep);
-  auto t = take_pushed(win.data(), win.size(), p.pushed,
-		       std::optional<uint32_t>(p.crc), out);
+  auto t = take_pushed(win.data(), win.size(), p.pushed, p.crc, out);
   ASSERT_TRUE(t.ok());
   EXPECT_EQ(3u, out.size());
   EXPECT_EQ("k", flatten(out, "d"));
@@ -196,8 +178,7 @@ TEST(ECGather, TheReplyCarriesTheChecksum)
   auto it = std::as_const(p).begin();
   got.decode(it);
   EXPECT_EQ(r.pushed, got.pushed);
-  ASSERT_TRUE(got.pushed_crc);
-  EXPECT_EQ(0xdeadbeefu, *got.pushed_crc);
+  EXPECT_EQ(0xdeadbeefu, got.pushed_crc);
 
   // to a peer from before pushes, neither goes out
   ceph::buffer::list op, od;
@@ -208,7 +189,7 @@ TEST(ECGather, TheReplyCarriesTheChecksum)
   auto oit = std::as_const(op).begin();
   old.decode(oit);
   EXPECT_TRUE(old.pushed.empty());
-  EXPECT_FALSE(old.pushed_crc);
+  EXPECT_EQ(0u, old.pushed_crc);
 }
 
 TEST(ECGather, TheReplySaysWhenNothingWasSent)
@@ -233,7 +214,6 @@ TEST(ECGather, TheReplySaysWhenNothingWasSent)
   got.decode(pit, dit);
   EXPECT_TRUE(got.push_declined);
   EXPECT_TRUE(got.pushed.empty());
-  EXPECT_FALSE(got.pushed_crc);
   ASSERT_EQ(1u, got.buffers_read[hoid].size());
   EXPECT_TRUE(got.buffers_read[hoid].front().second.contents_equal(bl));
 
@@ -260,17 +240,13 @@ TEST(ECGather, TheReplySaysWhenNothingWasSent)
   EXPECT_FALSE(old.push_declined);
 }
 
-TEST(ECGather, AV5ReplySaysNothingWasDeclined)
+namespace {
+
+/// what a reply holds up to v3, as Tentacle encodes it, with nothing read
+void encode_v3_fields(ceph::buffer::list& p, ceph_tid_t tid)
 {
-  // a shard from before push_declined (v5) never returns a window clean:
-  // its reply decodes as possibly having written
-  const hobject_t hoid(sobject_t("obj", CEPH_NOSNAP));
-  std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
-  pushed[hoid].emplace_back(0, 4096);
-  ceph::buffer::list p;
-  ENCODE_START(5, 2, p);
   encode(pg_shard_t(1, shard_id_t(1)), p);
-  encode(ceph_tid_t(9), p);
+  encode(tid, p);
   encode(__u32(0), p);  // buffers_read, encoded by hand from v2
   encode(std::map<hobject_t,
 		  std::map<std::string, ceph::buffer::list, std::less<>>>(),
@@ -280,21 +256,65 @@ TEST(ECGather, AV5ReplySaysNothingWasDeclined)
   encode(std::map<hobject_t, std::map<std::string, ceph::buffer::list>>(),
 	 p);  // omap entries
   encode(std::map<hobject_t, bool>(), p);  // omaps_complete
-  encode(pushed, p);
-  encode(std::optional<uint32_t>(0xfeedu), p);  // pushed_crc
+}
+
+} // anonymous namespace
+
+TEST(ECGather, AV3ReplyPushedNothing)
+{
+  // a shard from before pushes (v3) neither pushed nor declined: its
+  // reply decodes so, whatever the reply decoded into held before
+  ceph::buffer::list p;
+  ENCODE_START(3, 2, p);
+  encode_v3_fields(p, 9);
   ENCODE_FINISH(p);
 
   ECSubReadReply got;
+  got.pushed[hobject_t(sobject_t("obj", CEPH_NOSNAP))].emplace_back(0, 1);
+  got.pushed_crc = 1;
   got.push_declined = true;
   ceph::buffer::list d;
   auto pit = std::as_const(p).begin();
   auto dit = std::as_const(d).begin();
   got.decode(pit, dit);
   EXPECT_EQ(9u, got.tid);
-  EXPECT_EQ(pushed, got.pushed);
-  ASSERT_TRUE(got.pushed_crc);
-  EXPECT_EQ(0xfeedu, *got.pushed_crc);
+  EXPECT_TRUE(got.pushed.empty());
+  EXPECT_EQ(0u, got.pushed_crc);
   EXPECT_FALSE(got.push_declined);
+}
+
+TEST(ECGather, V4AddsThePushFields)
+{
+  // v4 follows v3 with the pushed extents, their crc32c and whether the
+  // push was declined, in that order. Any change here is a wire format
+  // change and needs a version bump
+  const hobject_t hoid(sobject_t("obj", CEPH_NOSNAP));
+  ECSubReadReply r;
+  r.from = pg_shard_t(1, shard_id_t(1));
+  r.tid = 9;
+  r.pushed[hoid].emplace_back(0, 4096);
+  r.pushed_crc = 0xfeedu;
+  r.push_declined = true;
+  ceph::buffer::list p, d;
+  r.encode(p, d, CEPH_FEATURES_ALL);
+
+  ceph::buffer::list want;
+  ENCODE_START(4, 2, want);
+  encode_v3_fields(want, 9);
+  encode(r.pushed, want);
+  encode(uint32_t(0xfeedu), want);
+  encode(true, want);
+  ENCODE_FINISH(want);
+  EXPECT_TRUE(p.contents_equal(want))
+    << "ECSubReadReply layout changed; this is a wire format break";
+
+  ECSubReadReply got;
+  auto pit = std::as_const(p).begin();
+  auto dit = std::as_const(d).begin();
+  got.decode(pit, dit);
+  EXPECT_EQ(r.pushed, got.pushed);
+  EXPECT_EQ(0xfeedu, got.pushed_crc);
+  EXPECT_TRUE(got.push_declined);
 }
 
 /*
@@ -527,7 +547,6 @@ void expect_inline(ECSubReadReply& op)
 {
   EXPECT_TRUE(same_buffers(shard_read(), op.buffers_read));
   EXPECT_TRUE(op.pushed.empty());
-  EXPECT_FALSE(op.pushed_crc);
 }
 
 } // anonymous namespace
@@ -572,8 +591,7 @@ TEST(ECGatherPush, APlacedPushReturnsTheExtents)
       }
     }
     EXPECT_EQ(extents, op.pushed);
-    ASSERT_TRUE(op.pushed_crc);
-    EXPECT_EQ(all.crc32c(-1), *op.pushed_crc);
+    EXPECT_EQ(all.crc32c(-1), op.pushed_crc);
 
     // and the primary takes the shard's buffers back out of its window
     buffers_t out;

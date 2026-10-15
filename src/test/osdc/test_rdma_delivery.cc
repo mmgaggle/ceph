@@ -63,11 +63,10 @@ TEST(RdmaDelivery, OobResultWireFormat)
 
   bufferlist bl;
   encode(r, bl);
-  // ENCODE_START(3,1) header, le64 bytes, le64 crc64, le32 flags,
-  // then the v2 ranges vector (le32 count, empty here), then the v3
-  // crc32c (le32)
+  // ENCODE_START(1,1) header, le64 bytes, le64 crc64, le32 flags,
+  // the ranges vector (le32 count, empty here), le32 crc32c
   static const unsigned char expected_bytes[] = {
-    0x03, 0x01, 0x1c, 0x00, 0x00, 0x00,              // v3, compat 1, len 28
+    0x01, 0x01, 0x1c, 0x00, 0x00, 0x00,              // v1, compat 1, len 28
     0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // bytes (le64)
     0x88, 0x98, 0x79, 0x0a, 0x86, 0x14, 0x8b, 0xae,  // crc64 (le64)
     0x01, 0x00, 0x00, 0x00,                          // flags (le32)
@@ -90,37 +89,47 @@ TEST(RdmaDelivery, OobResultWireFormat)
   EXPECT_TRUE(p.end());
 }
 
-// What an OSD of the previous release sends: a v2 result whose ranges
-// are v1, without CRC-32C values. It decodes with none.
-TEST(RdmaDelivery, OobResultFromOlderOsd)
+// A result with a range pins the range's layout too: ENCODE_START(1,1)
+// header, le64 ofs, le64 len, le64 crc64, le32 crc32c.
+TEST(RdmaDelivery, OobResultRangeWireFormat)
 {
+  ceph::rdma::oob_result_t r;
+  r.bytes = 0x1000;
+  r.crc64 = 0x1234;
+  r.flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME |
+            ceph::rdma::oob_result_t::FLAG_RANGES |
+            ceph::rdma::oob_result_t::FLAG_CRC32C;
+  r.ranges = {{0x2000, 0x1000, 0x5678, 0x9abc}};
+  r.crc32c = 0xdef0;
+
   bufferlist bl;
-  ENCODE_START(2, 1, bl);
-  encode(uint64_t(4096), bl);                 // bytes
-  encode(uint64_t(0x1234), bl);               // crc64
-  encode(ceph::rdma::oob_result_t::FLAG_CRC64NVME |
-         ceph::rdma::oob_result_t::FLAG_RANGES, bl);
-  encode(uint32_t(1), bl);                    // one range, v1
-  {
-    ENCODE_START(1, 1, bl);
-    encode(uint64_t(0), bl);
-    encode(uint64_t(4096), bl);
-    encode(uint64_t(0x1234), bl);
-    ENCODE_FINISH(bl);
-  }
-  ENCODE_FINISH(bl);
+  encode(r, bl);
+  static const unsigned char expected_bytes[] = {
+    0x01, 0x01, 0x3e, 0x00, 0x00, 0x00,              // v1, compat 1, len 62
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // bytes (le64)
+    0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // crc64 (le64)
+    0x45, 0x00, 0x00, 0x00,                          // flags (le32)
+    0x01, 0x00, 0x00, 0x00,                          // ranges: 1 entry
+    0x01, 0x01, 0x1c, 0x00, 0x00, 0x00,              // v1, compat 1, len 28
+    0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // ofs (le64)
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // len (le64)
+    0x78, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // crc64 (le64)
+    0xbc, 0x9a, 0x00, 0x00,                          // crc32c (le32)
+    0xf0, 0xde, 0x00, 0x00,                          // crc32c (le32)
+  };
+  bufferlist expected;
+  expected.append(reinterpret_cast<const char*>(expected_bytes),
+                  sizeof(expected_bytes));
+  EXPECT_TRUE(bl.contents_equal(expected))
+    << "oob result range layout changed; this is a wire format break";
 
   ceph::rdma::oob_result_t out;
   auto p = bl.cbegin();
   decode(out, p);
   EXPECT_TRUE(p.end());
-  EXPECT_EQ(4096u, out.bytes);
-  EXPECT_EQ(0x1234u, out.crc64);
-  EXPECT_EQ(0u, out.crc32c);
-  EXPECT_FALSE(out.flags & ceph::rdma::oob_result_t::FLAG_CRC32C);
-  ASSERT_EQ(1u, out.ranges.size());
-  EXPECT_EQ(0x1234u, out.ranges[0].crc64);
-  EXPECT_EQ(0u, out.ranges[0].crc32c);
+  EXPECT_EQ(r.flags, out.flags);
+  EXPECT_EQ(r.ranges, out.ranges);
+  EXPECT_EQ(r.crc32c, out.crc32c);
 }
 
 // The canonical CRC-32C is S3's, and two of them combine into the CRC of
@@ -390,7 +399,7 @@ TEST(RdmaDelivery, Crc64ValidityIsSeparateFromCombinability)
   // distinct bits: a scattered placement reports a checksum of the
   // bytes it moved without claiming it folds with its neighbours
   static_assert(ceph::rdma::oob_result_t::FLAG_CRC64NVME !=
-		ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE);
+		ceph::rdma::oob_result_t::FLAG_COMBINABLE);
 
   ceph::rdma::oob_result_t scattered;
   scattered.bytes = 1048576;
@@ -398,10 +407,10 @@ TEST(RdmaDelivery, Crc64ValidityIsSeparateFromCombinability)
   scattered.flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME;
   EXPECT_TRUE(scattered.flags & ceph::rdma::oob_result_t::FLAG_CRC64NVME);
   EXPECT_FALSE(scattered.flags &
-	       ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE);
+	       ceph::rdma::oob_result_t::FLAG_COMBINABLE);
 
   ceph::rdma::oob_result_t linear = scattered;
-  linear.flags |= ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE;
+  linear.flags |= ceph::rdma::oob_result_t::FLAG_COMBINABLE;
 
   // the extra bit rides in the existing flags field, so neither
   // combination changes the encoded length
@@ -415,31 +424,8 @@ TEST(RdmaDelivery, Crc64ValidityIsSeparateFromCombinability)
   decode(out, p);
   EXPECT_EQ(linear.crc64, out.crc64);
   EXPECT_TRUE(out.flags & ceph::rdma::oob_result_t::FLAG_CRC64NVME);
-  EXPECT_TRUE(out.flags & ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE);
+  EXPECT_TRUE(out.flags & ceph::rdma::oob_result_t::FLAG_COMBINABLE);
   EXPECT_TRUE(p.end());
-}
-
-TEST(RdmaDelivery, OobResultDecodesV1)
-{
-  // a v1 result (no ranges) from an older peer decodes with an empty
-  // ranges vector rather than reading past the struct
-  static const unsigned char v1_bytes[] = {
-    0x01, 0x01, 0x14, 0x00, 0x00, 0x00,              // v1, compat 1, len 20
-    0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // bytes (le64)
-    0x88, 0x98, 0x79, 0x0a, 0x86, 0x14, 0x8b, 0xae,  // crc64 (le64)
-    0x01, 0x00, 0x00, 0x00,                          // flags (le32)
-  };
-  bufferlist bl;
-  bl.append(reinterpret_cast<const char*>(v1_bytes), sizeof(v1_bytes));
-  ceph::rdma::oob_result_t out;
-  out.ranges = {{0, 1, 2}};  // must be cleared, not left over
-  auto p = bl.cbegin();
-  decode(out, p);
-  EXPECT_TRUE(p.end());
-  EXPECT_EQ(0x0102030405060708ull, out.bytes);
-  EXPECT_EQ(0xae8b14860a799888ull, out.crc64);
-  EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_CRC64NVME, out.flags);
-  EXPECT_TRUE(out.ranges.empty());
 }
 
 TEST(RdmaDelivery, OobResultRangesRoundTrip)
@@ -447,7 +433,7 @@ TEST(RdmaDelivery, OobResultRangesRoundTrip)
   ceph::rdma::oob_result_t r;
   r.bytes = 3 * 65536;
   r.flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME |
-	    ceph::rdma::oob_result_t::FLAG_CRC64_RANGES;
+	    ceph::rdma::oob_result_t::FLAG_RANGES;
   r.ranges = {{0, 65536, 1}, {131072, 65536, 2}, {262144, 65536, 3}};
   r.crc64 = 42;
 
@@ -561,7 +547,7 @@ TEST(RdmaDelivery, ResultReachesEitherForm)
   r1.bytes = 4096;
   r1.crc64 = 0x1234;
   r1.flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME |
-             ceph::rdma::oob_result_t::FLAG_CRC64_RANGES;
+             ceph::rdma::oob_result_t::FLAG_RANGES;
   r1.ranges = {{4096, 2048, 0x11}, {6144, 2048, 0x22}};
   Objecter::deliver_rdma_oob_result(o, 1, r1);
   ASSERT_TRUE(by_callback.has_value());
@@ -620,7 +606,7 @@ TEST(RdmaDelivery, PulledWriteCarriesItsDescriptor)
   r.bytes = 4 << 20;
   r.crc64 = 0xabcdef;
   r.flags = ceph::rdma::oob_result_t::FLAG_CRC64NVME |
-            ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE;
+            ceph::rdma::oob_result_t::FLAG_COMBINABLE;
   Objecter::deliver_rdma_oob_result(o, 1, r);
   ASSERT_TRUE(got.has_value());
   EXPECT_EQ(uint64_t(4 << 20), got->bytes);

@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <list>
 #include <map>
-#include <optional>
 #include <utility>
 
 #include "include/buffer.h"
@@ -36,10 +35,10 @@ struct pushed_take_t {
  * reply order. They are copied out first and checked after, so a write
  * that lands in the window meanwhile cannot change what was checked.
  *
- * When the shard sent the crc32c of what it pushed, the copy has to match
- * it. Without the check, the window's memory would pass for the shard's
- * data whatever put it there: a push that completed short, a stray or
- * late write that landed after it, or a window lent to two gathers.
+ * The copy has to match the crc32c the shard sent of what it pushed.
+ * Without the check, the window's memory would pass for the shard's data
+ * whatever put it there: a push that completed short, a stray or late
+ * write that landed after it, or a window lent to two gathers.
  *
  * On success the extents are appended to out; on failure out is left
  * as it was.
@@ -48,7 +47,7 @@ template <typename Key>
 pushed_take_t take_pushed(
   const char* win, uint64_t size,
   const std::map<Key, std::list<std::pair<uint64_t, uint64_t>>>& pushed,
-  const std::optional<uint32_t>& want_crc,
+  uint32_t want_crc,
   std::map<Key, std::list<std::pair<uint64_t, ceph::buffer::list>>>& out)
 {
   pushed_take_t t;
@@ -67,7 +66,7 @@ pushed_take_t take_pushed(
       t.bytes += len;
     }
   }
-  if (want_crc && *want_crc != t.crc) {
+  if (want_crc != t.crc) {
     t.mismatch = true;
     return t;
   }

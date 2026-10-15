@@ -42,6 +42,28 @@ ceph::oob::location_t loopback()
   return loc;
 }
 
+/// whether libfabric offers the tcp provider on the loopback. A test
+/// skips only without it: the executor failing to start over it is a
+/// failure of the test, not a reason to skip. The probe opens an
+/// ofi-rma endpoint, as the executor does, so a test skips as well
+/// should ofi-rma come to ask libfabric for more than tcp offers: only
+/// ofi-rma's own tests, which a Ceph build leaves out, catch that
+bool tcp_available()
+{
+  ofi_rma_config c;
+  ofi_rma_config_init(&c);
+  c.provider = "tcp";
+  c.node = "127.0.0.1";
+  ofi_rma_ep* ep = nullptr;
+  char err[1024] = "";
+  const int r = ofi_rma_ep_open(&c, &ep, err, sizeof(err));
+  ofi_rma_ep_close(ep);
+  // -ENODATA: fi_getinfo() found no tcp provider with what ofi-rma
+  // asks for
+  EXPECT_TRUE(r == 0 || r == -ENODATA) << err;
+  return r != -ENODATA;
+}
+
 } // anonymous namespace
 
 // Only the executor of the cluster transport lends the gather windows,
@@ -49,12 +71,13 @@ ceph::oob::location_t loopback()
 // none.
 TEST(OSDOfi, RegistersWindowsOnlyWhenLending)
 {
+  if (!tcp_available()) {
+    GTEST_SKIP() << "tcp is not available";
+  }
   {
     auto a = arena(1);
     OSDOfi ofi(g_ceph_context, nullptr);
-    if (ofi.init("tcp", loopback(), false, a.get()) != 0) {
-      GTEST_SKIP() << "tcp is not available";
-    }
+    ASSERT_EQ(0, ofi.init("tcp", loopback(), false, a.get()));
     EXPECT_TRUE(ofi.is_available());
     EXPECT_FALSE(ofi.acquire_window(4096));
     EXPECT_EQ(0u, a->stats().reserved);
@@ -65,6 +88,8 @@ TEST(OSDOfi, RegistersWindowsOnlyWhenLending)
     OSDOfi ofi(g_ceph_context, nullptr);
     ASSERT_EQ(0, ofi.init("tcp", loopback(), true, a.get()));
     EXPECT_EQ(2 * ceph::oob::Arena::MAX, a->stats().reserved);
+    // more than a window holds is refused while every window is free
+    EXPECT_FALSE(ofi.acquire_window(WINDOW + 1));
     std::vector<OSDOobExecutor::window_t> lent;
     while (auto w = ofi.acquire_window(4096)) {
       EXPECT_EQ(WINDOW, w->size);
@@ -72,7 +97,6 @@ TEST(OSDOfi, RegistersWindowsOnlyWhenLending)
       lent.push_back(*w);
     }
     EXPECT_EQ(16u, lent.size());
-    EXPECT_FALSE(ofi.acquire_window(WINDOW + 1));
     for (const auto& w : lent) {
       ofi.release_window(w.id, 0);
     }
@@ -163,11 +187,12 @@ client_t stalled(OSDOfi& ofi, size_t n)
 // client's window, through its staging, into a buffer of its own.
 TEST(OSDOfi, PullsAWritePayload)
 {
-  auto a = arena(1);
-  OSDOfi ofi(g_ceph_context, nullptr);
-  if (ofi.init("tcp", loopback(), false, a.get()) != 0) {
+  if (!tcp_available()) {
     GTEST_SKIP() << "tcp is not available";
   }
+  auto a = arena(1);
+  OSDOfi ofi(g_ceph_context, nullptr);
+  ASSERT_EQ(0, ofi.init("tcp", loopback(), false, a.get()));
   auto c = lend(WINDOW, ceph::ofi::Endpoint::remote_read);
   ASSERT_TRUE(c.ep);
   ASSERT_FALSE(c.token.empty()) << c.ep->last_error();
@@ -237,11 +262,12 @@ TEST(OSDOfi, CutoffPolicyIsSetAtStartup)
 // although its endpoint is broken as well.
 TEST(OSDOfi, FailedCutOffRaisesUnsafe)
 {
-  auto a = arena(1);
-  OSDOfi ofi(g_ceph_context, nullptr);
-  if (ofi.init("tcp", loopback(), false, a.get()) != 0) {
+  if (!tcp_available()) {
     GTEST_SKIP() << "tcp is not available";
   }
+  auto a = arena(1);
+  OSDOfi ofi(g_ceph_context, nullptr);
+  ASSERT_EQ(0, ofi.init("tcp", loopback(), false, a.get()));
   const size_t n = 4 << 20;
   auto c = stalled(ofi, n);
   ASSERT_TRUE(c.ep);
@@ -273,11 +299,12 @@ TEST(OSDOfi, FailedCutOffRaisesUnsafe)
 // it ended: not OOB_CUTOFF_LATE, which would say within the tolerance.
 TEST(OSDOfi, SlowCutOffRaisesUnsafeNotLate)
 {
-  auto a = arena(1);
-  OSDOfi ofi(g_ceph_context, nullptr);
-  if (ofi.init("tcp", loopback(), false, a.get()) != 0) {
+  if (!tcp_available()) {
     GTEST_SKIP() << "tcp is not available";
   }
+  auto a = arena(1);
+  OSDOfi ofi(g_ceph_context, nullptr);
+  ASSERT_EQ(0, ofi.init("tcp", loopback(), false, a.get()));
   const size_t n = 4 << 20;
   auto c = stalled(ofi, n);
   ASSERT_TRUE(c.ep);

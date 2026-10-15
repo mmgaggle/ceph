@@ -27,19 +27,20 @@ namespace ceph::oob { class Arena; }
 /**
  * Per-OSD cuObject RDMA endpoint for out-of-band delivery.
  *
- * Owns one cuObjServer (a DC initiator bound to the OSD's RDMA NIC)
- * and a pool of pre-registered host buffers that stripe data is staged
- * through on its way into client memory. Instantiated by OSD::init()
- * when an out-of-band transport option names "cuobj"; PrimaryLogPG
- * reaches it through
+ * Owns one cuObjServer (a DC initiator bound to the OSD's RDMA NIC),
+ * with which it registers the OSD's out-of-band memory (the arena)
+ * once. Each transfer stages its data in a buffer of the arena, taken
+ * at the transfer's size, on its way into or out of client memory.
+ * Instantiated by OSD::init() when an out-of-band transport option
+ * names "cuobj"; PrimaryLogPG reaches it through
  * OSDService::oob_executor_for() for cuObject tokens.
  *
  * Thread safety: execute_plan() and execute_pull() may be called
  * concurrently from any number of op worker threads, and of transfer
  * threads when cuObject runs on them (osd_oob_cuobj_transfer_threads).
  * Each thread lazily allocates its own cuObject channel (DCI), and only
- * that thread posts to it and polls it; buffer-pool slots are claimed
- * with atomic compare-exchange.
+ * that thread posts to it and polls it; the arena hands out staging
+ * buffers under its own lock.
  */
 class OSDCuObj : public OSDOobExecutor {
 public:

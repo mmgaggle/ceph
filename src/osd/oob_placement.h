@@ -13,16 +13,15 @@
  *
  * A plan is a correspondence, not a direction: each triple says
  * "local bytes [local_ofs, +len) correspond to client window offset
- * client_ofs". Today the only executor is the read path, which
- * RDMA-writes local reply data into the client window, but nothing
- * in a plan presumes that - the same geometry describes an OSD
- * RDMA-reading its share of a write payload out of client memory,
- * so the builders and their tests are reusable in that direction.
- * Direction belongs to the executor, not to the plan.
+ * client_ofs". The executors consume plans in both directions: a push
+ * (execute_plan()) RDMA-writes local reply data into the client
+ * window, and a pull (execute_pull()) RDMA-reads a write's payload out
+ * of it into local memory. Direction belongs to the executor, not to
+ * the plan.
  *
  * The builders are pure functions so the interleave math can be
- * unit-tested without an OSD or an RDMA stack; the cuObject executor
- * consumes the plan verbatim.
+ * unit-tested without an OSD or an RDMA stack; the executors consume
+ * the plan verbatim.
  */
 namespace ceph::osd::oob {
 

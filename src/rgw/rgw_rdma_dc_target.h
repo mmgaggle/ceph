@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <string>
 
+#include "common/rdma_dc_target.h"
 #include "include/common_fwd.h"
 #include "rgw_rdma_rc_transport.h"
 
@@ -31,7 +32,8 @@
  * the OSDs a token for the session buffer, and the stripes land in
  * gateway memory for the RC push. Only mlx5 devices implement DC, so
  * this is compiled only with HAVE_MLX5DV and opened only when the
- * device supports it.
+ * device supports it. The DCT itself is ceph::rdma::dc_target, which
+ * the OSD's gather target (osd_dc_target) brings up too.
  */
 namespace rgw::rdma::dc {
 
@@ -49,15 +51,12 @@ class Target {
   /// the cuObject descriptor for a registered window, in the form the
   /// OSDs' cuObject server library parses:
   /// "raddr:rsize:rkey:lid:dctn:has_gid:gid" (lowercase hex)
-  std::string token(const void* addr, uint32_t size, uint32_t rkey) const;
+  std::string token(const void* addr, uint32_t size, uint32_t rkey) const {
+    return dct.token(addr, size, rkey);
+  }
 
  private:
-  ibv_cq* cq = nullptr;
-  ibv_srq* srq = nullptr;
-  ibv_qp* dct = nullptr;
-  uint32_t dct_num = 0;
-  uint16_t lid = 0;
-  ibv_gid gid = {};
+  ceph::rdma::dc_target dct;
 };
 
 } // namespace rgw::rdma::dc

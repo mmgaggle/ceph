@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -32,6 +33,16 @@ inline constexpr size_t RDMA_TOKEN_MAX_LEN = 640;
 /// forwarded verbatim to the RDMA library. Returns std::nullopt on
 /// malformed input.
 std::optional<token_window> parse_rdma_token(std::string_view token);
+
+/// The cuObject descriptor of the window [addr, addr+size), registered
+/// with rkey, behind the Dynamically Connected target dctn at lid and
+/// gid: "raddr:rsize:rkey:lid:dctn:1:gid" in fixed-width lowercase hex,
+/// the form the cuObject server library parses. The DC targets of the
+/// OSD and the gateway (common/rdma_dc_target.h) hand these out.
+std::string format_cuobj_descriptor(uint64_t addr, uint32_t size,
+				    uint32_t rkey, uint16_t lid,
+				    uint32_t dctn,
+				    std::span<const uint8_t, 16> gid);
 
 /// Whether a token is a libfabric one (common/ofi_rma.h): its third
 /// field is "ofi<N>", the libfabric family at any version N, where a

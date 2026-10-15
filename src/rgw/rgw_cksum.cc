@@ -29,17 +29,16 @@ extern "C" {
 
 namespace rgw::cksum {
 
-  /* a stored CRC holds the big-endian bytes of the CRC, as Final()
-   * lays them out: swap between that and the CRC on little-endian
-   * hosts only */
   template <std::integral T>
-  static T stored_crc_order(T value)
+  T stored_crc_order(T value)
   {
     if constexpr (std::endian::native != std::endian::big) {
       value = rgw::digest::byteswap(value);
     }
     return value;
   }
+  template uint32_t stored_crc_order(uint32_t value);
+  template uint64_t stored_crc_order(uint64_t value);
 
   std::optional<Cksum>
   combine_crc_cksum(const Cksum& ck1, const Cksum& ck2, uintmax_t len1)

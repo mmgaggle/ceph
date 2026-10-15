@@ -3,19 +3,14 @@
 
 #pragma once
 
-#include <algorithm>
-#include <bit>
 #include <cerrno>
 #include <cstdint>
 #include <optional>
-#include <string>
-#include <string_view>
 
-#include <boost/algorithm/string/predicate.hpp>
-
-#include "include/crc32c.h"
+#include "include/rados/librados.hpp"
 #include "rgw_cksum.h"
-#include "rgw_crc_digest.h"
+
+struct req_state;
 
 /**
  * Checksums of out-of-band transfers: the CRCs that the OSDs compute of
@@ -38,6 +33,14 @@ struct cksum_want {
   bool any() const { return crc64nvme || crc32c; }
 };
 
+/// the librados RDMA_DELIVERY_WANT_* request flags of want
+inline uint32_t delivery_want_flags(const cksum_want& want)
+{
+  using R = librados::ObjectOperation;
+  return (want.crc64nvme ? R::RDMA_DELIVERY_WANT_CRC64 : 0) |
+    (want.crc32c ? R::RDMA_DELIVERY_WANT_CRC32C : 0);
+}
+
 /**
  * What a request's x-amz-rdma-checksum-algorithm asks for, given its
  * value or null: CRC64NVME, the default when the header is absent, or
@@ -46,54 +49,85 @@ struct cksum_want {
 inline int parse_checksum_algorithm(const char* value, cksum_want* want)
 {
   *want = cksum_want{};
-  if (!value || boost::iequals(std::string_view(value), "CRC64NVME")) {
+  switch (value ? rgw::cksum::parse_cksum_type(value)
+                : rgw::cksum::Type::crc64nvme) {
+  case rgw::cksum::Type::crc64nvme:
     want->crc64nvme = true;
     return 0;
-  }
-  if (boost::iequals(std::string_view(value), "CRC32C")) {
+  case rgw::cksum::Type::crc32c:
     want->crc32c = true;
     return 0;
+  default:
+    return -EINVAL;
   }
-  return -EINVAL;
 }
+
+/// parse_checksum_algorithm() of the request's header, which also sets
+/// the error message of a value it rejects
+int parse_checksum_header(req_state* s, cksum_want* want);
 
 /// S3's rendering of a canonical CRC-64/NVME: base64 of its big-endian
 /// bytes, as rgw::digest::Crc64Nvme::Final() lays out a stored checksum
 /// on either byte order
 inline rgw::cksum::Cksum cksum_crc64nvme(uint64_t canonical)
 {
-  if constexpr (std::endian::native != std::endian::big) {
-    canonical = rgw::digest::byteswap(canonical);
-  }
+  const uint64_t stored = rgw::cksum::stored_crc_order(canonical);
   return rgw::cksum::Cksum(rgw::cksum::Type::crc64nvme,
-                           reinterpret_cast<char*>(&canonical),
+                           reinterpret_cast<const char*>(&stored),
                            rgw::cksum::Cksum::CtorStyle::raw);
 }
 
 /// the same for a canonical CRC-32C, as rgw::digest::Crc32c::Final()
 inline rgw::cksum::Cksum cksum_crc32c(uint32_t canonical)
 {
-  if constexpr (std::endian::native != std::endian::big) {
-    canonical = rgw::digest::byteswap(canonical);
-  }
+  const uint32_t stored = rgw::cksum::stored_crc_order(canonical);
   return rgw::cksum::Cksum(rgw::cksum::Type::crc32c,
-                           reinterpret_cast<char*>(&canonical),
+                           reinterpret_cast<const char*>(&stored),
                            rgw::cksum::Cksum::CtorStyle::raw);
 }
 
+/// the x-amz-rdma-checksum-<algorithm> header of each CRC given
+void dump_checksums(req_state* s, const std::optional<uint64_t>& crc64,
+                    const std::optional<uint32_t>& crc32c);
+
 /// the canonical CRC-32C of len bytes at p, as rgw::digest::Crc32c
 /// computes it
-inline uint32_t crc32c_of(const void* p, uint64_t len)
-{
-  const auto* b = static_cast<const unsigned char*>(p);
-  uint32_t crc = 0xffffffff;
-  while (len > 0) {
-    const unsigned n = static_cast<unsigned>(std::min<uint64_t>(len, 1u << 30));
-    crc = ceph_crc32c(crc, b, n);
-    b += n;
-    len -= n;
-  }
-  return crc ^ 0xffffffff;
-}
+uint32_t crc32c_of(const void* p, uint64_t len);
+
+/// the canonical CRCs of some bytes, those that are known
+struct crcs {
+  std::optional<uint64_t> crc64;
+  std::optional<uint32_t> crc32c;
+};
+
+/**
+ * The CRCs of the bytes that an OSD reported for one operation, those
+ * that fold with their neighbours': its own when it marked them
+ * combinable (one contiguous extent), or the fold of its ranges when it
+ * placed the bytes as several that cover them exactly, as a stripe
+ * served by interleaved EC shards arrives. Neither without its valid
+ * flag.
+ */
+crcs delivered_crcs(
+  const librados::ObjectOperation::rdma_delivery_result& r);
+
+/**
+ * Folds the CRCs of consecutive extents, appended in object order, into
+ * those of their concatenation, for the CRCs wanted. An extent without
+ * one of them ends that CRC: skipping it would cover the wrong bytes.
+ */
+class crc_fold {
+  cksum_want live;
+  crcs folded;
+
+public:
+  explicit crc_fold(const cksum_want& want) : live(want) {}
+
+  /// the next extent, of len bytes
+  void append(const crcs& c, uint64_t len);
+
+  /// those of everything appended; none before the first extent
+  const crcs& result() const { return folded; }
+};
 
 } // namespace rgw::rdma

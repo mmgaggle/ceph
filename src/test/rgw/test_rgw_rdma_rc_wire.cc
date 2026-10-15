@@ -225,8 +225,20 @@ TEST(RdmaRcWire, ChecksumHeaders)
   EXPECT_TRUE(w.crc32c);
   ASSERT_EQ(0, rgw::rdma::parse_checksum_algorithm("CRC64NVME", &w));
   EXPECT_TRUE(w.crc64nvme);
+  EXPECT_FALSE(w.crc32c);
+  // S3 checksums that the OSDs do not compute, and no checksum
   EXPECT_EQ(-EINVAL, rgw::rdma::parse_checksum_algorithm("SHA256", &w));
+  EXPECT_EQ(-EINVAL, rgw::rdma::parse_checksum_algorithm("CRC32", &w));
+  EXPECT_EQ(-EINVAL, rgw::rdma::parse_checksum_algorithm("none", &w));
   EXPECT_EQ(-EINVAL, rgw::rdma::parse_checksum_algorithm("", &w));
+
+  // the request flags that ask the OSDs for them
+  using R = librados::ObjectOperation;
+  EXPECT_EQ(R::RDMA_DELIVERY_WANT_CRC64,
+            rgw::rdma::delivery_want_flags({.crc64nvme = true}));
+  EXPECT_EQ(R::RDMA_DELIVERY_WANT_CRC64 | R::RDMA_DELIVERY_WANT_CRC32C,
+            rgw::rdma::delivery_want_flags({true, true}));
+  EXPECT_EQ(0u, rgw::rdma::delivery_want_flags({}));
 }
 
 TEST(RdmaRcWire, SignedHeaders)

@@ -269,12 +269,9 @@ class GetOp : public RGWGetObj {
 
   int get_params(optional_yield y) override {
     // the CRC of the delivered bytes the READY answer reports
-    if (rgw::rdma::parse_checksum_algorithm(
-          s->info.env->get("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", nullptr),
-          &rdma_cksum_asked) < 0) {
-      s->err.message = "x-amz-rdma-checksum-algorithm must be CRC64NVME "
-                       "or CRC32C";
-      return -EINVAL;
+    if (int r = rgw::rdma::parse_checksum_header(s, &rdma_cksum_asked);
+        r < 0) {
+      return r;
     }
     // the range is the session's, never a Range header
     range_str = nullptr;
@@ -625,14 +622,7 @@ void GetOp::send_response()
     dump_header_if_nonempty(s, "x-amz-rdma-version-id", version_id);
     // the checksums of the delivered range, not of the object, so not
     // in S3's x-amz-checksum-<algorithm>
-    if (final_crc64) {
-      dump_header(s, rgw::rdma::HDR_CRC64NVME,
-                  rgw::rdma::cksum_crc64nvme(*final_crc64).to_armor());
-    }
-    if (final_crc32c) {
-      dump_header(s, rgw::rdma::HDR_CRC32C,
-                  rgw::rdma::cksum_crc32c(*final_crc32c).to_armor());
-    }
+    rgw::rdma::dump_checksums(s, final_crc64, final_crc32c);
   }
   end_header(s, this, nullptr, 0);
 }
@@ -682,12 +672,8 @@ class PutOp : public RGWPutObj_ObjStore_S3 {
     if (!s->length) {
       s->length = "0";
     }
-    if (rgw::rdma::parse_checksum_algorithm(
-          s->info.env->get("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", nullptr),
-          &cksum_asked) < 0) {
-      s->err.message = "x-amz-rdma-checksum-algorithm must be CRC64NVME "
-                       "or CRC32C";
-      return -EINVAL;
+    if (int r = rgw::rdma::parse_checksum_header(s, &cksum_asked); r < 0) {
+      return r;
     }
     return RGWPutObj_ObjStore_S3::get_params(y);
   }
@@ -827,14 +813,7 @@ void PutOp::send_response()
     dump_header_if_nonempty(s, "x-amz-rdma-version-id", version_id);
     // the checksums of the bytes the client wrote, and the object's
     // stored one, as S3 reports it
-    if (final_crc64) {
-      dump_header(s, rgw::rdma::HDR_CRC64NVME,
-                  rgw::rdma::cksum_crc64nvme(*final_crc64).to_armor());
-    }
-    if (final_crc32c) {
-      dump_header(s, rgw::rdma::HDR_CRC32C,
-                  rgw::rdma::cksum_crc32c(*final_crc32c).to_armor());
-    }
+    rgw::rdma::dump_checksums(s, final_crc64, final_crc32c);
     if (cksum && cksum->aws()) {
       dump_header(s, cksum->header_name(), cksum->to_armor());
     }

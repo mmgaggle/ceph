@@ -93,7 +93,6 @@
 #ifdef WITH_CUOBJ
 #include "rgw_cuobj.h"
 #endif
-#include "common/crc64nvme.h"
 #include "common/oob_config.h"
 #include "common/rdma_token.h"
 #include "rgw_rdma_fence.h"
@@ -2867,8 +2866,10 @@ int RGWGetObj::rdma_stage(bufferlist& bl, off_t bl_ofs, off_t bl_len)
                        << rdma_buf_offset << "+" << bl_len << dendl;
     return -EIO;
   }
-  memcpy(static_cast<char*>(entry->ptr) + rdma_buf_offset,
-         bl.c_str() + bl_ofs, bl_len);
+  // segment by segment: c_str() would first copy a list of several
+  // segments into one
+  bl.begin(bl_ofs).copy(bl_len,
+                        static_cast<char*>(entry->ptr) + rdma_buf_offset);
   rdma_buf_offset += bl_len;
   return 0;
 #else
@@ -5696,22 +5697,22 @@ void RGWPutObj::execute(optional_yield y)
     // the ETag is built from every stripe's CRC-64/NVME; the object's
     // checksum is the CRC-32C when the client chose that, else the
     // CRC-64/NVME
-    const bool want32c = cksum_filter &&
-      cksum_filter->type() == rgw::cksum::Type::crc32c;
-    const uint32_t want =
-      librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC64 |
-      (want32c ? librados::ObjectOperation::RDMA_DELIVERY_WANT_CRC32C : 0);
+    const rgw::rdma::cksum_want want{
+      .crc64nvme = true,
+      .crc32c = cksum_filter &&
+                cksum_filter->type() == rgw::cksum::Type::crc32c};
     std::vector<rgw::sal::PulledStripe> stripes;
     tracepoint(rgw_op, before_data_transfer, s->req_id.c_str());
-    op_ret = processor->process_pulled(total, *rdma_put_token, want, &stripes);
+    op_ret = processor->process_pulled(total, *rdma_put_token,
+                                       rgw::rdma::delivery_want_flags(want),
+                                       &stripes);
     tracepoint(rgw_op, after_data_transfer, s->req_id.c_str(), total);
     // every stripe must have arrived whole, with its checksums: the
     // object's checksum and ETag are built from them
-    std::optional<uint64_t> crc;
-    std::optional<uint32_t> crc32c;
+    rgw::rdma::crc_fold fold(want);
     if (op_ret == 0) {
       for (const auto& st : stripes) {
-        const bool sums = st.crc64_valid && (!want32c || st.crc32c_valid);
+        const bool sums = st.crc64_valid && (!want.crc32c || st.crc32c_valid);
         if (st.bytes != st.len || !sums) {
           ldpp_dout(this, 1) << "OSD-direct PUT: the stripe at " << st.ofs
                              << " reported " << st.bytes << " of " << st.len
@@ -5721,16 +5722,12 @@ void RGWPutObj::execute(optional_yield y)
           op_ret = -EIO;
           break;
         }
-        crc = crc ? ceph::crc64nvme_combine(*crc, st.crc64, st.len)
-                  : st.crc64;
-        if (want32c) {
-          crc32c = crc32c ?
-            ceph::rdma::crc32c_combine(*crc32c, st.crc32c, st.len) :
-            st.crc32c;
-        }
+        // the fold takes only the CRCs it wants
+        fold.append({st.crc64, st.crc32c}, st.len);
       }
     }
-    if (op_ret < 0 || !crc || (want32c && !crc32c)) {
+    const auto& crc = fold.result();
+    if (op_ret < 0 || !crc.crc64 || (want.crc32c && !crc.crc32c)) {
       // nothing is visible: the head was not written, and the writer
       // removes the stripes it wrote
       ldpp_dout(this, 1) << "OSD-direct PUT of " << total << " bytes failed: "
@@ -5746,8 +5743,8 @@ void RGWPutObj::execute(optional_yield y)
     s->obj_size = total;
     s->object->set_obj_size(total);
     s->rdma_bytes_transferred = total;
-    rdma_pulled_crc64 = crc;
-    rdma_pulled_crc32c = crc32c;
+    rdma_pulled_crc64 = crc.crc64;
+    rdma_pulled_crc32c = crc.crc32c;
     pulled_etag = osd_put_etag(stripes);
     rdma_pulled = true;
   }

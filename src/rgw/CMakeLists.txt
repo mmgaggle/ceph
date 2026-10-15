@@ -331,6 +331,9 @@ if(WITH_CUOBJ)
   list(APPEND librgw_common_srcs rgw_cuobj.cc)
 endif()
 
+# the checksums of out-of-band transfers, of every transport
+list(APPEND librgw_common_srcs rgw_rdma_cksum.cc)
+
 # hipobj-rc-v2 wire encoding: pure, no transport dependency
 list(APPEND librgw_common_srcs rgw_rdma_rc_wire.cc)
 if(WITH_RDMA_RC)

@@ -935,7 +935,7 @@ void ECBackend::handle_sub_read_reply(
 	dout(0) << __func__ << ": the " << t.bytes << " bytes shard " << from
 		<< " pushed into gather window " << w->id << " (" << w->token
 		<< ") do not match its checksum: crc32c 0x" << std::hex
-		<< t.crc << " != 0x" << *op.pushed_crc << std::dec
+		<< t.crc << " != 0x" << op.pushed_crc << std::dec
 		<< "; reading it again inline" << dendl;
 	rop.gather.exec->note_gather_crc_mismatch();
       } else if (t.overrun) {

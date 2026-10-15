@@ -23,8 +23,6 @@
 #include "os/ObjectStore.h"
 #include "boost/tuple/tuple.hpp"
 
-#include <optional>
-
 struct ECSubWrite {
   pg_shard_t from;
   ceph_tid_t tid;
@@ -159,9 +157,9 @@ struct ECSubReadReply {
   /// there back to back
   std::map<hobject_t, std::list<std::pair<uint64_t, uint64_t>>> pushed;
   /// crc32c (seeded with -1) of the data pushed, as the shard read it;
-  /// the primary takes the window's content only if it matches. Unset
-  /// from a shard that pushed nothing, or predates it.
-  std::optional<uint32_t> pushed_crc;
+  /// the primary takes the window's content only if it matches. Zero
+  /// from a shard that pushed nothing.
+  uint32_t pushed_crc = 0;
   /// the shard held a push token and handed no write for the window to
   /// its transport: it returns its data inline, and nothing of it can
   /// land in the window later. False from a shard that may have written,

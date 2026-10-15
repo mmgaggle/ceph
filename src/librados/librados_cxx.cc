@@ -254,10 +254,10 @@ void librados::ObjectReadOperation::set_rdma_delivery(
 		ceph::rdma::oob_result_t::FLAG_CRC32C);
   static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_VALID ==
 		ceph::rdma::oob_result_t::FLAG_CRC64NVME);
-  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_COMBINABLE ==
-		ceph::rdma::oob_result_t::FLAG_CRC64_COMBINABLE);
-  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_CRC64_RANGES ==
-		ceph::rdma::oob_result_t::FLAG_CRC64_RANGES);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_COMBINABLE ==
+		ceph::rdma::oob_result_t::FLAG_COMBINABLE);
+  static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_RANGES ==
+		ceph::rdma::oob_result_t::FLAG_RANGES);
   static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_DECLINED ==
 		ceph::rdma::oob_result_t::FLAG_DECLINED);
   static_assert(librados::ObjectReadOperation::RDMA_DELIVERY_LANDED ==

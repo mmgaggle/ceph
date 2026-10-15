@@ -578,8 +578,8 @@ CHECK_C_COMPILER_FLAG("-fvar-tracking-assignments" HAS_VTA)
 # ofi-rma: libfabric RMA for out-of-band delivery, in a library of its
 # own so that clients can lend windows without building Ceph. Its header
 # is always on the include path, since common's token code reads the
-# libfabric token tag from it; the library itself is built only
-# WITH_OOB_OFI.
+# libfabric token tag and length from it; the library itself is built
+# only WITH_OOB_OFI.
 option(WITH_SYSTEM_OFI_RMA "build against an installed ofi-rma" OFF)
 if(WITH_SYSTEM_OFI_RMA)
   # 0.4 for the staging fields of config_t that osd_ofi.cc sets; its
@@ -694,8 +694,8 @@ if(WITH_BREAKPAD)
 endif()
 
 if(WITH_EC_ISA_PLUGIN)
-  # ISA-L, built by src/erasure-code/isa, for its CRC-64 (see
-  # src/common/CMakeLists.txt)
+  # ISA-L, built by src/erasure-code/isa, for the CRC-64 of
+  # ceph::crc64nvme() (src/common/crc64nvme.cc)
   list(APPEND ceph_common_deps ISAL::ISAL)
 endif()
 

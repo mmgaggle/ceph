@@ -140,9 +140,21 @@ int OSDOfi::init(const std::string& provider,
   // verbs registration cache off: ceph-osd's main() sets
   // FI_MR_CACHE_MONITOR before any thread starts
   std::string err;
-  ep = ceph::ofi::Endpoint::open(cfg, &err);
+  const auto open = [&] { ep = ceph::ofi::Endpoint::open(cfg, &err); };
+  std::string no_raw;
+  if (!ceph::oob::needs_net_raw(provider)) {
+    open();
+  } else if (ceph::oob::with_net_raw(open, &no_raw) == -EPERM) {
+    // see global_init(): the switch to another user comes before the mon
+    // config
+    no_raw += "; an osd started with --setuser keeps it only when "
+      "ceph.conf or its command line, not the mon config alone, makes " +
+      provider + " the provider of its endpoint: oob_cluster_transport, "
+      "or else the first libfabric provider in oob_client_transports";
+  }
   if (!ep) {
-    derr << "libfabric endpoint: " << err << dendl;
+    derr << "libfabric endpoint: " << err
+	 << (no_raw.empty() ? "" : "; " + no_raw) << dendl;
     return -EIO;
   }
 

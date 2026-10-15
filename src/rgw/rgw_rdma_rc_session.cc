@@ -14,7 +14,6 @@
 #include "rgw_rdma_rc_session.h"
 
 #include <cerrno>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <random>
@@ -174,10 +173,6 @@ int Service::do_init(CephContext* c)
       ceph::oob::ofi_where(loc, oob.cluster, &oc.domain, &oc.node);
       // OSD writes land only while a manual-progress provider is polled
       oc.progress_thread = true;
-      // a relay window is closed when its session ends, which revokes
-      // its key only when the provider does not keep the region: verbs
-      // caches registrations unless the cache is off
-      setenv("FI_MR_CACHE_MONITOR", "disabled", 0);
       std::string err;
       ofi_ep = ceph::ofi::Endpoint::open(oc, &err);
       if (ofi_ep) {
@@ -241,16 +236,22 @@ void Service::do_shutdown()
   }
   {
     std::unique_lock l(mtx);
-    // no handler may still hold a session by now; destroy every queue
-    // pair before the memory it references. The arena, which holds the
-    // memory, goes after the service, and nothing takes from it any more
+    // no handler may still hold a session by now, and the reaper is
+    // gone: destroy every queue pair, of the sessions in the table and of
+    // those that ended, before the memory it references. The arena, which
+    // holds the memory, goes after the service, and nothing takes from it
+    // any more
     for (auto& [id, s] : sessions) {
+      ended.push_back(std::move(s));
+    }
+    sessions.clear();
+    for (auto& s : ended) {
       s->conn.destroy();
       if (s->buf) {
         free_buffer(*s->buf);
       }
     }
-    sessions.clear();
+    ended.clear();
     for (auto& b : held) {
       free_buffer(*b);
     }
@@ -352,6 +353,29 @@ std::unique_ptr<Buffer> Service::make_buffer(Op op, size_t size)
 #endif
   }
   return b;
+}
+
+std::unique_ptr<Buffer> Service::make_buffer_from_ended(Op op, size_t size)
+{
+  // Only the sessions that ended until now: those that end meanwhile
+  // are not this request's to wait for. After each teardown, here or
+  // elsewhere, the buffer may fit already
+  std::unique_lock l(mtx);
+  const uint64_t upto = teardowns.last();
+  for (;;) {
+    if (!ended.empty() && ended.front()->ended_seq <= upto) {
+      tear_down_one(l);
+    } else if (teardowns.running_upto(upto)) {
+      teardown_cv.wait(l);
+    } else {
+      return nullptr;
+    }
+    l.unlock();
+    if (auto b = make_buffer(op, size); b) {
+      return b;
+    }
+    l.lock();
+  }
 }
 
 std::unique_ptr<Buffer> Service::release_buffer(
@@ -478,7 +502,6 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
     }
     std::memcpy(s->peer.gid.raw, tok->gid, sizeof(tok->gid));
     s->peer.lid = tok->lid;
-    s->peer_known = true;
     // a PUT client may advertise its window here already
     s->client_mr_addr = tok->addr;
     s->client_mr_rkey = tok->rkey;
@@ -495,12 +518,18 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
   }
   s->buf = make_buffer(s->op, req.size);
   if (!s->buf) {
+    // the arena may be short only of the buffers of sessions that ended
+    // and are not torn down yet
+    s->buf = make_buffer_from_ended(s->op, req.size);
+  }
+  if (!s->buf) {
     std::lock_guard l(mtx);
     limits.release(req.principal);
     // for the 503: a buffer an OSD write may still land in stays out of
     // the arena until its quarantine passes
     ldout(cct, 4) << "rgw_rdma_rc: no buffer of " << req.size << " bytes: "
-                  << sessions.size() << " sessions, " << held.size()
+                  << sessions.size() << " sessions, " << ended.size()
+                  << " ended ones to tear down, " << held.size()
                   << " buffers in quarantine" << dendl;
     return Error::NO_BUFFER;
   }
@@ -587,25 +616,6 @@ Error Service::prepare(const PrepareRequest& req, PrepareReply& reply)
   return Error::INTERNAL;
 }
 
-Error Service::info(const std::string& id, const std::string& principal,
-                    SessionInfo& out)
-{
-  std::lock_guard l(mtx);
-  auto it = sessions.find(id);
-  if (it == sessions.end()) {
-    return Error::NO_SESSION;
-  }
-  const Session& s = *it->second;
-  if (s.principal != principal) {
-    return Error::SESSION;
-  }
-  out.op = s.op;
-  out.target = s.target;
-  out.size = s.size;
-  out.offset = s.offset;
-  return Error::OK;
-}
-
 Error Service::peek(const std::string& id, SessionInfo& out)
 {
   std::lock_guard l(mtx);
@@ -637,10 +647,10 @@ Error Service::claim(const ReadyRequest& req, Session** out)
     if (s->principal != req.principal) {
       return Error::SESSION;
     }
-    if (s->state == State::TRANSFERRING || s->state == State::COMPLETING) {
+    if (s->state == State::TRANSFERRING) {
       return Error::STATE;  // duplicate READY
     }
-    if (s->state != State::PREPARED || s->reap_pending) {
+    if (s->reap_pending) {
       return Error::STALE;
     }
     if (req.cookie != s->cookie) {
@@ -675,7 +685,6 @@ void Service::finish(Session* s, Outcome outcome, uint64_t bytes,
 {
   std::unique_lock l(mtx);
   s->last_outcome = outcome;
-  s->bytes = bytes;
   ldout(cct, 20) << "rgw_rdma_rc: session " << s->id << " finished "
                  << to_string(outcome) << " bytes=" << bytes << dendl;
   if (outcome == Outcome::BUSY && !s->reap_pending &&
@@ -700,18 +709,26 @@ void Service::finish(Session* s, Outcome outcome, uint64_t bytes,
     }
     s->last_outcome = Outcome::WIRE_FAIL;
   }
+  if (s->conn.outstanding() > 0) {
+    // a push that failed or timed out may leave writes in the send
+    // queue, which the queue pair would go on sending into the client's
+    // memory after the reply. It goes now, before the reply, rather
+    // than with the teardown; the io reference still pins the session
+    l.unlock();
+    s->conn.destroy();
+    l.lock();
+  }
   s->io_refs = 0;
   s->reap_pending = true;
-  s->state = State::REAPING;
-  // the reap hands it to release_buffer(), which closes the buffer's
+  // the reaper hands it to release_buffer(), which closes the buffer's
   // windows and must not mistake it for a clean one
   s->quarantine = quarantine;
-  reap_locked(l, s->id);
+  reap_locked(s->id);
 }
 
 Error Service::cancel(const std::string& id, const std::string& principal)
 {
-  std::unique_lock l(mtx);
+  std::lock_guard l(mtx);
   auto it = sessions.find(id);
   if (it == sessions.end()) {
     return Error::STALE;
@@ -722,28 +739,12 @@ Error Service::cancel(const std::string& id, const std::string& principal)
   }
   s.reap_pending = true;
   if (s.io_refs == 0) {
-    reap_locked(l, id);
+    reap_locked(id);
   }
   return Error::OK;
 }
 
-void Service::cancel_all()
-{
-  std::unique_lock l(mtx);
-  std::vector<std::string> ids;
-  for (auto& [id, s] : sessions) {
-    s->reap_pending = true;
-    if (s->io_refs == 0) {
-      ids.push_back(id);
-    }
-  }
-  for (const auto& id : ids) {
-    reap_locked(l, id);
-  }
-}
-
-void Service::reap_locked(std::unique_lock<std::mutex>& lock,
-                          const std::string& id)
+void Service::reap_locked(const std::string& id)
 {
   auto it = sessions.find(id);
   if (it == sessions.end() || it->second->io_refs > 0) {
@@ -755,29 +756,68 @@ void Service::reap_locked(std::unique_lock<std::mutex>& lock,
   ldout(cct, 20) << "rgw_rdma_rc: reaping session " << s->id << " ("
                  << to_string(s->last_outcome) << ", quarantine "
                  << s->quarantine.count() << "ms)" << dendl;
-  // the queue pair must be gone before its buffer is: a posted work
-  // request may still reference the region
+  s->ended_seq = teardowns.ended();
+  ended.push_back(std::move(s));
+  reaper_cv.notify_one();
+}
+
+void Service::tear_down_ended(std::unique_lock<std::mutex>& lock)
+{
+  // only those queued now: sessions that end meanwhile must not keep
+  // the reaper from its scan
+  const uint64_t upto = teardowns.last();
+  while (!ended.empty() && ended.front()->ended_seq <= upto) {
+    tear_down_one(lock);
+  }
+}
+
+void Service::tear_down_one(std::unique_lock<std::mutex>& lock)
+{
+  std::unique_ptr<Session> s = std::move(ended.front());
+  ended.pop_front();
+  teardowns.begin(s->ended_seq);
   lock.unlock();
-  s->conn.destroy();
-  // with the quarantine finish() was given. A session reaped without
-  // finish() has none: it never ran a data phase, or went back to
-  // PREPARED after one that left no write in flight.
-  auto hold = release_buffer(std::move(s->buf), s->quarantine);
+  auto hold = tear_down(*s);
   lock.lock();
+  teardowns.end(s->ended_seq);
   if (hold) {
     held.push_back(std::move(hold));
   }
+  // a PREPARE short of a buffer may wait for this one
+  teardown_cv.notify_all();
+}
+
+std::unique_ptr<Buffer> Service::tear_down(Session& s)
+{
+  // the queue pair, unless finish() destroyed it already, must be gone
+  // before its buffer is: a posted work request may still reference the
+  // region
+  s.conn.destroy();
+  // with the quarantine finish() was given. A session reaped without
+  // finish() has none: it never ran a data phase, or went back to
+  // PREPARED after one that left no write in flight.
+  return release_buffer(std::move(s.buf), s.quarantine);
 }
 
 void Service::reaper_loop()
 {
   std::unique_lock l(mtx);
+  auto next_scan = clock::now() + std::chrono::seconds(1);
   while (!reaper_stop) {
-    reaper_cv.wait_for(l, std::chrono::seconds(1));
+    // sessions that ended are torn down as they come; the scan for held
+    // buffers and expired sessions runs once a second
+    reaper_cv.wait_until(l, next_scan, [this] {
+      return reaper_stop || !ended.empty();
+    });
     if (reaper_stop) {
       break;
     }
+    tear_down_ended(l);
     const auto now = clock::now();
+    if (now < next_scan) {
+      continue;
+    }
+    next_scan = now + std::chrono::seconds(1);
     // buffers whose quarantine passed go back to the arena
     std::vector<std::unique_ptr<Buffer>> due;
     for (auto it = held.begin(); it != held.end(); ) {
@@ -808,8 +848,9 @@ void Service::reaper_loop()
         expired.push_back(id);
       }
     }
+    // torn down on the next pass
     for (const auto& id : expired) {
-      reap_locked(l, id);
+      reap_locked(id);
     }
   }
 }

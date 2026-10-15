@@ -463,6 +463,44 @@ TEST(RdmaRcLimits, ZeroAdmitsNone)
   EXPECT_EQ(0u, no_user.sessions());
 }
 
+TEST(RdmaRcTeardowns, WaitsForThoseThatEndedBefore)
+{
+  // a PREPARE that finds the arena full waits for the teardowns of the
+  // sessions that ended until then, also one the reaper runs already
+  Teardowns t;
+  EXPECT_FALSE(t.running_upto(t.last()));
+  const auto a = t.ended();
+  t.begin(a);
+  const auto upto = t.last();
+  EXPECT_TRUE(t.running_upto(upto));
+  // and not for a session that ends and is torn down meanwhile
+  const auto b = t.ended();
+  EXPECT_LT(a, b);
+  t.begin(b);
+  t.end(a);
+  EXPECT_FALSE(t.running_upto(upto));
+  EXPECT_TRUE(t.running_upto(t.last()));
+  t.end(b);
+  EXPECT_FALSE(t.running_upto(t.last()));
+}
+
+TEST(RdmaRcTeardowns, OutOfOrder)
+{
+  // the reaper and a PREPARE tear down side by side, and the later
+  // teardown can be done first
+  Teardowns t;
+  const auto a = t.ended();
+  const auto b = t.ended();
+  t.begin(a);
+  t.begin(b);
+  const auto upto = t.last();
+  t.end(b);
+  EXPECT_TRUE(t.running_upto(upto));
+  EXPECT_TRUE(t.running_upto(a));
+  t.end(a);
+  EXPECT_FALSE(t.running_upto(upto));
+}
+
 TEST(RdmaRcTransport, PathMtu)
 {
   // 0 takes the port's active MTU

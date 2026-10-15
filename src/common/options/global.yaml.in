@@ -1,6 +1,9 @@
 # -*- mode: YAML -*-
 ---
 
+headers: |
+  // cuobj_dc_key validation
+  #include "common/oob_config.h"
 options:
 - name: host
   type: str
@@ -157,7 +160,9 @@ options:
     OSD and gateway takes the first address of its host in these subnets for
     its out-of-band transports. From the address it finds the network
     interface, and for an RDMA transport the device, the port and the RoCE
-    GID that carry the address. Empty means the daemon's public address.
+    GID that carry the address. When it is empty, an OSD uses its public
+    address, and a gateway uses public_addr only when that is set. Set it
+    for every gateway that runs a transport.
   tags:
   - network
   services:
@@ -259,12 +264,14 @@ options:
   flags:
   - startup
 - name: cuobj_dc_key
-  type: uint
+  type: str
   level: advanced
   desc: Dynamically Connected key of every cuObject DC initiator and target
   long_desc: It must match the key of the cuObject client library across the
-    cluster. The default, 0xffeeddcc, is the library's default.
-  default: 4293844428
+    cluster, rdma_dc_key in cufile.json. Give it in hexadecimal after 0x, as
+    cufile.json does, or in decimal; any other value is rejected. The
+    default, 0xffeeddcc, is the library's default.
+  default: "0xffeeddcc"
   services:
   - osd
   - rgw
@@ -272,6 +279,16 @@ options:
   - oob_client_transports
   flags:
   - startup
+  validator: |
+    [](std::string *value, std::string *error_message) {
+      uint64_t key;
+      if (!ceph::oob::parse_dc_key(*value, &key)) {
+        *error_message = "not a 64-bit key in hexadecimal after 0x, such "
+                         "as 0xffeeddcc, or in decimal";
+        return -EINVAL;
+      }
+      return 0;
+    }
 - name: monmap
   type: str
   level: advanced

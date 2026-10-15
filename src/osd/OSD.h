@@ -75,7 +75,6 @@ class MonClient;
 class ObjectStore;
 class FuseStore;
 class OSDCuObj;
-class OSDOfi;
 class OSDOobExecutor;
 namespace ceph::oob {
 class Arena;
@@ -129,21 +128,17 @@ public:
   md_config_cacher_t<bool> osd_skip_data_digest;
 
 #ifdef WITH_CUOBJ
-  /// cuObject out-of-band delivery endpoint; null unless an out-of-band
-  /// transport option names "cuobj" and the RDMA session came up
+  /// the cuObject executor, one of oob_executors, for oob_runs_inline();
+  /// null unless an out-of-band transport option names "cuobj" and the
+  /// RDMA session came up
   OSDCuObj* cuobj = nullptr;
-#endif
-#ifdef WITH_OOB_OFI
-  /// libfabric delivery endpoint; null unless an out-of-band transport
-  /// option names a libfabric provider and the endpoint came up
-  OSDOfi* ofi = nullptr;
 #endif
 #ifdef HAVE_OSD_OOB_DELIVERY
   /// the memory every executor registers and takes its staging buffers
   /// and gather windows from (oob_memory); null when none runs
   std::unique_ptr<ceph::oob::Arena> oob_arena;
-  /// the executors that started (owned through cuobj and ofi above)
-  std::vector<OSDOobExecutor*> oob_executors;
+  /// the executors that started
+  std::vector<std::unique_ptr<OSDOobExecutor>> oob_executors;
   /// the one of them that lends windows for EC gathers, and the only one
   /// that registered any: the executor of oob_cluster_transport; null
   /// when none does
@@ -153,11 +148,12 @@ public:
   std::atomic<bool> oob_published = false;
   /// an executor that started; lends when its transport is the cluster
   /// transport. Only before publish_oob_executors().
-  void add_oob_executor(OSDOobExecutor* e, bool lends);
+  void add_oob_executor(std::unique_ptr<OSDOobExecutor> e, bool lends);
   /// let the other threads use the executors added; none is added after
   void publish_oob_executors();
   /// oob_executors once published, else none
-  const std::vector<OSDOobExecutor*>& published_oob_executors() const;
+  const std::vector<std::unique_ptr<OSDOobExecutor>>&
+  published_oob_executors() const;
   /// the executor that serves a delivery token's transport, or null
   OSDOobExecutor* oob_executor_for(const std::string& token) const;
   /// the executor that can pull a write's payload out of a token's
@@ -191,6 +187,10 @@ public:
   /// running ones, and stop the transfer threads, before the executors
   /// go
   void stop_oob_transfers();
+  /// once the transfer threads stopped (stop_oob_transfers()): quiesce
+  /// the executors, then delete them, then free the arena they
+  /// registered. shutdown() and fast_shutdown() both end them here
+  void shutdown_oob();
   /// the pulls of op, a pulled write, settled, and a hold of head in PG
   /// pgid waits for them (op's, or a later attempt's of its request):
   /// queue the kick that runs the hold's ops again (PGOobPullKick), from

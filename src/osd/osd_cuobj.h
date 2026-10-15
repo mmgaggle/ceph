@@ -107,6 +107,10 @@ public:
 
   /// asok/debug counters
   void dump_stats(ceph::Formatter* f) const override;
+  std::string_view name() const override { return "cuobj"; }
+  std::string_view status_help() const override {
+    return "cuObject out-of-band RDMA delivery statistics";
+  }
 
   /// gather windows: slots of a pool behind a DC target on this OSD, so
   /// peers' cuObject servers can push shard reads here, when cuobj is the

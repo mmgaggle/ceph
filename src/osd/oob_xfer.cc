@@ -16,6 +16,7 @@
 #include "common/debug.h"
 #include "common/Formatter.h"
 #include "common/perf_counters.h"
+#include "common/rdma_token.h"
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_osd
@@ -46,7 +47,7 @@ bounds_t make_bounds(ceph::mono_clock::time_point received, double lease,
 		     ceph::signedspan mnow)
 {
   bounds_t b;
-  b.land_by = received + ceph::make_timespan(lease + drain);
+  b.land_by = received + delivery_window(lease, drain);
   b.post_by = received + ceph::make_timespan(lease);
   if (readable_until) {
     // within an interval readable_until only grows, so the PG's lease
@@ -68,11 +69,26 @@ bounds_t make_bounds(utime_t recv_stamp, double lease, double drain,
 		     lease, drain, readable_until, mnow);
 }
 
+bool lease_expired(const bounds_t& b)
+{
+  return ceph::mono_clock::now() > b.post_by;
+}
+
 std::chrono::milliseconds budget_left(const bounds_t& b)
 {
   const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
     b.land_by - ceph::mono_clock::now());
   return std::max(left, std::chrono::milliseconds::zero());
+}
+
+void decline_all(const std::vector<ceph::rdma::delivery_t>& deliveries,
+		 std::vector<ceph::rdma::oob_result_t>& oob)
+{
+  for (size_t i = 0; i < oob.size() && i < deliveries.size(); i++) {
+    if (!deliveries[i].empty()) {
+      oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
+    }
+  }
 }
 
 void debug_delay_done(CephContext* cct)

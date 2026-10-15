@@ -103,6 +103,10 @@ public:
 		       std::chrono::milliseconds budget,
 		       bool* started) override;
   void dump_stats(ceph::Formatter* f) const override;
+  std::string_view name() const override { return "ofi"; }
+  std::string_view status_help() const override {
+    return "libfabric out-of-band delivery statistics";
+  }
   std::optional<window_t> acquire_window(size_t size) override;
   void release_window(uint64_t id, uint64_t quarantine_ms) override;
   void window_sync() override;

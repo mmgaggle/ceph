@@ -1439,3 +1439,49 @@ TEST(OobReadDelivery, OpThreadLetsGoBeforeTheReply)
     expect_landed(sent, rops);
   }
 }
+
+// the bounds that the read push, the shard push and the gather share: a
+// transfer may start until receipt plus the pool's lease, or until the
+// PG's read lease runs out, and its writes land by receipt plus the
+// lease plus the drain, which is also how long a gather keeps a window
+// it lent out of use
+TEST(OobReadDelivery, LeaseAndDeliveryWindow)
+{
+  EXPECT_EQ(8000ms, std::chrono::duration_cast<std::chrono::milliseconds>(
+	      delivery_window(5.0, 3.0)));
+  const auto now = mono_clock::now();
+  for (double age : {0.0, 4.9, 5.1, 9.0}) {
+    SCOPED_TRACE(age);
+    const auto received = now - ceph::make_timespan(age);
+    const auto b = make_bounds(received, 5.0, 3.0, std::nullopt,
+			       ceph::signedspan::zero());
+    EXPECT_EQ(age > 5.0, lease_expired(b));
+    EXPECT_EQ(received + delivery_window(5.0, 3.0), b.land_by);
+  }
+  const ceph::signedspan mnow = 100s;
+  EXPECT_TRUE(lease_expired(make_bounds(
+    now, 5.0, 3.0, std::optional<ceph::signedspan>(mnow - 1ms), mnow)));
+}
+
+// an op that carries a descriptor is declined, and keeps its other
+// flags; one without, or past either vector, is left as it is
+TEST(OobReadDelivery, DeclineAll)
+{
+  const std::vector<delivery_t> deliveries{descriptor(0), delivery_t{},
+					   descriptor(0)};
+  std::vector<oob_result_t> oob(3);
+  oob[2].flags = oob_result_t::FLAG_LANDED;
+  decline_all(deliveries, oob);
+  EXPECT_EQ(oob_result_t::FLAG_DECLINED, oob[0].flags);
+  EXPECT_EQ(0u, oob[1].flags);
+  EXPECT_EQ(oob_result_t::FLAG_DECLINED | oob_result_t::FLAG_LANDED,
+	    oob[2].flags);
+  std::vector<oob_result_t> fewer(1);
+  decline_all(deliveries, fewer);
+  EXPECT_EQ(oob_result_t::FLAG_DECLINED, fewer[0].flags);
+  std::vector<oob_result_t> more(5);
+  decline_all(deliveries, more);
+  EXPECT_EQ(oob_result_t::FLAG_DECLINED, more[2].flags);
+  EXPECT_EQ(0u, more[3].flags);
+  EXPECT_EQ(0u, more[4].flags);
+}

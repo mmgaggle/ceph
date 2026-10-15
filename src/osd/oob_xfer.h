@@ -20,6 +20,10 @@
 #include "include/utime.h"
 
 namespace ceph { class Formatter; }
+namespace ceph::rdma {
+struct delivery_t;
+struct oob_result_t;
+}
 
 /**
  * The OSD's out-of-band transfer service: threads of its own that run
@@ -64,9 +68,31 @@ bounds_t make_bounds(utime_t recv_stamp, double lease, double drain,
 		     std::optional<ceph::signedspan> readable_until,
 		     ceph::signedspan mnow);
 
+/// how long after receipt the writes of a transfer may still land: the
+/// pool's delivery lease plus its drain (make_bounds()'s land_by). A
+/// peer that holds the token of a window lent to it may write into the
+/// window that long. Inline, so that ECCommon.cc, which crimson-osd
+/// builds too, needs nothing of oob_xfer.cc, which crimson does not
+inline ceph::timespan delivery_window(double lease, double drain)
+{
+  return ceph::make_timespan(lease + drain);
+}
+
+/// true once b's post_by passed: the pool's delivery lease ran out, or
+/// the PG's read lease that make_bounds() took, and no transfer within
+/// b may start any more
+bool lease_expired(const bounds_t& b);
+
 /// the remaining budget at the moment of the call, for
 /// execute_plan()/execute_pull(); never negative
 std::chrono::milliseconds budget_left(const bounds_t& b);
+
+/// mark declined the result of each op that carries a descriptor in
+/// deliveries: no transfer of it started, so nothing of it reached its
+/// window, and its client need not fence the window. oob holds one
+/// result for each op of the request
+void decline_all(const std::vector<ceph::rdma::delivery_t>& deliveries,
+		 std::vector<ceph::rdma::oob_result_t>& oob);
 
 /// osd_debug_oob_delay_done_ms: a job sleeps this long after the
 /// executor call, before it answers

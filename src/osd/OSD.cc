@@ -82,8 +82,8 @@
 #include "common/rdma_token.h"
 #include "oob_executor.h"
 #include "oob_pull.h"
-#include "oob_xfer.h"
 #endif
+#include "oob_xfer.h"
 
 #include "PrimaryLogPG.h"
 
@@ -558,32 +558,7 @@ void OSDService::shutdown()
   }
 
 #ifdef HAVE_OSD_OOB_DELIVERY
-  // the op threads and the transfer threads are stopped by now
-  // (stop_oob_transfers()); what the executors left posted may still
-  // touch their staging. A cuObject write left posted retries for up to
-  // 2 s, and the part of a failed submission behind it as long again
-  const auto quiet_by = ceph::mono_clock::now() + std::chrono::seconds(5);
-  for (auto* e : oob_executors) {
-    e->quiesce(quiet_by);
-  }
-  oob_published = false;
-  oob_xfer.reset();
-  oob_executors.clear();
-  oob_lender = nullptr;
-#endif
-#ifdef WITH_CUOBJ
-  // no transfer runs any more; a write that quiesce() gave up on cannot
-  // reach the arena once the executor deregistered it
-  delete cuobj;
-  cuobj = nullptr;
-#endif
-#ifdef WITH_OOB_OFI
-  delete ofi;
-  ofi = nullptr;
-#endif
-#ifdef HAVE_OSD_OOB_DELIVERY
-  // after the executors, which registered it
-  oob_arena.reset();
+  shutdown_oob();
 #endif
 
   publish_map(OSDMapRef());
@@ -593,9 +568,9 @@ void OSDService::shutdown()
 #ifdef HAVE_OSD_OOB_DELIVERY
 OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
 {
-  for (auto* e : published_oob_executors()) {
+  for (const auto& e : published_oob_executors()) {
     if (e->handles(token)) {
-      return e;
+      return e.get();
     }
   }
   return nullptr;
@@ -603,22 +578,23 @@ OSDOobExecutor* OSDService::oob_executor_for(const std::string& token) const
 
 OSDOobExecutor* OSDService::oob_puller_for(const std::string& token) const
 {
-  for (auto* e : published_oob_executors()) {
+  for (const auto& e : published_oob_executors()) {
     if (e->pulls(token)) {
-      return e;
+      return e.get();
     }
   }
   return nullptr;
 }
 
-void OSDService::add_oob_executor(OSDOobExecutor* e, bool lends)
+void OSDService::add_oob_executor(std::unique_ptr<OSDOobExecutor> e,
+				  bool lends)
 {
   ceph_assert(!oob_published);
-  oob_executors.push_back(e);
   if (lends) {
     ceph_assert(!oob_lender);
-    oob_lender = e;
+    oob_lender = e.get();
   }
+  oob_executors.push_back(std::move(e));
 }
 
 void OSDService::publish_oob_executors()
@@ -626,10 +602,10 @@ void OSDService::publish_oob_executors()
   oob_published.store(true, std::memory_order_release);
 }
 
-const std::vector<OSDOobExecutor*>&
+const std::vector<std::unique_ptr<OSDOobExecutor>>&
 OSDService::published_oob_executors() const
 {
-  static const std::vector<OSDOobExecutor*> none;
+  static const std::vector<std::unique_ptr<OSDOobExecutor>> none;
   return oob_published.load(std::memory_order_acquire) ? oob_executors : none;
 }
 
@@ -666,6 +642,29 @@ void OSDService::stop_oob_transfers()
   }
 }
 
+void OSDService::shutdown_oob()
+{
+  // the op threads and the transfer threads are stopped by now
+  // (stop_oob_transfers()); what the executors left posted may still
+  // touch their staging. A cuObject write left posted retries for up to
+  // 2 s, and the part of a failed submission behind it as long again
+  const auto quiet_by = ceph::mono_clock::now() + std::chrono::seconds(5);
+  for (const auto& e : oob_executors) {
+    e->quiesce(quiet_by);
+  }
+  oob_published = false;
+  oob_xfer.reset();
+  oob_lender = nullptr;
+#ifdef WITH_CUOBJ
+  cuobj = nullptr;
+#endif
+  // no transfer runs any more; a write that quiesce() gave up on cannot
+  // reach the arena once its executor deregistered it
+  oob_executors.clear();
+  // after the executors, which registered it
+  oob_arena.reset();
+}
+
 void OSDService::queue_oob_pull_kick(spg_t pgid, epoch_t epoch,
 				     OpRequestRef op, const hobject_t& head)
 {
@@ -700,32 +699,7 @@ void OSDService::fast_shutdown()
     watch_timer.shutdown();
   }
 #ifdef HAVE_OSD_OOB_DELIVERY
-  // the op threads and the transfer threads are stopped by now
-  // (stop_oob_transfers()); what the executors left posted may still
-  // touch their staging. A cuObject write left posted retries for up to
-  // 2 s, and the part of a failed submission behind it as long again
-  const auto quiet_by = ceph::mono_clock::now() + std::chrono::seconds(5);
-  for (auto* e : oob_executors) {
-    e->quiesce(quiet_by);
-  }
-  oob_published = false;
-  oob_xfer.reset();
-  oob_executors.clear();
-  oob_lender = nullptr;
-#endif
-#ifdef WITH_CUOBJ
-  // no transfer runs any more; a write that quiesce() gave up on cannot
-  // reach the arena once the executor deregistered it
-  delete cuobj;
-  cuobj = nullptr;
-#endif
-#ifdef WITH_OOB_OFI
-  delete ofi;
-  ofi = nullptr;
-#endif
-#ifdef HAVE_OSD_OOB_DELIVERY
-  // after the executors, which registered it
-  oob_arena.reset();
+  shutdown_oob();
 #endif
 }
 
@@ -1224,7 +1198,7 @@ void OSDService::set_statfs(const struct store_statfs_t &stbuf,
   logger->set(l_osd_stat_bytes_avail, avail);
 
 #ifdef HAVE_OSD_OOB_DELIVERY
-  for (auto* e : published_oob_executors()) {
+  for (const auto& e : published_oob_executors()) {
     e->get_alerts(alerts);
   }
 #endif
@@ -1856,11 +1830,7 @@ void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
     // laggy replica can retry without fencing its window
     const auto& deliveries = m->get_rdma_deliveries();
     std::vector<ceph::rdma::oob_result_t> oob(deliveries.size());
-    for (size_t i = 0; i < deliveries.size(); i++) {
-      if (!deliveries[i].empty()) {
-	oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
-      }
-    }
+    ceph::osd::oob::decline_all(deliveries, oob);
 #ifdef HAVE_OSD_OOB_DELIVERY
     if (op->oob_pull) {
       // but a pull of the request may have read the client's window,
@@ -2991,6 +2961,26 @@ int OSD::asok_route_to_pg(
   }
 }
 
+#ifdef HAVE_OSD_OOB_DELIVERY
+/// the executor whose asok command is prefix ("<name> status", which
+/// final_init() registers), or null
+static OSDOobExecutor* oob_status_executor(const OSDService& service,
+					   std::string_view prefix)
+{
+  constexpr std::string_view suffix = " status";
+  if (!prefix.ends_with(suffix)) {
+    return nullptr;
+  }
+  prefix.remove_suffix(suffix.size());
+  for (const auto& e : service.published_oob_executors()) {
+    if (e->name() == prefix) {
+      return e.get();
+    }
+  }
+  return nullptr;
+}
+#endif
+
 void OSD::asok_command(
   std::string_view prefix, const cmdmap_t& cmdmap,
   Formatter *f,
@@ -3078,23 +3068,11 @@ void OSD::asok_command(
                      superblock.cluster_osdmap_trim_lower_bound);
     f->dump_unsigned("num_pgs", num_pgs);
     f->close_section();
-#ifdef WITH_CUOBJ
-  } else if (prefix == "cuobj status") {
-    f->open_object_section("cuobj");
-    if (service.cuobj) {
-      service.cuobj->dump_stats(f);
-    }
-    f->close_section();
-#endif
-#ifdef WITH_OOB_OFI
-  } else if (prefix == "ofi status") {
-    f->open_object_section("ofi");
-    if (service.ofi) {
-      service.ofi->dump_stats(f);
-    }
-    f->close_section();
-#endif
 #ifdef HAVE_OSD_OOB_DELIVERY
+  } else if (auto* e = oob_status_executor(service, prefix)) {
+    f->open_object_section(e->name());
+    e->dump_stats(f);
+    f->close_section();
   } else if (prefix == "dump_oob_transfers") {
     f->open_object_section("oob_transfers");
     if (auto* xfer = service.oob_transfers()) {
@@ -4341,8 +4319,8 @@ int OSD::init()
 	auto cuobj = std::make_unique<OSDCuObj>(cct, loc.addr, cuobj_lends,
 						num_dcis, arena);
 	if (cuobj->is_available()) {
-	  service.cuobj = cuobj.release();
-	  service.add_oob_executor(service.cuobj, cuobj_lends);
+	  service.cuobj = cuobj.get();
+	  service.add_oob_executor(std::move(cuobj), cuobj_lends);
 	} else {
 	  derr << "WARNING: cuObject RDMA init failed on " << loc.addr
 	       << " (cuObject delivery disabled on this osd)" << dendl;
@@ -4357,8 +4335,7 @@ int OSD::init()
 	auto ofi = std::make_unique<OSDOfi>(cct, clog);
 	if (int r = ofi->init(oob.ofi_provider, loc, ofi_lends, arena);
 	    r == 0) {
-	  service.ofi = ofi.release();
-	  service.add_oob_executor(service.ofi, ofi_lends);
+	  service.add_oob_executor(std::move(ofi), ofi_lends);
 	} else {
 	  derr << "WARNING: libfabric delivery init failed: "
 	       << cpp_strerror(r) << " (libfabric delivery disabled on this "
@@ -4405,7 +4382,7 @@ int OSD::init()
 	  cct->_conf.get_val<Option::size_t>("osd_oob_transfer_queue_bytes"),
 	  grace,
 	  [this] {
-	    for (auto* e : service.published_oob_executors()) {
+	    for (const auto& e : service.published_oob_executors()) {
 	      e->idle();
 	    }
 	  });
@@ -4465,22 +4442,15 @@ void OSD::final_init()
   int r = admin_socket->register_command("status", asok_hook,
 					 "high-level status of OSD");
   ceph_assert(r == 0);
-#ifdef WITH_CUOBJ
-  if (service.cuobj) {
-    r = admin_socket->register_command(
-      "cuobj status", asok_hook,
-      "cuObject out-of-band RDMA delivery statistics");
-    ceph_assert(r == 0);
-  }
-#endif
-#ifdef WITH_OOB_OFI
-  if (service.ofi) {
-    r = admin_socket->register_command(
-      "ofi status", asok_hook, "libfabric out-of-band delivery statistics");
-    ceph_assert(r == 0);
-  }
-#endif
 #ifdef HAVE_OSD_OOB_DELIVERY
+  // "<name> status" for each executor that started (oob_status_executor())
+  for (const auto& e : service.published_oob_executors()) {
+    if (!e->name().empty()) {
+      r = admin_socket->register_command(
+	std::string(e->name()) + " status", asok_hook, e->status_help());
+      ceph_assert(r == 0);
+    }
+  }
   if (service.oob_xfer) {
     r = admin_socket->register_command(
       "dump_oob_transfers", asok_hook,

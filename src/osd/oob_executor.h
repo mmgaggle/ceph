@@ -10,6 +10,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <sys/types.h>
 
 #include "common/ceph_time.h"
@@ -112,6 +113,14 @@ public:
 
   /// asok/debug counters
   virtual void dump_stats(ceph::Formatter* f) const = 0;
+
+  /// the transport's name: the OSD's asok command "<name> status" dumps
+  /// dump_stats(), with status_help() as its help. An executor without
+  /// a name has no such command
+  virtual std::string_view name() const { return {}; }
+  virtual std::string_view status_help() const {
+    return "out-of-band delivery statistics";
+  }
 
   /**
    * Add this executor's health alerts, by alert name, to an OSD's alerts

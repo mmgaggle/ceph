@@ -7,7 +7,6 @@
 #include <utility>
 
 #include "common/ceph_context.h"
-#include "common/crc64nvme.h"
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/Formatter.h"
@@ -107,46 +106,8 @@ void finish_op(OSDOp& op, ceph::rdma::oob_result_t& res,
   // with delivery-complete writes every byte is in the window: nothing of
   // this op lands after the reply, which follows
   res.flags |= ceph::rdma::attempt_flags(true, true, r.delivery_complete);
-  if (p.want64 || p.want32c) {
-    // checksum each placed range at the storage node, after it
-    // crossed the fabric. Every triple is one contiguous logical
-    // extent, so a caller holding all of a window's ranges can fold
-    // them in offset order however they were interleaved across
-    // shards; the whole-payload value comes from the same pass, since
-    // the builders emit triples contiguous and ascending in payload
-    // order.
-    res.ranges.reserve(p.plan.size());
-    uint64_t whole64 = 0;
-    uint32_t whole32c = 0;
-    for (const auto& t : p.plan) {
-      bufferlist part;
-      part.substr_of(p.payload, t.local_ofs, t.len);
-      ceph::rdma::crc_range_t c{t.client_ofs, t.len};
-      if (p.want64) {
-	c.crc64 = ceph::crc64nvme(part);
-	whole64 = res.ranges.empty() ? c.crc64
-		: ceph::crc64nvme_combine(whole64, c.crc64, t.len);
-      }
-      if (p.want32c) {
-	c.crc32c = ceph::rdma::crc32c_canonical(part);
-	whole32c = res.ranges.empty() ? c.crc32c
-		 : ceph::rdma::crc32c_combine(whole32c, c.crc32c, t.len);
-      }
-      res.ranges.push_back(c);
-    }
-    res.crc64 = whole64;
-    res.crc32c = whole32c;
-    res.flags |= ceph::rdma::oob_result_t::FLAG_RANGES |
-      (p.want64 ? ceph::rdma::oob_result_t::FLAG_CRC64NVME : 0) |
-      (p.want32c ? ceph::rdma::oob_result_t::FLAG_CRC32C : 0);
-    if (p.plan.size() == 1) {
-      // one contiguous logical extent: crc64 and crc32c themselves fold
-      // with adjacent stripes, so a caller needs no ranges. This is the
-      // plain read, and also the EC-direct read whose range fits in
-      // one chunk of this shard.
-      res.flags |= ceph::rdma::oob_result_t::FLAG_COMBINABLE;
-    }
-  }
+  // the checksums of the placed ranges, after they crossed the fabric
+  checksum_plan(p.payload, p.plan, p.want64, p.want32c, res);
 }
 
 oob_reply::oob_reply(MOSDOpReply* reply, std::vector<OSDOp>&& rops,

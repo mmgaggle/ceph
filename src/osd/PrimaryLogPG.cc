@@ -68,8 +68,8 @@
 #include "osd/oob_placement.h"
 #include "osd/oob_pull.h"
 #include "osd/oob_read_delivery.h"
-#include "osd/oob_xfer.h"
 #endif
+#include "osd/oob_xfer.h"
 
 // required includes order:
 #include "json_spirit/json_spirit_value.h"
@@ -9558,15 +9558,6 @@ std::vector<ceph::osd::oob::read_push> PrimaryLogPG::deliver_oob_prepare(
   const auto& deliveries = m->get_rdma_deliveries();
   ceph_assert(oob.size() == rops.size());
   std::vector<ceph::osd::oob::read_push> pushes;
-  // an op this OSD started no transfer for is reported declined: nothing
-  // of it reached the window, and its client need not fence the window
-  auto decline_all = [&] {
-    for (size_t i = 0; i < oob.size() && i < deliveries.size(); i++) {
-      if (!deliveries[i].empty()) {
-	oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
-      }
-    }
-  };
   if (deliveries.size() != rops.size()) {
     // the descriptor vector must mirror the ops; anything else is
     // malformed and everything stays inline
@@ -9582,7 +9573,7 @@ std::vector<ceph::osd::oob::read_push> PrimaryLogPG::deliver_oob_prepare(
   // declined or landed (a replica bounced it, say), when none can
   if (m->get_retry_attempt() > 0 &&
       !ceph::rdma::prior_attempts_settled(deliveries)) {
-    decline_all();
+    ceph::osd::oob::decline_all(deliveries, oob);
     return pushes;
   }
   // check_laggy ran at dispatch, but the push runs after the read
@@ -9595,22 +9586,7 @@ std::vector<ceph::osd::oob::read_push> PrimaryLogPG::deliver_oob_prepare(
     dout(10) << __func__ << " past readable_until "
 	     << recovery_state.get_readable_until()
 	     << ", delivering inline" << dendl;
-    decline_all();
-    return pushes;
-  }
-  // the pool's delivery lease bounds how long after receipt this OSD
-  // may still initiate a transfer against the descriptor; a client
-  // that abandoned the request reasons about window reuse from the
-  // same bound, so a late push must degrade to inline rather than
-  // race that reuse. The age is monotonic, as the read lease's check
-  // above is: a step of the wall clock since receipt does not hide it
-  const double lease = pool.info.get_rdma_delivery_lease();
-  const double age = std::chrono::duration<double>(
-    ceph::mono_clock::now() - ctx->op->get_mono_recv_stamp()).count();
-  if (age > lease) {
-    dout(10) << __func__ << " lease expired (" << age << "s > " << lease
-	     << "s), delivering inline" << dendl;
-    decline_all();
+    ceph::osd::oob::decline_all(deliveries, oob);
     return pushes;
   }
   // every push of the request keeps to the same bounds, fixed here
@@ -9618,10 +9594,24 @@ std::vector<ceph::osd::oob::read_push> PrimaryLogPG::deliver_oob_prepare(
   // past readable_until as it is now, and its writes land, or are cut
   // off, by receipt plus the lease plus the pool's drain. No step of
   // the wall clock moves them.
+  const double lease = pool.info.get_rdma_delivery_lease();
   const auto bounds = ceph::osd::oob::make_bounds(
     ctx->op->get_mono_recv_stamp(), lease,
     pool.info.get_rdma_delivery_drain(),
     recovery_state.get_readable_until(), osd->get_mnow());
+  // the pool's delivery lease bounds how long after receipt this OSD
+  // may still initiate a transfer against the descriptor; a client
+  // that abandoned the request reasons about window reuse from the
+  // same bound, so a late push must degrade to inline rather than
+  // race that reuse. The bounds are monotonic, as the read lease's
+  // check above is: a step of the wall clock since receipt does not
+  // hide it
+  if (ceph::osd::oob::lease_expired(bounds)) {
+    dout(10) << __func__ << " lease of " << lease << "s expired, "
+	     << "delivering inline" << dendl;
+    ceph::osd::oob::decline_all(deliveries, oob);
+    return pushes;
+  }
   const bool ec_direct = ctx->op->ec_direct_read();
   std::optional<ceph::osd::oob::ec_direct_geometry> ec;
   if (ec_direct && pool.info.is_erasure() &&
@@ -10013,12 +10003,7 @@ void PrimaryLogPG::complete_read_ctx(int result, OpContext *ctx)
     {
       // a failed read, or an OSD without a transport (or built without
       // one), starts no transfer
-      const auto& deliveries = m->get_rdma_deliveries();
-      for (size_t i = 0; i < oob.size() && i < deliveries.size(); i++) {
-	if (!deliveries[i].empty()) {
-	  oob[i].flags |= ceph::rdma::oob_result_t::FLAG_DECLINED;
-	}
-      }
+      ceph::osd::oob::decline_all(m->get_rdma_deliveries(), oob);
 #ifdef HAVE_OSD_OOB_DELIVERY
       if (ctx->op->oob_pull) {
 	// but a write may fail after its pull read the client's window: an

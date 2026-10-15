@@ -1061,7 +1061,10 @@ function TEST_primary_change_during_pull() {
     ceph_test_osd_oob_read write rpool $SIZE obj || return 1
     local primary=$(get_primary rpool obj)
     local pgid=$(get_pg rpool obj)
-    ceph tell osd.$primary config set osd_debug_oob_delay_done_ms 4000 || return 1
+    # long enough that the map that marks the primary down reaches it
+    # while the write still waits: the command and the map can take
+    # several seconds
+    ceph tell osd.$primary config set osd_debug_oob_delay_done_ms 10000 || return 1
     local entries=$(log_entries $pgid obj)
 
     timeout 120 ceph_test_osd_oob_read put rpool $SIZE obj > $dir/put.out &

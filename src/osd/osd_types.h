@@ -1152,11 +1152,12 @@ public:
      * Seconds after receiving a read that asks for out-of-band RDMA
      * delivery during which an OSD may still start the RDMA write
      * into the client's memory window; a push that would start later
-     * is delivered inline instead. A client that reuses a window
-     * waits this out (plus the transport drain bound) before writing
-     * it again, so the value the OSDs enforce must be the value the
-     * clients see - hence a pool option rather than a daemon option.
-     * Unset means pg_pool_t::DEFAULT_RDMA_DELIVERY_LEASE.
+     * is delivered inline instead. The lease is also part of how long
+     * a client that gave up on a request waits before it writes its
+     * window again (see RDMA_DELIVERY_DRAIN), so the value the OSDs
+     * enforce must be the value the clients see - hence a pool option
+     * rather than a daemon option. Unset means
+     * pg_pool_t::DEFAULT_RDMA_DELIVERY_LEASE.
      */
     RDMA_DELIVERY_LEASE,
     /**
@@ -1167,9 +1168,11 @@ public:
      * cut off. The lease bounds when a write may start, the drain when
      * it may still land: an OSD stops waiting for its writes at receipt
      * plus lease plus drain and cuts off any still in flight, and a
-     * window owner that gave up on a request waits lease plus drain
-     * before it writes the window again. A pool option for the same
-     * reason as the lease. Unset means
+     * libfabric cut-off can end up to osd_oob_cutoff_late_tolerance
+     * after that. A window owner that gave up on a request writes the
+     * window again only once lease plus drain plus that tolerance have
+     * passed since the last operation of the request reached its OSD.
+     * A pool option for the same reason as the lease. Unset means
      * pg_pool_t::DEFAULT_RDMA_DELIVERY_DRAIN.
      */
     RDMA_DELIVERY_DRAIN,

@@ -1190,11 +1190,13 @@ class Object {
         /// out: true when iterate() sent at least one descriptor-bearing
         /// operation to the OSDs (fence-wait gating on fallback)
         bool rdma_submitted{false};
-        /// out: the longest rdma_delivery_lease plus rdma_delivery_drain
-        /// (seconds) among the pools those operations were sent to; an
-        /// OSD's writes land, or are cut off, within this long of its
-        /// receiving one, so a fallback that rewrites the window, or a
-        /// reuse of it, waits this long first
+        /// out: the largest rdma_delivery_lease plus rdma_delivery_drain
+        /// (seconds) that any pool can have, whichever pools served the
+        /// operations. An OSD replies only after its writes landed or were
+        /// cut off, but a write that no reply accounts for (an OSD marked
+        /// down, an earlier attempt of a resent operation) can land after
+        /// the replies, so a fallback that rewrites the window, or a reuse
+        /// of it, waits this long after the last operation completed
         double rdma_fence{0};
         /// out: false when no write of the operations can land any more,
         /// so a fallback need not wait out rdma_fence: every one came back

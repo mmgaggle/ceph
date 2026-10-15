@@ -496,16 +496,16 @@ protected:
   size_t relay_window = 0;
   /// The fence a GET owes once descriptor-bearing reads reached OSDs: a
   /// write of theirs that no reply accounts for may still land in the
-  /// window until the pools' lease and drain run out, so the window is
-  /// not rewritten (a fallback) and the client is not answered (success
-  /// or error) before that.
+  /// window until the largest lease plus drain that any pool can have
+  /// runs out, so the window is not rewritten (a fallback) and the
+  /// client is not answered (success or error) before that.
   struct rdma_fence_t {
     bool sent = false;           ///< descriptor-bearing reads went out
     bool needed = true;          ///< see rgw::rdma::fence_needed()
     bool resent = false;         ///< one of them was sent more than once
     bool client_window = false;  ///< they wrote the client's window
     bool settled = false;        ///< waited out, or found not needed
-    uint64_t wait_ms = 0;        ///< the longest lease plus drain
+    uint64_t wait_ms = 0;        ///< the largest lease plus drain
   } rdma_fence_state;
   /// what the read that just ended left owing
   void note_rdma_reads(bool submitted, bool needed, bool resent,
@@ -514,7 +514,7 @@ protected:
   /// window, or a response (success or not)
   void rdma_fence_before(const char* what, bool response, bool success);
   /// after execute(): how long a relay window must stay out of use for
-  /// the fence the response did not wait out (the pools' lease plus
+  /// the fence the response did not wait out (the largest lease plus
   /// drain), given whether the reads delivered the whole range, whatever
   /// became of the relay to the client after that; 0 when no write of
   /// the reads can land any more (see rgw::rdma::write_may_land())

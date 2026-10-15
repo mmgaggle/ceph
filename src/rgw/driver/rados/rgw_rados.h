@@ -802,9 +802,9 @@ public:
         std::optional<uint64_t> *rdma_crc64 = nullptr;
         std::optional<uint32_t> *rdma_crc32c = nullptr;
         bool rdma_submitted = false; // out: descriptor-bearing ops reached OSDs
-        double rdma_fence = 0; // out: longest delivery lease plus drain
-                               // (seconds) among the pools those ops
-                               // were sent to
+        double rdma_fence = 0; // out: the largest delivery lease plus
+                               // drain (seconds) any pool can have, set
+                               // once those ops were sent
         bool rdma_fence_needed = true; // out: a fallback must wait out
                                        // rdma_fence first; see
                                        // rgw::rdma::fence_needed()
@@ -1803,11 +1803,10 @@ struct get_obj_data {
   uint64_t rdma_range_start = 0; // logical offset of the range start
   uint32_t rdma_flags = 0;       // delivery request flags (e.g. want-crc64)
   bool rdma_ops_sent = false;    // at least one descriptor-bearing op issued
-  // the lease and drain each OSD enforces are pool options; the fence
-  // the caller waits before reusing the client window must cover the
-  // longest lease plus drain among the pools descriptor-bearing ops
-  // were sent to
-  std::map<int64_t, double> rdma_fence_by_pool;
+  // the fence the caller waits before reusing the client window: the
+  // largest lease plus drain any pool can have (pg_pool_t's caps), since
+  // the OSD that serves a stripe may use another pool's options, or a
+  // newer map's
   double rdma_fence = 0;
   // per-stripe oob results, pushed in logical stripe order (stable addrs)
   std::deque<librados::ObjectReadOperation::rdma_delivery_result> rdma_slots;

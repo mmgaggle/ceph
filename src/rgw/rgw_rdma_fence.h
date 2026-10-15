@@ -11,8 +11,9 @@
 namespace rgw::rdma {
 
 /**
- * Whether a fallback after OSD-direct reads must wait out the pools'
- * delivery lease and drain before anything else writes the window.
+ * Whether a fallback after OSD-direct reads must wait out the delivery
+ * lease and drain (10 s, the largest any pool can have) before anything
+ * else writes the window.
  *
  * Not when every descriptor-bearing read came back, without having been
  * resent, saying either that its OSD started no transfer for it

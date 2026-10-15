@@ -1867,6 +1867,9 @@ void OSDService::reply_op_error(OpRequestRef op, int err, eversion_t v,
       // before it failed or before the request did
       op->oob_pull->clear_declined(oob);
     }
+    // and a resend answered as a dup reports what the pulls of the
+    // attempt that did the write reported, as the PG log kept it
+    ceph::osd::oob::dup_pull_results(deliveries, op_returns, err, oob);
 #endif
     reply->set_oob_results(std::move(oob));
   }

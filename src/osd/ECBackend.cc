@@ -293,10 +293,12 @@ bool ECBackend::_handle_message(
     // bytes after a push was attempted, and a failed push leaves
     // buffers_read as it was
     if (!op->op.push_token.empty()) {
-      const utime_t received = _op->get_req()->get_recv_stamp();
-      if (auto push = prepare_sub_read_push(
-	    op->op, &reply->op,
-	    received.is_zero() ? ceph_clock_now() : received); push) {
+      // the sub-read's receipt as the wall clock reads it now: its age
+      // is the monotonic one, whatever step the wall clock took since
+      const utime_t received = ceph_clock_now() -
+	utime_t(ceph::mono_clock::now() - _op->get_mono_recv_stamp());
+      if (auto push = prepare_sub_read_push(op->op, &reply->op, received);
+	  push) {
 	// the reply follows the push: the job sends it once the push is
 	// over, from a transfer thread, or from this one before the
 	// submit returns. Everything in it but the push's outcome was

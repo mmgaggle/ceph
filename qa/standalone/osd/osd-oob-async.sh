@@ -767,21 +767,14 @@ function expect_pulled() {
 }
 
 # the write of oid went in once, whichever attempt of it the primary
-# answered: one it pulled, or a resend it found done (which says its
-# descriptor was declined, since that attempt pulled nothing)
+# answered: one it pulled, or a resend it found done, whose reply says
+# what the attempt that did the write pulled, as the PG log kept it
+# (the client asks for the ops' return data, RETURNVEC, of a request
+# that pulls when no other op of it returns anything, as without --call)
 function expect_written() {
     local out="$1"
     local oid=$2
-    test "$(op_field "$out" put $oid r)" = 0 || return 1
-    test "$(op_field "$out" check $oid data)" = ok || return 1
-    local bytes=$(op_field "$out" put $oid bytes)
-    local flags=$(op_field "$out" put $oid flags)
-    if [ "$bytes" = 0 ] ; then
-        (( flags & FLAG_DECLINED )) || return 1
-    else
-        test "$bytes" = $SIZE || return 1
-        test "$(op_field "$out" put $oid crc)" = ok || return 1
-    fi
+    expect_pulled "$out" $oid || return 1
 }
 
 # the holds of PG **pgid**: the pulled writes that wait for their pulls
@@ -1269,6 +1262,93 @@ function TEST_session_reset_during_pull() {
     grep -q "maybe_wait_for_oob_pull .*:::obj:head .* waits \(for the pulls of an earlier attempt, \)\?behind" $log || return 1
     test $(log_entries $pgid obj) = $((entries + 1)) || return 1
     test $(ofi_stat $primary pulls_started) -ge $((pulls + 2)) || return 1
+    test $(client_bytes $primary) = 0 || return 1
+    no_osd_failed $dir 0 1 2 || return 1
+}
+
+##
+# (i2) A resend of a pulled write that the primary answers as a dup
+# reports what the attempt that did the write pulled. W1 is pulled, and
+# its commit waits for a replica that is stopped. Meanwhile the client's
+# connection closes when idle for 2 s, and it sends W1 again on a new
+# one. The resend finds W1 in the PG's log, and waits for it to commit;
+# then the replica goes on, and the primary answers the resend with the
+# byte count and the CRC-64/NVME of W1's pull, which the log kept with
+# W1 (the client asks for the ops' return data of a request that pulls,
+# when its other ops return nothing), not declined with no bytes.
+# Nothing is pulled again.
+#
+function TEST_dup_of_pulled_write_reports_the_pull() {
+    local dir=$1
+
+    run_oob_cluster $dir 4 --osd_debug_op_order=true || return 1
+    create_repl_pool rpool || return 1
+    ceph_test_osd_oob_read write rpool $SIZE obj || return 1
+    local primary=$(get_primary rpool obj)
+    local replica=$(get_not_primary rpool obj)
+    local pgid=$(get_pg rpool obj)
+    local entries=$(log_entries $pgid obj)
+    local pulls=$(ofi_stat $primary pulls_started)
+    local log=$dir/osd.$primary.log
+
+    kill -STOP $(cat $dir/osd.$replica.pid) || return 1
+    CEPH_ARGS="$CEPH_ARGS --ms_connection_idle_timeout=2" timeout 120 \
+        ceph_test_osd_oob_read put rpool $SIZE obj > $dir/put.out &
+    local pid=$!
+    # well within the heartbeat grace of the stopped replica
+    local waits=false
+    for i in $(seq 50) ; do
+        if grep -q "do_op_impl dup .* version" $log &&
+                grep -q " waiting for .* to commit" $log ; then
+            waits=true
+            break
+        fi
+        sleep 0.2
+    done
+    kill -CONT $(cat $dir/osd.$replica.pid) || return 1
+    $waits || return 1
+    wait $pid || return 1
+    cat $dir/put.out
+    expect_pulled "$(cat $dir/put.out)" obj || return 1
+    grep -q "ms_handle_reset con .* session .*" $log || return 1
+    test $(log_entries $pgid obj) = $((entries + 1)) || return 1
+    test $(ofi_stat $primary pulls_started) = $((pulls + 1)) || return 1
+    test $(client_bytes $primary) = 0 || return 1
+    wait_for_clean || return 1
+    no_osd_failed $dir 0 1 2 || return 1
+}
+
+##
+# (i3) A pulled write that waited in its PG past the pool's lease plus
+# drain after it arrived still pulls: a pull writes nothing to client
+# memory, and the client keeps its window until the reply, so its
+# bounds count from when it is planned. With a lease of 1 s and a drain
+# of 0.5 s, the pull of W1 is held for 3 s; W2, a pulled write of the
+# same object, waits behind W1 meanwhile, then pulls, and both go in.
+#
+function TEST_pulled_write_waited_past_lease() {
+    local dir=$1
+
+    run_oob_cluster $dir 4 --osd_debug_op_order=true || return 1
+    create_repl_pool rpool || return 1
+    ceph osd pool set rpool rdma_delivery_lease 1 || return 1
+    ceph osd pool set rpool rdma_delivery_drain 0.5 || return 1
+    ceph_test_osd_oob_read write rpool $SIZE obj || return 1
+    local primary=$(get_primary rpool obj)
+    local pgid=$(get_pg rpool obj)
+    ceph tell osd.$primary config set osd_debug_oob_delay_done_ms 3000 || return 1
+    local entries=$(log_entries $pgid obj)
+    local pulls=$(ofi_stat $primary pulls_started)
+
+    local out
+    out=$(ceph_test_osd_oob_read put rpool $SIZE obj obj) || return 1
+    echo "$out"
+    test $(echo "$out" | grep -c "^put obj: r=0 bytes=$SIZE .* crc=ok ") = 2 || return 1
+    test $(echo "$out" | grep -c "^check obj: data=ok") = 2 || return 1
+    local log=$dir/osd.$primary.log
+    grep -q "maybe_wait_for_oob_pull .*:::obj:head .* waits behind" $log || return 1
+    test $(ofi_stat $primary pulls_started) = $((pulls + 2)) || return 1
+    test $(log_entries $pgid obj) = $((entries + 2)) || return 1
     test $(client_bytes $primary) = 0 || return 1
     no_osd_failed $dir 0 1 2 || return 1
 }

@@ -19,6 +19,7 @@
 #include "rgw_aio.h"
 #include "rgw_putobj_processor.h"
 #include "rgw_multi.h"
+#include "rgw_rdma_cksum.h"
 #include "rgw_compression.h"
 #include "services/svc_sys_obj.h"
 #include "services/svc_zone.h"
@@ -536,15 +537,12 @@ int AtomicObjectProcessor::process_pulled(
     st.ofs = extents[i].first;
     st.len = extents[i].second;
     st.bytes = res.bytes;
-    st.crc64 = res.crc64;
-    st.crc32c = res.crc32c;
-    // one contiguous extent, so its CRCs fold with their neighbours'
-    const bool combinable =
-      res.flags & librados::ObjectOperation::RDMA_DELIVERY_COMBINABLE;
-    st.crc64_valid = combinable &&
-      (res.flags & librados::ObjectOperation::RDMA_DELIVERY_CRC64_VALID);
-    st.crc32c_valid = combinable &&
-      (res.flags & librados::ObjectOperation::RDMA_DELIVERY_CRC32C_VALID);
+    // the CRCs that fold with the neighbours', as a GET takes them
+    const auto crcs = rgw::rdma::delivered_crcs(res);
+    st.crc64 = crcs.crc64.value_or(0);
+    st.crc64_valid = crcs.crc64.has_value();
+    st.crc32c = crcs.crc32c.value_or(0);
+    st.crc32c_valid = crcs.crc32c.has_value();
     stripes->push_back(st);
   }
   return 0;

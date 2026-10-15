@@ -4,17 +4,21 @@
 /*
  * How RGWGetObj picks the out-of-band mode of a GET with
  * x-amz-rdma-token, and how it leaves it when the store streams the
- * data instead, without a store behind it.
+ * data instead, without a store behind it. And the checksum headers of
+ * an out-of-band transfer.
  */
 
+#include "rgw_client_io.h"
 #include "rgw_common.h"
 #include "rgw_op.h"
 #include "rgw_process_env.h"
+#include "rgw_rdma_cksum.h"
 #include "rgw_rest_s3.h"
 #ifdef WITH_CUOBJ
 #include "rgw_cuobj.h"
 #endif
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -140,6 +144,32 @@ rgw::sal::Attrs legacy_cksum_attrs(rgw::cksum::Type type,
 
 constexpr std::optional<int> WHOLE; // no partNumber
 constexpr std::optional<int> NO_PARTS; // an atomic manifest
+
+/// a client that keeps the headers of the response
+class HeaderClient : public rgw::io::RestfulClient {
+  RGWEnv env;
+
+protected:
+  int init_env(CephContext*) override { return 0; }
+
+public:
+  std::map<std::string, std::string> headers;
+
+  RGWEnv& get_env() noexcept override { return env; }
+  size_t complete_request() override { return 0; }
+  size_t send_100_continue() override { return 0; }
+  size_t send_status(int, const char*) override { return 0; }
+  size_t send_header(const std::string_view& name,
+                     const std::string_view& value) override {
+    headers.emplace(name, value);
+    return 0;
+  }
+  size_t send_content_length(uint64_t) override { return 0; }
+  size_t complete_header() override { return 0; }
+  size_t recv_body(char*, size_t) override { return 0; }
+  size_t send_body(const char*, size_t len) override { return len; }
+  void flush() override {}
+};
 
 } // anonymous namespace
 
@@ -338,6 +368,54 @@ TEST(RgwRdmaGet, StoredCrcOfAPart)
       cksum_attrs(Type::crc32c, Cksum::FLAG_COMPOSITE, ETAG_3), 2, 3));
 }
 
+TEST(RgwRdmaGet, ChecksumAlgorithmOfTheRequest)
+{
+  DEFINE_REQ_STATE(g_ceph_context);
+  rgw::rdma::cksum_want want;
+  // CRC64NVME when the request has no x-amz-rdma-checksum-algorithm
+  ASSERT_EQ(0, rgw::rdma::parse_checksum_header(&s, &want));
+  EXPECT_TRUE(want.crc64nvme);
+  EXPECT_FALSE(want.crc32c);
+
+  e.set("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", "crc32c");
+  ASSERT_EQ(0, rgw::rdma::parse_checksum_header(&s, &want));
+  EXPECT_FALSE(want.crc64nvme);
+  EXPECT_TRUE(want.crc32c);
+  EXPECT_TRUE(s.err.message.empty());
+
+  // an S3 checksum the OSDs do not compute
+  e.set("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", "CRC32");
+  EXPECT_EQ(-EINVAL, rgw::rdma::parse_checksum_header(&s, &want));
+  EXPECT_EQ("x-amz-rdma-checksum-algorithm must be CRC64NVME or CRC32C",
+            s.err.message);
+}
+
+TEST(RgwRdmaGet, ChecksumHeaders)
+{
+  using Headers = std::map<std::string, std::string>;
+  DEFINE_REQ_STATE(g_ceph_context);
+  HeaderClient client;
+  s.cio = &client;
+
+  // the check values of "123456789", each in its own header
+  rgw::rdma::dump_checksums(&s, 0xae8b14860a799888ull, std::nullopt);
+  EXPECT_EQ((Headers{{"x-amz-rdma-checksum-crc64nvme", "rosUhgp5mIg="}}),
+            client.headers);
+  client.headers.clear();
+  rgw::rdma::dump_checksums(&s, std::nullopt, 0xe3069283u);
+  EXPECT_EQ((Headers{{"x-amz-rdma-checksum-crc32c", "4waSgw=="}}),
+            client.headers);
+  client.headers.clear();
+  rgw::rdma::dump_checksums(&s, 0xae8b14860a799888ull, 0xe3069283u);
+  EXPECT_EQ((Headers{{"x-amz-rdma-checksum-crc64nvme", "rosUhgp5mIg="},
+                     {"x-amz-rdma-checksum-crc32c", "4waSgw=="}}),
+            client.headers);
+  client.headers.clear();
+  rgw::rdma::dump_checksums(&s, std::nullopt, std::nullopt);
+  EXPECT_TRUE(client.headers.empty());
+  s.cio = nullptr;
+}
+
 #ifdef WITH_CUOBJ
 TEST(RgwRdmaGet, StagingStaysInsideTheResponse)
 {
@@ -365,6 +443,33 @@ TEST(RgwRdmaGet, StagingStaysInsideTheResponse)
   // nothing past the response
   EXPECT_EQ(-EIO, op.get_data_cb(bl, 0, 1));
   EXPECT_EQ(8u, op.rdma_buf_offset);
+  op.rdma_buf = nullptr;
+}
+
+TEST(RgwRdmaGet, StagingCopiesEachSegment)
+{
+  // data in several segments, as a decompressed or a RADOS read can
+  // come, is staged without first being copied into one segment
+  DEFINE_REQ_STATE(g_ceph_context);
+  TestGetObj op(&s);
+  op.rdma_token = TOKEN_1M;
+  op.total_len = 8;
+  std::vector<char> mem(8);
+  RGWCuObjServer::RDMABufEntry entry;
+  entry.ptr = mem.data();
+  entry.size = mem.size();
+  op.rdma_buf = &entry;
+  op.rdma_mode = Mode::STAGED;
+
+  bufferlist bl;
+  bl.append(buffer::copy("xx012", 5));
+  bl.append(buffer::copy("345", 3));
+  bl.append(buffer::copy("67yy", 4));
+  ASSERT_EQ(3u, bl.get_num_buffers());
+  EXPECT_EQ(0, op.get_data_cb(bl, 2, 8));
+  EXPECT_EQ(8u, op.rdma_buf_offset);
+  EXPECT_EQ("01234567", std::string(mem.data(), 8));
+  EXPECT_EQ(3u, bl.get_num_buffers());
   op.rdma_buf = nullptr;
 }
 

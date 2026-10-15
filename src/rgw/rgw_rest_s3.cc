@@ -348,12 +348,9 @@ int RGWGetObj_ObjStore_S3::get_params(optional_yield y)
     // OSD passthrough, staged RDMA and plain-HTTP fallback
     rdma_token = *rdma_hdr;
     // the CRC of the delivered bytes the response reports
-    if (rgw::rdma::parse_checksum_algorithm(
-          s->info.env->get("HTTP_X_AMZ_RDMA_CHECKSUM_ALGORITHM", nullptr),
-          &rdma_cksum_asked) < 0) {
-      s->err.message = "x-amz-rdma-checksum-algorithm must be CRC64NVME "
-                       "or CRC32C";
-      return -EINVAL;
+    if (int r = rgw::rdma::parse_checksum_header(s, &rdma_cksum_asked);
+        r < 0) {
+      return r;
     }
   }
 
@@ -561,14 +558,7 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
     dump_header(s, "x-amz-rdma-bytes-transferred", total_len);
     // the OSDs' CRCs of exactly the delivered bytes, folded, a range's
     // too: what the client can check its own buffer against
-    if (rdma_crc64) {
-      dump_header(s, rgw::rdma::HDR_CRC64NVME,
-                  rgw::rdma::cksum_crc64nvme(*rdma_crc64).to_armor());
-    }
-    if (rdma_crc32c) {
-      dump_header(s, rgw::rdma::HDR_CRC32C,
-                  rgw::rdma::cksum_crc32c(*rdma_crc32c).to_armor());
-    }
+    rgw::rdma::dump_checksums(s, rdma_crc64, rdma_crc32c);
   } else {
     if (!rdma_token.empty()) {
       // token sent but RDMA is unavailable: valid fallback per the
@@ -3149,15 +3139,7 @@ void RGWPutObj_ObjStore_S3::send_response()
         // also in x-amz-checksum-<algorithm> below
         dump_header(s, "x-amz-rdma-reply", "200");
         dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
-        if (rdma_pulled_crc64) {
-          dump_header(s, rgw::rdma::HDR_CRC64NVME,
-                      rgw::rdma::cksum_crc64nvme(*rdma_pulled_crc64)
-                        .to_armor());
-        }
-        if (rdma_pulled_crc32c) {
-          dump_header(s, rgw::rdma::HDR_CRC32C,
-                      rgw::rdma::cksum_crc32c(*rdma_pulled_crc32c).to_armor());
-        }
+        rgw::rdma::dump_checksums(s, rdma_pulled_crc64, rdma_pulled_crc32c);
       }
       dump_header_if_nonempty(s, "x-amz-version-id", version_id);
       dump_header_if_nonempty(s, "x-amz-expiration", expires);

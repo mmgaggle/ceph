@@ -26,13 +26,12 @@
 
 #include "rgw_asio_thread.h"
 #include "rgw_cksum.h"
+#include "rgw_rdma_cksum.h"
 #include "rgw_rdma_fence.h"
 #include "rgw_sal.h"
 #include "rgw_zone.h"
 #include "rgw_cache.h"
 #include "rgw_acl.h"
-#include "common/crc64nvme.h"
-#include "common/rdma_token.h"
 #include "rgw_acl_s3.h" /* for dumping s3policy in debug log */
 #include "rgw_aio_throttle.h"
 #include "driver/rados/rgw_bucket.h"
@@ -8896,6 +8895,10 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
   auto aio = rgw::make_throttle(window_size, y);
   get_obj_data data(store, cb, &*aio, ofs, y);
 
+  // the CRCs the caller has room for: it decides which it wants
+  const rgw::rdma::cksum_want crcs_wanted{
+    .crc64nvme = params.rdma_crc64 != nullptr,
+    .crc32c = params.rdma_crc32c != nullptr};
   if (!params.rdma_token.empty()) {
     if (store->get_use_datacache()) {
       // d3n substitutes cached stripe sources, which is incompatible
@@ -8907,15 +8910,7 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
     data.rdma = true;
     data.rdma_token = params.rdma_token;
     data.rdma_range_start = ofs;
-    // the CRCs the caller has room for: it decides which it wants
-    if (params.rdma_crc64) {
-      data.rdma_flags |=
-        librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC64;
-    }
-    if (params.rdma_crc32c) {
-      data.rdma_flags |=
-        librados::ObjectReadOperation::RDMA_DELIVERY_WANT_CRC32C;
-    }
+    data.rdma_flags |= rgw::rdma::delivery_want_flags(crcs_wanted);
   }
 
   if (state.obj.empty()) {
@@ -8968,73 +8963,20 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
     }
     *params.rdma_bytes = total;
   }
-  if (data.rdma && (params.rdma_crc64 || params.rdma_crc32c)) {
+  if (data.rdma && crcs_wanted.any()) {
     // slots were pushed in logical stripe order, so folding them with
     // the concatenation combine yields the checksum of the whole
-    // delivered range. A slot contributes its value directly when the
-    // OSD marked it combinable (one contiguous extent), or the fold
-    // of its ranges when it was placed as several - a stripe served
-    // by interleaved EC shards arrives that way. A slot offering
-    // neither, or no valid value of a CRC, ends that CRC: folding a
-    // non-contiguous crc would be wrong, and skipping a slot would
-    // cover the wrong bytes.
-    using R = librados::ObjectReadOperation;
-    std::optional<uint64_t> combined64;
-    std::optional<uint32_t> combined32c;
-    bool ok64 = params.rdma_crc64 != nullptr;
-    bool ok32c = params.rdma_crc32c != nullptr;
+    // delivered range. A slot without a usable value of a CRC ends
+    // that CRC (see rgw::rdma::delivered_crcs())
+    rgw::rdma::crc_fold fold(crcs_wanted);
     for (const auto& r : data.rdma_slots) {
-      std::optional<uint64_t> slot64;
-      std::optional<uint32_t> slot32c;
-      if (r.flags & R::RDMA_DELIVERY_COMBINABLE) {
-        if (r.flags & R::RDMA_DELIVERY_CRC64_VALID) {
-          slot64 = r.crc64;
-        }
-        if (r.flags & R::RDMA_DELIVERY_CRC32C_VALID) {
-          slot32c = r.crc32c;
-        }
-      } else if (r.flags & R::RDMA_DELIVERY_RANGES) {
-        std::vector<ceph::rdma::crc_range_t> ranges;
-        ranges.reserve(r.ranges.size());
-        uint64_t ranged = 0;
-        for (const auto& x : r.ranges) {
-          ranges.push_back({x.ofs, x.len, x.crc64, x.crc32c});
-          ranged += x.len;
-        }
-        if (ranged == r.bytes) {
-          if (r.flags & R::RDMA_DELIVERY_CRC64_VALID) {
-            slot64 = ceph::rdma::fold_crc64_ranges(ranges);
-          }
-          if (r.flags & R::RDMA_DELIVERY_CRC32C_VALID) {
-            slot32c = ceph::rdma::fold_crc32c_ranges(std::move(ranges));
-          }
-        }
-      }
-      if (ok64) {
-        if (!slot64) {
-          ok64 = false;
-          combined64.reset();
-        } else {
-          combined64 = combined64 ?
-            ceph::crc64nvme_combine(*combined64, *slot64, r.bytes) : *slot64;
-        }
-      }
-      if (ok32c) {
-        if (!slot32c) {
-          ok32c = false;
-          combined32c.reset();
-        } else {
-          combined32c = combined32c ?
-            ceph::rdma::crc32c_combine(*combined32c, *slot32c, r.bytes) :
-            *slot32c;
-        }
-      }
+      fold.append(rgw::rdma::delivered_crcs(r), r.bytes);
     }
     if (params.rdma_crc64) {
-      *params.rdma_crc64 = combined64;
+      *params.rdma_crc64 = fold.result().crc64;
     }
     if (params.rdma_crc32c) {
-      *params.rdma_crc32c = combined32c;
+      *params.rdma_crc32c = fold.result().crc32c;
     }
   }
   return 0;

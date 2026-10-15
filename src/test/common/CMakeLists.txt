@@ -276,6 +276,13 @@ add_executable(unittest_rdma_token
 add_ceph_unittest(unittest_rdma_token)
 target_link_libraries(unittest_rdma_token ceph-common)
 
+# unittest_oob_gid
+add_executable(unittest_oob_gid
+  test_oob_gid.cc
+  )
+add_ceph_unittest(unittest_oob_gid)
+target_link_libraries(unittest_oob_gid ceph-common)
+
 if(WITH_OOB_OFI AND NOT WITH_SYSTEM_OFI_RMA)
   # unittest_ofi_rma: the ofi-rma submodule's own tests, token encoding
   # and writes over the tcp and shm providers, which need no special

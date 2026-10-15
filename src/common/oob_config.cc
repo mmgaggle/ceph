@@ -49,37 +49,11 @@ bool addr_to_gid(const std::string& addr, uint8_t gid[16])
   return false;
 }
 
-/// a GID as sysfs writes it, "0000:0000:0000:0000:0000:ffff:0a5a:0001"
+/// a GID as sysfs writes it, "0000:0000:0000:0000:0000:ffff:0a5a:0001",
+/// which the kernel prints as an IPv6 address (%pI6)
 bool parse_gid(const std::string& s, uint8_t gid[16])
 {
-  std::string hex;
-  for (char c : s) {
-    if (c == ':' || c == '\n') {
-      continue;
-    }
-    hex.push_back(c);
-  }
-  if (hex.size() != 32) {
-    return false;
-  }
-  for (int i = 0; i < 16; i++) {
-    unsigned v = 0;
-    for (int k = 0; k < 2; k++) {
-      const char c = hex[2 * i + k];
-      v <<= 4;
-      if (c >= '0' && c <= '9') {
-	v |= c - '0';
-      } else if (c >= 'a' && c <= 'f') {
-	v |= c - 'a' + 10;
-      } else if (c >= 'A' && c <= 'F') {
-	v |= c - 'A' + 10;
-      } else {
-	return false;
-      }
-    }
-    gid[i] = static_cast<uint8_t>(v);
-  }
-  return true;
+  return inet_pton(AF_INET6, s.c_str(), gid) == 1;
 }
 
 std::string read_line(const fs::path& p)

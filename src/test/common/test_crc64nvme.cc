@@ -135,10 +135,8 @@ TEST(Crc64Nvme, MatchesMadler)
 
 TEST(Crc64Nvme, MatchesSpdk)
 {
-  // the OSD computes with ceph::crc64nvme() (ISA-L or madler, chosen at
-  // run time); rgw's digests use spdk_crc64_nvme() (ISA-L when
-  // ceph-common is built with it, the vendored spdk table otherwise) -
-  // they must agree
+  // ceph::crc64nvme() (ISA-L or madler, chosen at run time), which the
+  // OSD and rgw's digests use, must agree with the vendored spdk table
   std::mt19937_64 rng(7);
   std::vector<char> buf(1 << 16);
   for (auto& c : buf) {

@@ -10,7 +10,12 @@
  * stripes into the window; this client never learns who wrote. A
  * progress thread polls the provider so the writes land while the
  * gateway waits. Then the window is checked against a local copy of
- * the object.
+ * the object. The window starts as the complement of that copy, so a
+ * byte that no OSD wrote does not match.
+ *
+ * The OSDs must place the object, and x-amz-rdma-bytes-transferred must
+ * count every byte. A gateway that falls back to HTTP fails the test,
+ * unless OFI_S3_ALLOW_FALLBACK=1: then the body is checked instead.
  *
  * The response must carry the OSDs' CRC of the delivered bytes,
  * x-amz-rdma-checksum-crc64nvme, or x-amz-rdma-checksum-crc32c when
@@ -126,6 +131,9 @@ int main(int argc, char** argv)
   const size_t size = expected.size();
   const char* alg_env = std::getenv("OFI_S3_CKSUM");
   const bool want32c = alg_env && strcasecmp(alg_env, "CRC32C") == 0;
+  const char* fallback_env = std::getenv("OFI_S3_ALLOW_FALLBACK");
+  const bool allow_fallback =
+    fallback_env && std::strcmp(fallback_env, "1") == 0;
 
   std::string err;
   auto ep = ceph::ofi::Endpoint::open(cfg, &err);
@@ -137,8 +145,11 @@ int main(int argc, char** argv)
   if (posix_memalign(&mem, 4096, size) != 0) {
     return 1;
   }
-  std::memset(mem, 0, size);
   char* window = static_cast<char*>(mem);
+  // no byte matches until an OSD writes it
+  for (size_t i = 0; i < size; i++) {
+    window[i] = ~expected[i];
+  }
   ceph::ofi::Endpoint::window_t w;
   if (int r = ep->register_window(window, size, &w); r < 0) {
     std::fprintf(stderr, "register window: %s\n", ep->last_error().c_str());
@@ -201,6 +212,15 @@ int main(int argc, char** argv)
     got = res.body.data();
     got_len = res.body.size();
     std::printf("fallback: object came back over HTTP\n");
+    if (!allow_fallback) {
+      std::printf("FAIL: the OSDs did not place the data "
+		  "(OFI_S3_ALLOW_FALLBACK=1 accepts the HTTP body)\n");
+      return 1;
+    }
+  } else if (res.bytes != std::to_string(size)) {
+    std::printf("FAIL: x-amz-rdma-bytes-transferred %s, expected %zu\n",
+		res.bytes.c_str(), size);
+    return 1;
   }
   if (got_len != size || std::memcmp(got, expected.data(), size) != 0) {
     size_t i = 0;

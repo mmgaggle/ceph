@@ -162,6 +162,61 @@ TEST(ECGather, AppendsToWhatIsThere)
   EXPECT_EQ("k", flatten(out, "d"));
 }
 
+TEST(ECGather, TakesExtentsOfManySlices)
+{
+  // an extent is copied and checked a slice at a time: one that ends
+  // inside its third slice comes out whole, in one buffer, as does one
+  // of no bytes, and a byte changed in any of its slices is found
+  using ceph::osd::oob::pushed_slice;
+  shard_push_t p;
+  const auto big = pattern('a', 2 * pushed_slice + 4099);
+  p.add("a", 0, big);
+  p.add("a", 1 << 20, "");
+  p.add("c", 8192, pattern('c', 5000));
+  p.seal();
+  std::vector<char> win(4 * pushed_slice, 'x');
+  std::memcpy(win.data(), p.data.data(), p.data.size());
+
+  out_t out;
+  auto t = take_pushed(win.data(), win.size(), p.pushed, p.crc, out);
+  ASSERT_TRUE(t.ok());
+  EXPECT_EQ(p.data.size(), t.bytes);
+  EXPECT_EQ(p.crc, t.crc);
+  ASSERT_EQ(2u, out.at("a").size());
+  EXPECT_EQ(1u, out.at("a").front().second.get_num_buffers());
+  EXPECT_EQ(big, out.at("a").front().second.to_str());
+  EXPECT_EQ(1u << 20, out.at("a").back().first);
+  EXPECT_EQ(0u, out.at("a").back().second.length());
+  EXPECT_EQ(pattern('c', 5000), flatten(out, "c"));
+
+  for (uint64_t at : {uint64_t(0), pushed_slice - 1, pushed_slice,
+		      2 * pushed_slice + 4098}) {
+    SCOPED_TRACE("byte " + std::to_string(at));
+    auto bad = win;
+    bad[at] ^= 0x40;
+    out_t o;
+    auto b = take_pushed(bad.data(), bad.size(), p.pushed, p.crc, o);
+    EXPECT_TRUE(b.mismatch);
+    EXPECT_EQ(p.data.size(), b.bytes);
+    EXPECT_TRUE(o.empty());
+  }
+}
+
+TEST(ECGather, RefusesAnExtentNoBufferlistHolds)
+{
+  // an extent of 4 GiB is refused before any of it is read, even from
+  // a window said to hold it
+  char win[1] = {};
+  pushed_t pushed;
+  pushed["a"].emplace_back(0, uint64_t(1) << 32);
+  out_t out;
+  auto t = take_pushed(win, uint64_t(1) << 33, pushed, 0, out);
+  EXPECT_TRUE(t.overrun);
+  EXPECT_FALSE(t.ok());
+  EXPECT_EQ(0u, t.bytes);
+  EXPECT_TRUE(out.empty());
+}
+
 TEST(ECGather, TheReplyCarriesTheChecksum)
 {
   ECSubReadReply r;

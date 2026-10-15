@@ -128,6 +128,9 @@ if(WITH_OOB_OFI)
   # client for OSD-direct PUTs over libfabric
   add_executable(ceph_test_rgw_ofi_put ofi/ofi_s3_put.cc)
   target_link_libraries(ceph_test_rgw_ofi_put ofi_rma ${CURL_LIBRARIES})
+  # neither is installed or run by qa; built by make check, so that a
+  # change that breaks them fails there
+  add_dependencies(tests ceph_test_rgw_ofi_get ceph_test_rgw_ofi_put)
 endif()
 
 # unittest_rgw_rdma_rc_wire

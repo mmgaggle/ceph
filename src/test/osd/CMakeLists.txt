@@ -133,6 +133,8 @@ if(WITH_OOB_OFI)
   install(TARGETS
     ceph_test_osd_oob_read
     DESTINATION ${CMAKE_INSTALL_BINDIR})
+  # built by make check too, so that a change that breaks it fails there
+  add_dependencies(tests ceph_test_osd_oob_read)
 endif()
 
 # unittest_ecbackend_l (legacy EC)

@@ -34,6 +34,8 @@ ARCH=$(uname -m)
 function munge_ceph_spec_in {
     local with_crimson=$1
     shift
+    local with_oob_ofi=$1
+    shift
     local for_make_check=$1
     shift
     local OUTFILE=$1
@@ -41,6 +43,9 @@ function munge_ceph_spec_in {
     # http://rpm.org/user_doc/conditional_builds.html
     if ! $with_crimson; then
         sed -i -e 's/%bcond_without crimson/%bcond_with crimson/g' $OUTFILE
+    fi
+    if $with_oob_ofi; then
+        sed -i -e 's/%bcond_with oob_ofi/%bcond_without oob_ofi/g' $OUTFILE
     fi
     if $for_make_check; then
         sed -i -e 's/%bcond_with make_check/%bcond_without make_check/g' $OUTFILE
@@ -419,6 +424,7 @@ if [ x$(uname)x = xFreeBSDx ]; then
 else
     [ $WITH_CRIMSON ] && with_crimson=true || with_crimson=false
     [ $WITH_PMEM ] && with_pmem=true || with_pmem=false
+    [ $WITH_OOB_OFI ] && with_oob_ofi=true || with_oob_ofi=false
     source /etc/os-release
     case "$ID" in
     debian|ubuntu|devuan|elementary|softiron)
@@ -493,9 +499,13 @@ else
         if $with_pmem; then
             build_profiles+=",pkg.ceph.pmdk"
         fi
+        if $with_oob_ofi; then
+            build_profiles+=",pkg.ceph.oob-ofi"
+        fi
 
         ci_debug "for_make_check=$for_make_check"
         ci_debug "with_crimson=$with_crimson"
+        ci_debug "with_oob_ofi=$with_oob_ofi"
         ci_debug "with_jaeger=$with_jaeger"
         ci_debug "build_profiles=$build_profiles"
         ci_debug "Now running 'mk-build-deps' and installing ceph-build-deps package"
@@ -534,7 +544,7 @@ else
         if [ "$INSTALL_EXTRA_PACKAGES" ]; then
             $SUDO dnf install -y $INSTALL_EXTRA_PACKAGES
         fi
-        munge_ceph_spec_in $with_crimson $for_make_check $DIR/ceph.spec
+        munge_ceph_spec_in $with_crimson $with_oob_ofi $for_make_check $DIR/ceph.spec
         # for python3_pkgversion macro defined by python-srpm-macros, which is required by python3-devel
         $SUDO dnf install -y python3-devel
         $SUDO $builddepcmd $DIR/ceph.spec 2>&1 | tee $DIR/yum-builddep.out
@@ -552,7 +562,7 @@ else
         if [ "$INSTALL_EXTRA_PACKAGES" ]; then
             $SUDO $zypp_install $INSTALL_EXTRA_PACKAGES
         fi
-        munge_ceph_spec_in $with_crimson $for_make_check $DIR/ceph.spec
+        munge_ceph_spec_in $with_crimson $with_oob_ofi $for_make_check $DIR/ceph.spec
         $SUDO $zypp_install $(rpmspec -q --buildrequires $DIR/ceph.spec) || exit 1
         ;;
     *)

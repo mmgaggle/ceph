@@ -5,6 +5,7 @@
 
 #include <charconv>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -81,6 +82,66 @@ bool is_verbs_provider(std::string_view provider);
  */
 void ofi_where(const location_t& loc, std::string_view provider,
 	       std::string* domain, std::string* node);
+
+/// whether a libfabric provider needs CAP_NET_RAW to open its endpoint:
+/// the UEC reference provider ("uet") sends and receives on a raw socket
+bool needs_net_raw(std::string_view provider);
+
+/**
+ * Before a switch from root to another user (--setuser): have the
+ * calling thread keep its permitted capabilities through its setuid(),
+ * for keep_only_net_raw() to trim after it. The other threads lose
+ * every capability in the switch, as they do without it. Returns 0, or
+ * -errno with *err.
+ */
+int keep_caps(std::string* err);
+
+/**
+ * After that switch, on the same thread: drop every capability but
+ * CAP_NET_RAW in the permitted set, and stop keeping capabilities
+ * through a later switch. The threads that this one starts afterwards
+ * inherit that permitted set. *kept says whether CAP_NET_RAW was there
+ * to keep, which a container can leave out. Returns 0, or -errno with
+ * *err when the thread may still hold other capabilities.
+ */
+int keep_only_net_raw(bool* kept, std::string* err);
+
+/**
+ * Run fn with CAP_NET_RAW in the effective set, for a provider that
+ * needs it while its endpoint opens (see needs_net_raw()).
+ *
+ * A thread that holds it in its effective set already, as one of a
+ * daemon running as root does, runs fn itself. A thread that holds it
+ * in its permitted set only, as one of a daemon that kept it through
+ * --setuser does, runs fn on a new thread that raises it, and drops it
+ * when fn returns. The kernel keeps capabilities for each thread, and
+ * raising them on the calling thread would give it credentials other
+ * than those that opened its RDMA files, which the kernel then refuses
+ * (ib_safe_file_access()). The threads that fn starts inherit the
+ * capability. A thread that does not hold it runs fn without it.
+ *
+ * Returns 0 when fn ran with CAP_NET_RAW, or -errno with *err when it
+ * ran without it: -EPERM when the thread does not hold it. An exception
+ * from fn reaches the caller.
+ */
+int with_net_raw(const std::function<void()>& fn, std::string* err);
+
+/**
+ * Whether an OSD that switches from root to cct's uid in global_init()
+ * keeps CAP_NET_RAW, and only it: when uet is the provider of its
+ * endpoint, and set_keepcaps does not keep every capability already.
+ * cct holds only ceph.conf, the environment and the command line then:
+ * the mon config arrives after the switch.
+ */
+bool osd_keeps_net_raw(CephContext* cct);
+
+/**
+ * Whether a gateway that switches from root to cct's uid when its
+ * frontends start keeps CAP_NET_RAW, and only it: when its RC service
+ * will open relay windows over uet (rc in oob_client_transports,
+ * rgw_rdma_osd_direct, and uet as oob_cluster_transport).
+ */
+bool rgw_keeps_net_raw(CephContext* cct);
 
 /// public_addr's address, for a daemon without a messenger of its own,
 /// or empty

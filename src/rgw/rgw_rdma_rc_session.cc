@@ -174,7 +174,19 @@ int Service::do_init(CephContext* c)
       // OSD writes land only while a manual-progress provider is polled
       oc.progress_thread = true;
       std::string err;
-      ofi_ep = ceph::ofi::Endpoint::open(oc, &err);
+      const auto open = [&] { ofi_ep = ceph::ofi::Endpoint::open(oc, &err); };
+      std::string no_raw;
+      if (!ceph::oob::needs_net_raw(oob.cluster)) {
+        open();
+      } else if (ceph::oob::with_net_raw(open, &no_raw) == -EPERM) {
+        // this thread keeps it through --setuser when root holds it
+        // (drop_privileges() in rgw_asio_frontend.cc), which podman's
+        // default capabilities do not include
+        no_raw += "; a gateway in a container needs --cap-add=NET_RAW";
+      }
+      if (!ofi_ep && !no_raw.empty()) {
+        err += "; " + no_raw;
+      }
       if (ofi_ep) {
         ldout(cct, 1) << "rgw_rdma_rc: OSD-direct relay windows over "
                       << "libfabric: " << ofi_ep->describe() << dendl;

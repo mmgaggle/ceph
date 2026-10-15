@@ -11,12 +11,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <list>
 #include <map>
 #include <utility>
 
 #include "include/buffer.h"
+#include "include/crc32c.h"
 
 namespace ceph::osd::oob {
 
@@ -29,11 +33,15 @@ struct pushed_take_t {
   bool ok() const { return !overrun && !mismatch; }
 };
 
+/// take_pushed() copies and checks an extent this much at a time
+inline constexpr uint64_t pushed_slice = 256 << 10;
+
 /**
  * Rebuild the buffers a shard pushed into a gather window instead of
  * returning them in its reply: its extents sit there back to back, in
- * reply order. They are copied out first and checked after, so a write
- * that lands in the window meanwhile cannot change what was checked.
+ * reply order. They are copied out a slice at a time, and each slice is
+ * checked in the copy, while it is still in cache: a write that lands in
+ * the window meanwhile cannot change what was checked.
  *
  * The copy has to match the crc32c the shard sent of what it pushed.
  * Without the check, the window's memory would pass for the shard's data
@@ -55,13 +63,22 @@ pushed_take_t take_pushed(
   std::map<Key, std::list<std::pair<uint64_t, ceph::buffer::list>>> got;
   for (const auto& [key, extents] : pushed) {
     for (const auto& [offset, len] : extents) {
-      if (len > size - t.bytes) {
+      // past the window's end, or more than a bufferlist holds
+      if (len > size - t.bytes || len > std::numeric_limits<unsigned>::max()) {
 	t.overrun = true;
 	return t;
       }
       ceph::buffer::list bl;
-      bl.append(win + t.bytes, len);
-      t.crc = bl.crc32c(t.crc);
+      if (len) {
+	ceph::buffer::ptr bp(ceph::buffer::create(len));
+	for (uint64_t o = 0; o < len; o += pushed_slice) {
+	  const uint64_t n = std::min(pushed_slice, len - o);
+	  char* c = bp.c_str() + o;
+	  std::memcpy(c, win + t.bytes + o, n);
+	  t.crc = ceph_crc32c(t.crc, reinterpret_cast<unsigned char*>(c), n);
+	}
+	bl.push_back(std::move(bp));
+      }
       got[key].emplace_back(offset, std::move(bl));
       t.bytes += len;
     }

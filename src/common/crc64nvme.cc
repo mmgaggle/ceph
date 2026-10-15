@@ -109,6 +109,36 @@ uint64_t crc64nvme(const ceph::buffer::list& bl)
   return crc;
 }
 
+uint64_t crc64nvme_crc32c(const ceph::buffer::list& bl, uint32_t* crc32c)
+{
+  // the walk lists each buffer on its own to reach its CRC cache: a
+  // heap node and two atomic updates of the buffer's reference count.
+  // On Zen 5 that costs more than the second read saves for buffers of
+  // 2 KiB or less, and less for 3 KiB or more; under 4 KiB on average,
+  // which leaves a margin, take the two passes
+  constexpr uint64_t min_avg_buffer = 4096;
+  if (bl.length() < min_avg_buffer * bl.get_num_buffers()) {
+    *crc32c = bl.crc32c(*crc32c);
+    return crc64nvme(bl);
+  }
+  const auto f = crc64nvme_func();
+  uint64_t crc = 0;
+  uint32_t crc32 = *crc32c;
+  for (const auto& ptr : bl.buffers()) {
+    if (ptr.length()) {
+      crc = f(crc, ptr.c_str(), ptr.length());
+      // a list of this one buffer finds and leaves its CRC-32C in the
+      // cache of the buffer's memory, under the range and the seed that
+      // bl.crc32c() would use
+      ceph::buffer::list one;
+      one.append(ptr);
+      crc32 = one.crc32c(crc32);
+    }
+  }
+  *crc32c = crc32;
+  return crc;
+}
+
 uint64_t crc64nvme_combine(uint64_t crc_a, uint64_t crc_b, uint64_t len_b)
 {
   return crc64nvme_comb(crc_a, crc_b, len_b);

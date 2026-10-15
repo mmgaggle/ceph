@@ -811,8 +811,11 @@ std::optional<ceph::osd::oob::sub_read_push> ECBackend::prepare_sub_read_push(
   // of receipt, land (or be cut off) within lease plus drain. The
   // primary keeps an unused window out of use for that long.
   const auto& pool = get_parent()->get_pool();
-  const double age = ceph_clock_now() - received;
-  if (age > pool.get_rdma_delivery_lease()) {
+  p.bounds = ceph::osd::oob::make_bounds(
+    received, pool.get_rdma_delivery_lease(), pool.get_rdma_delivery_drain(),
+    std::nullopt, ceph::signedspan::zero());
+  if (ceph::osd::oob::lease_expired(p.bounds)) {
+    const double age = ceph_clock_now() - received;
     dout(10) << __func__ << ": lease expired (" << age << "s), replying inline"
 	     << dendl;
     return std::nullopt;
@@ -820,9 +823,6 @@ std::optional<ceph::osd::oob::sub_read_push> ECBackend::prepare_sub_read_push(
   p.exec = exec;
   p.token = op.push_token;
   p.plan = ceph::osd::oob::linear_plan(0, p.all.length());
-  p.bounds = ceph::osd::oob::make_bounds(
-    received, pool.get_rdma_delivery_lease(), pool.get_rdma_delivery_drain(),
-    std::nullopt, ceph::signedspan::zero());
   return p;
 }
 

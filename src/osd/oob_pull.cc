@@ -7,7 +7,6 @@
 #include <utility>
 
 #include "common/ceph_context.h"
-#include "common/crc64nvme.h"
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/Formatter.h"
@@ -309,22 +308,10 @@ void pull_job::pull(const pull_op& p, pull_result& res)
     return;
   }
   ceph_assert(bl.length() == p.len);
-  auto& oob = res.oob;
-  oob.bytes = p.len;
-  if (p.want64 || p.want32c) {
-    // the bytes as they arrived here, before the write encodes them
-    if (p.want64) {
-      oob.crc64 = ceph::crc64nvme(bl);
-    }
-    if (p.want32c) {
-      oob.crc32c = ceph::rdma::crc32c_canonical(bl);
-    }
-    oob.ranges.push_back({p.base_offset, p.len, oob.crc64, oob.crc32c});
-    oob.flags |= ceph::rdma::oob_result_t::FLAG_COMBINABLE |
-      ceph::rdma::oob_result_t::FLAG_RANGES |
-      (p.want64 ? ceph::rdma::oob_result_t::FLAG_CRC64NVME : 0) |
-      (p.want32c ? ceph::rdma::oob_result_t::FLAG_CRC32C : 0);
-  }
+  res.oob.bytes = p.len;
+  // the checksums of the bytes as they arrived here, before the write
+  // encodes them
+  checksum_plan(bl, plan, p.want64, p.want32c, res.oob);
   dout(20) << "op " << p.idx << " of " << key << ": pulled " << p.len
 	   << " bytes" << dendl;
   res.r = 0;

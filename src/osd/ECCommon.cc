@@ -27,6 +27,7 @@
 #include "ECMsgTypes.h"
 #include "PGLog.h"
 #include "osd_tracer.h"
+#include "osd/oob_xfer.h"
 
 #define dout_context cct
 #define dout_subsys ceph_subsys_osd
@@ -623,9 +624,11 @@ void ECCommon::ReadPipeline::do_read_op(ReadOp &rop) {
     // a shard holding the window's token may start a push within the
     // pool's lease of receiving the sub-read, and its writes land or
     // are cut off within the drain after that
-    rop.gather.quarantine_ms = static_cast<uint64_t>(
-      (get_parent()->get_pool().get_rdma_delivery_lease() +
-       get_parent()->get_pool().get_rdma_delivery_drain()) * 1000.0);
+    const auto& pool = get_parent()->get_pool();
+    const auto window = ceph::osd::oob::delivery_window(
+      pool.get_rdma_delivery_lease(), pool.get_rdma_delivery_drain());
+    rop.gather.quarantine_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(window).count();
   }
   for (auto &&[pg_shard, read]: messages) {
     rop.in_progress.insert(pg_shard);

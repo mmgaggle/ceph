@@ -215,3 +215,83 @@ TEST(Crc64Nvme, ChainedSegments)
     EXPECT_EQ(want, chained) << "max_seg=" << max_seg;
   }
 }
+
+TEST(Crc64Nvme, WithCrc32c)
+{
+  // one walk gives what the two passes give, over segments of odd
+  // lengths, with any CRC-32C seed. Segments under 4 KiB on average
+  // (max_seg 7 and 300) take the two passes themselves
+  std::mt19937_64 rng(129);
+  for (size_t max_seg : {size_t(7), size_t(300), size_t(70000),
+			 size_t(1 << 20)}) {
+    std::vector<char> src(1 << 18);
+    for (auto& c : src) {
+      c = static_cast<char>(rng());
+    }
+    bufferlist bl;
+    for (size_t pos = 0; pos < src.size();) {
+      const size_t len = std::min<size_t>(1 + rng() % max_seg,
+					  src.size() - pos);
+      bl.append(ceph::buffer::copy(src.data() + pos, len));
+      pos += len;
+    }
+    for (uint32_t seed : {0u, 0xffffffffu, 0x12345678u}) {
+      uint32_t crc32 = seed;
+      EXPECT_EQ(ceph::crc64nvme(bl), ceph::crc64nvme_crc32c(bl, &crc32))
+	<< "max_seg=" << max_seg;
+      bl.invalidate_crc();
+      EXPECT_EQ(bl.crc32c(seed), crc32) << "max_seg=" << max_seg
+					<< " seed=" << seed;
+    }
+  }
+  bufferlist empty;
+  uint32_t crc32 = 0x12345678;
+  EXPECT_EQ(0u, ceph::crc64nvme_crc32c(empty, &crc32));
+  EXPECT_EQ(0x12345678u, crc32);
+}
+
+TEST(Crc64Nvme, WithCrc32cUsesTheBufferCache)
+{
+  // the CRC-32C half goes through each buffer's cache, as bl.crc32c()
+  // does: it fills it for a later data digest of the same bytes, and
+  // finds what an earlier one left. So do the two passes that buffers
+  // under 4 KiB on average take
+  std::mt19937_64 rng(1290);
+  ceph::buffer::track_cached_crc(true);
+  for (size_t min_seg : {size_t(500), size_t(5000)}) {
+    bufferlist bl;
+    for (int i = 0; i < 16; i++) {
+      std::vector<char> seg(min_seg + rng() % (2 * min_seg));
+      for (auto& c : seg) {
+	c = static_cast<char>(rng());
+      }
+      bl.append(ceph::buffer::copy(seg.data(), seg.size()));
+    }
+    ASSERT_EQ(16u, bl.get_num_buffers());
+    int hits = ceph::buffer::get_cached_crc();
+    int misses = ceph::buffer::get_missed_crc();
+    uint32_t crc32 = -1;
+    ceph::crc64nvme_crc32c(bl, &crc32);
+    EXPECT_EQ(misses + 16, ceph::buffer::get_missed_crc())
+      << "min_seg=" << min_seg;
+    EXPECT_EQ(crc32, bl.crc32c(-1)) << "min_seg=" << min_seg;
+    EXPECT_EQ(hits + 16, ceph::buffer::get_cached_crc())
+      << "min_seg=" << min_seg;
+    // and the other way around, over copies of the same buffers
+    bufferlist copy;
+    for (const auto& p : bl.buffers()) {
+      copy.append(ceph::buffer::copy(p.c_str(), p.length()));
+    }
+    const uint32_t digest = copy.crc32c(-1);
+    hits = ceph::buffer::get_cached_crc();
+    misses = ceph::buffer::get_missed_crc();
+    crc32 = -1;
+    EXPECT_EQ(ceph::crc64nvme(copy), ceph::crc64nvme_crc32c(copy, &crc32))
+      << "min_seg=" << min_seg;
+    EXPECT_EQ(digest, crc32) << "min_seg=" << min_seg;
+    EXPECT_EQ(hits + 16, ceph::buffer::get_cached_crc())
+      << "min_seg=" << min_seg;
+    EXPECT_EQ(misses, ceph::buffer::get_missed_crc()) << "min_seg=" << min_seg;
+  }
+  ceph::buffer::track_cached_crc(false);
+}

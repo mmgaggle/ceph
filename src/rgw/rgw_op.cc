@@ -5433,6 +5433,12 @@ void RGWPutObj::execute(optional_yield y)
       osd_put_refusal = "an append";
     } else if (multipart) {
       osd_put_refusal = "a part of a multipart upload";
+    } else if (s->cct->_conf.get_val<std::chrono::seconds>(
+		 "rados_osd_op_timeout").count() > 0) {
+      // an OSD counts a pull's bounds from when it plans the pull, so a
+      // stripe write that timed out here can still read the client's
+      // window after the client reused it
+      osd_put_refusal = "rados_osd_op_timeout is set";
     } else if (supplied_md5_b64) {
       osd_put_refusal = "Content-MD5, which needs the bytes";
     } else if (driver->get_compression_type(*pdest_placement) != "none") {

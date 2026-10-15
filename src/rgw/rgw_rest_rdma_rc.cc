@@ -28,10 +28,9 @@
 #include "include/scope_guard.h"
 #include "osd/osd_types.h"
 #include "rgw_auth.h"
-#include "rgw_cksum.h"
 #include "rgw_common.h"
-#include "rgw_crc_digest.h"
 #include "rgw_op.h"
+#include "rgw_rdma_cksum.h"
 #include "rgw_rdma_rc_session.h"
 #include "rgw_rdma_rc_wire.h"
 #include "rgw_rest_s3.h"
@@ -215,37 +214,134 @@ void send_status(req_state* s, RGWOp* op, int op_ret, const Status& st)
   }
 }
 
-// ---------------------------------------------------------------------
-// GET: PREPARE stats and authorizes, READY reads the object into the
-// session buffer (OSD-direct when the gateway has a DC target) and
-// relays it to the client over the paired queue pair as it lands.
+/// the service, or nullptr with the fall-back answer in status when it
+/// is not running
+Service* available_service(Status& status)
+{
+  auto* svc = Service::get();
+  if (!svc || !svc->available()) {
+    status = status_of(Error::UNSUPPORTED);
+    return nullptr;
+  }
+  return svc;
+}
 
-class GetOp : public RGWGetObj {
+/**
+ * What the GET and the PUT share: the session, the PREPARE and READY
+ * steps around it, and the headers their answers have in common. Base
+ * is the S3 op that does the object's part of the work.
+ */
+template <class Base, Op OP>
+class SessionOp : public Base {
+ protected:
   const bool prepare_phase;
   PrepareRequest preq;
   ReadyRequest rreq;
   PrepareReply prep_reply;
   Status status;
-
   Session* sess = nullptr;
+  uint64_t bytes_done = 0;
+  /// the CRCs of the transferred bytes that the client asked for
+  std::optional<uint64_t> final_crc64;
+  std::optional<uint32_t> final_crc32c;
+
+  explicit SessionOp(bool prepare) : prepare_phase(prepare) {}
+
+  /// PREPARE: create the session, owned by the requester
+  void prepare_session(Service* svc) {
+    preq.principal = principal_of(this->s);
+    if (auto e = svc->prepare(preq, prep_reply); e != Error::OK) {
+      ldpp_dout(this, 4) << "hipobj-rc: prepare failed: " << to_string(e)
+                         << dendl;
+      status = status_of(e);
+    }
+  }
+
+  /// READY: take the session that the requester prepared; false, with
+  /// the answer set, when it cannot be taken
+  bool claim_session(Service* svc) {
+    rreq.principal = principal_of(this->s);
+    Session* claimed = nullptr;
+    if (auto e = svc->claim(rreq, &claimed); e != Error::OK) {
+      ldpp_dout(this, 4) << "hipobj-rc: ready refused: " << to_string(e)
+                         << dendl;
+      status = status_of(e);
+      return false;
+    }
+    sess = claimed;
+    return true;
+  }
+
+  /// the status line and protocol echo; false, with the answer ended,
+  /// for an error
+  bool send_reply_status() {
+    send_status(this->s, this, this->op_ret, status);
+    if (this->op_ret < 0 || status.http) {
+      end_header(this->s, this);
+      return false;
+    }
+    return true;
+  }
+
+  /// the answer to PREPARE: the server's end of the queue pair
+  void dump_prepare_reply() {
+    dump_header(this->s, "x-amz-rdma-reply", "200:" + prep_reply.server_token);
+    dump_header(this->s, "x-amz-rdma-token", prep_reply.server_token);
+    dump_header(this->s, "x-amz-rdma-session", prep_reply.session_id);
+    dump_header(this->s, "x-amz-rdma-psn", format_psn(prep_reply.server_psn));
+    dump_header(this->s, "x-amz-rdma-qpn", format_hex(prep_reply.server_qpn));
+  }
+
+  /// the answer to READY: the outcome of the transfer
+  void dump_ready_reply(const std::string& etag) {
+    dump_header(this->s, "x-amz-rdma-bytes-transferred", bytes_done);
+    dump_header(this->s, "x-amz-rdma-cookie", format_cookie(rreq.cookie));
+    if (!etag.empty()) {
+      dump_header(this->s, "x-amz-rdma-etag", etag);
+      dump_etag(this->s, etag);
+    }
+    dump_header_if_nonempty(this->s, "x-amz-rdma-version-id",
+                            this->version_id);
+    rgw::rdma::dump_checksums(this->s, final_crc64, final_crc32c);
+  }
+
+ public:
+  int verify_permission(optional_yield y) override {
+    if (int r = check_requester(this, this->s); r < 0) {
+      return r;
+    }
+    return Base::verify_permission(y);
+  }
+
+  int verify_params() override {
+    return prepare_phase ? parse_prepare(this->s, OP, preq)
+                         : parse_ready(this->s, rreq);
+  }
+};
+
+// ---------------------------------------------------------------------
+// GET: PREPARE stats and authorizes, READY reads the object into the
+// session buffer (OSD-direct when the gateway has a DC target) and
+// relays it to the client over the paired queue pair as it lands.
+
+class GetOp : public SessionOp<RGWGetObj, Op::GET> {
   uint64_t range_ofs = 0;
   uint64_t range_size = 0;
 
   landed_ranges landed;
   uint64_t staged = 0;  ///< inline-copy cursor
+  bool relayed = false; ///< OSDs placed bytes in the buffer
+  /// the CRCs that the client asked for, of the bytes staged inline
+  chained_crcs staged_crcs;
   uint64_t pushed = 0;  ///< bytes posted to the client
   uint32_t acked = 0;   ///< writes the client's queue pair took
   Outcome push_outcome = Outcome::OK;
   uint32_t depth = 1;
 
-  uint64_t bytes_done = 0;
-  /// the CRCs of the delivered bytes that the client asked for
-  std::optional<uint64_t> final_crc64;
-  std::optional<uint32_t> final_crc32c;
   std::string etag;
 
  public:
-  explicit GetOp(bool prepare) : prepare_phase(prepare) {}
+  explicit GetOp(bool prepare) : SessionOp(prepare) {}
 
   const char* name() const override {
     return prepare_phase ? "hipobj_rc_prepare_get" : "hipobj_rc_ready_get";
@@ -255,23 +351,16 @@ class GetOp : public RGWGetObj {
   // and force a relay to restart in staged mode
   bool prefetch_data() override { return false; }
 
-  int verify_permission(optional_yield y) override {
-    if (int r = check_requester(this, s); r < 0) {
-      return r;
-    }
-    return RGWGetObj::verify_permission(y);
-  }
-
-  int verify_params() override {
-    return prepare_phase ? parse_prepare(s, Op::GET, preq)
-                         : parse_ready(s, rreq);
-  }
-
   int get_params(optional_yield y) override {
     // the CRC of the delivered bytes the READY answer reports
     if (int r = rgw::rdma::parse_checksum_header(s, &rdma_cksum_asked);
         r < 0) {
       return r;
+    }
+    // and the same CRCs of the bytes the read stages: RGWGetObj::execute()
+    // gets here once, before it reads
+    if (!prepare_phase && s->cct->_conf.get_val<bool>("rgw_rdma_checksum")) {
+      staged_crcs.reset(rdma_cksum_asked);
     }
     // the range is the session's, never a Range header
     range_str = nullptr;
@@ -415,7 +504,9 @@ int GetOp::send_response_data(bufferlist& bl, off_t bl_ofs, off_t len)
                        << staged << "+" << len << dendl;
     return -EIO;
   }
-  bl.begin(bl_ofs).copy(len, static_cast<char*>(sess->buf->ptr) + staged);
+  char* dst = static_cast<char*>(sess->buf->ptr) + staged;
+  bl.begin(bl_ofs).copy(len, dst);
+  staged_crcs.append(dst, len);
   landed.add(staged, len);
   staged += len;
   return push(false);
@@ -434,6 +525,7 @@ int GetOp::get_oob_cb(uint64_t o, uint64_t len)
                        << "window at " << o << "+" << len << dendl;
     return -EIO;
   }
+  relayed = true;
   landed.add(o, len);
   return push(false);
 }
@@ -449,9 +541,8 @@ void GetOp::execute(optional_yield y)
 
 void GetOp::execute_prepare(optional_yield y)
 {
-  auto* svc = Service::get();
-  if (!svc || !svc->available()) {
-    status = status_of(Error::UNSUPPORTED);
+  auto* svc = available_service(status);
+  if (!svc) {
     return;
   }
   range_ofs = preq.offset;
@@ -471,28 +562,15 @@ void GetOp::execute_prepare(optional_yield y)
   }
   // a range past the end transfers what exists
   preq.size = total_len;
-  preq.principal = principal_of(s);
-  if (auto e = svc->prepare(preq, prep_reply); e != Error::OK) {
-    ldpp_dout(this, 4) << "hipobj-rc: prepare failed: " << to_string(e) << dendl;
-    status = status_of(e);
-  }
+  prepare_session(svc);
 }
 
 void GetOp::execute_ready(optional_yield y)
 {
-  auto* svc = Service::get();
-  if (!svc || !svc->available()) {
-    status = status_of(Error::UNSUPPORTED);
+  auto* svc = available_service(status);
+  if (!svc || !claim_session(svc)) {
     return;
   }
-  rreq.principal = principal_of(s);
-  Session* claimed = nullptr;
-  if (auto e = svc->claim(rreq, &claimed); e != Error::OK) {
-    ldpp_dout(this, 4) << "hipobj-rc: ready refused: " << to_string(e) << dendl;
-    status = status_of(e);
-    return;
-  }
-  sess = claimed;
   // the session ends in finish() also when the data phase throws, or the
   // reaper never takes it; what the OSDs may still write into the buffer
   // is not known then. A throw out of the read itself leaves no fence
@@ -553,14 +631,20 @@ void GetOp::execute_ready(optional_yield y)
     bytes_done = total_len;
     if (s->cct->_conf.get_val<bool>("rgw_rdma_checksum")) {
       // the OSDs' own checksums of the bytes they placed, when they
-      // relayed them; else the gateway's, of its buffer
-      const bool relay = rdma_mode == RdmaMode::RELAY;
+      // relayed them; else the gateway's, chained over its copies when
+      // it staged every byte, or of its buffer
+      rgw::rdma::crcs c;
+      if (rdma_mode == RdmaMode::RELAY) {
+        c = {rdma_crc64, rdma_crc32c};
+      } else if (!relayed && staged == total_len) {
+        c = staged_crcs.result();
+      }
       if (rdma_cksum_asked.crc64nvme) {
-        final_crc64 = relay && rdma_crc64 ? *rdma_crc64 :
+        final_crc64 = c.crc64 ? *c.crc64 :
           ceph::crc64nvme(0, sess->buf->ptr, total_len);
       }
       if (rdma_cksum_asked.crc32c) {
-        final_crc32c = relay && rdma_crc32c ? *rdma_crc32c :
+        final_crc32c = c.crc32c ? *c.crc32c :
           rgw::rdma::crc32c_of(sess->buf->ptr, total_len);
       }
     }
@@ -601,28 +685,15 @@ void GetOp::execute_ready(optional_yield y)
 
 void GetOp::send_response()
 {
-  send_status(s, this, op_ret, status);
-  if (op_ret < 0 || status.http) {
-    end_header(s, this);
+  if (!send_reply_status()) {
     return;
   }
   if (prepare_phase) {
-    dump_header(s, "x-amz-rdma-reply", "200:" + prep_reply.server_token);
-    dump_header(s, "x-amz-rdma-token", prep_reply.server_token);
-    dump_header(s, "x-amz-rdma-session", prep_reply.session_id);
-    dump_header(s, "x-amz-rdma-psn", format_psn(prep_reply.server_psn));
-    dump_header(s, "x-amz-rdma-qpn", format_hex(prep_reply.server_qpn));
+    dump_prepare_reply();
   } else {
-    dump_header(s, "x-amz-rdma-bytes-transferred", bytes_done);
-    dump_header(s, "x-amz-rdma-cookie", format_cookie(rreq.cookie));
-    if (!etag.empty()) {
-      dump_header(s, "x-amz-rdma-etag", etag);
-      dump_etag(s, etag);
-    }
-    dump_header_if_nonempty(s, "x-amz-rdma-version-id", version_id);
     // the checksums of the delivered range, not of the object, so not
     // in S3's x-amz-checksum-<algorithm>
-    rgw::rdma::dump_checksums(s, final_crc64, final_crc32c);
+    dump_ready_reply(etag);
   }
   end_header(s, this, nullptr, 0);
 }
@@ -633,38 +704,19 @@ void GetOp::send_response()
 // regular PUT pipeline (bucket default encryption, compression,
 // checksums, notifications).
 
-class PutOp : public RGWPutObj_ObjStore_S3 {
-  const bool prepare_phase;
-  PrepareRequest preq;
-  ReadyRequest rreq;
-  PrepareReply prep_reply;
-  Status status;
-  Session* sess = nullptr;
+class PutOp : public SessionOp<RGWPutObj_ObjStore_S3, Op::PUT> {
   uint64_t cursor = 0;
-  uint64_t bytes_done = 0;
   /// the CRCs of the session buffer that the client asked for
   rgw::rdma::cksum_want cksum_asked;
-  std::optional<uint64_t> final_crc64;
-  std::optional<uint32_t> final_crc32c;
+  /// and of the chunks get_data() copied
+  chained_crcs copied_crcs;
 
  public:
-  explicit PutOp(bool prepare) : prepare_phase(prepare) {}
+  explicit PutOp(bool prepare) : SessionOp(prepare) {}
   using RGWPutObj_ObjStore_S3::get_data;
 
   const char* name() const override {
     return prepare_phase ? "hipobj_rc_prepare_put" : "hipobj_rc_ready_put";
-  }
-
-  int verify_permission(optional_yield y) override {
-    if (int r = check_requester(this, s); r < 0) {
-      return r;
-    }
-    return RGWPutObj_ObjStore_S3::verify_permission(y);
-  }
-
-  int verify_params() override {
-    return prepare_phase ? parse_prepare(s, Op::PUT, preq)
-                         : parse_ready(s, rreq);
   }
 
   int get_params(optional_yield y) override {
@@ -685,7 +737,9 @@ class PutOp : public RGWPutObj_ObjStore_S3 {
     }
     const uint64_t n = std::min<uint64_t>(bytes_done - cursor,
                                           s->cct->_conf->rgw_max_chunk_size);
-    bl.append(static_cast<const char*>(sess->buf->ptr) + cursor, n);
+    const char* p = static_cast<const char*>(sess->buf->ptr) + cursor;
+    bl.append(p, n);
+    copied_crcs.append(p, n);
     cursor += n;
     return static_cast<int>(n);
   }
@@ -696,9 +750,8 @@ class PutOp : public RGWPutObj_ObjStore_S3 {
 
 void PutOp::execute(optional_yield y)
 {
-  auto* svc = Service::get();
-  if (!svc || !svc->available()) {
-    status = status_of(Error::UNSUPPORTED);
+  auto* svc = available_service(status);
+  if (!svc) {
     return;
   }
   if (prepare_phase) {
@@ -706,22 +759,13 @@ void PutOp::execute(optional_yield y)
       op_ret = -ERR_TOO_LARGE;
       return;
     }
-    preq.principal = principal_of(s);
-    if (auto e = svc->prepare(preq, prep_reply); e != Error::OK) {
-      ldpp_dout(this, 4) << "hipobj-rc: prepare failed: " << to_string(e) << dendl;
-      status = status_of(e);
-    }
+    prepare_session(svc);
     return;
   }
 
-  rreq.principal = principal_of(s);
-  Session* claimed = nullptr;
-  if (auto e = svc->claim(rreq, &claimed); e != Error::OK) {
-    ldpp_dout(this, 4) << "hipobj-rc: ready refused: " << to_string(e) << dendl;
-    status = status_of(e);
+  if (!claim_session(svc)) {
     return;
   }
-  sess = claimed;
   // the session ends in finish() also when the store throws (a streaming
   // signature whose HMAC fails does), or the reaper never takes it
   auto unclaim = make_scope_guard([this, svc] {
@@ -769,17 +813,16 @@ void PutOp::execute(optional_yield y)
     // the body is the session buffer, whatever token READY carries
     rdma_staging_allowed = false;
     if (s->cct->_conf.get_val<bool>("rgw_rdma_checksum")) {
-      if (cksum_asked.crc64nvme) {
-        final_crc64 = ceph::crc64nvme(0, sess->buf->ptr, sess->size);
-      }
-      if (cksum_asked.crc32c) {
-        final_crc32c = rgw::rdma::crc32c_of(sess->buf->ptr, sess->size);
-      }
+      copied_crcs.reset(cksum_asked);
     }
     RGWPutObj_ObjStore_S3::execute(y);
     if (op_ret < 0) {
       outcome = Outcome::BACKEND_FAIL;
       bytes_done = 0;
+    } else if (cursor == bytes_done) {
+      // get_data() copied every byte, unless a copy source gave the body
+      final_crc64 = copied_crcs.result().crc64;
+      final_crc32c = copied_crcs.result().crc32c;
     }
   } else {
     status = status_of(outcome);
@@ -790,33 +833,20 @@ void PutOp::execute(optional_yield y)
 
 void PutOp::send_response()
 {
-  send_status(s, this, op_ret, status);
-  if (op_ret < 0 || status.http) {
-    end_header(s, this);
+  if (!send_reply_status()) {
     return;
   }
   if (prepare_phase) {
-    dump_header(s, "x-amz-rdma-reply", "200:" + prep_reply.server_token);
-    dump_header(s, "x-amz-rdma-token", prep_reply.server_token);
-    dump_header(s, "x-amz-rdma-session", prep_reply.session_id);
-    dump_header(s, "x-amz-rdma-psn", format_psn(prep_reply.server_psn));
-    dump_header(s, "x-amz-rdma-qpn", format_hex(prep_reply.server_qpn));
+    dump_prepare_reply();
+    // the staging buffer the client writes the object into
     dump_header(s, "x-amz-rdma-mr-addr", format_hex(prep_reply.staging_addr));
     dump_header(s, "x-amz-rdma-mr-rkey", format_hex(prep_reply.staging_rkey));
   } else {
-    dump_header(s, "x-amz-rdma-bytes-transferred", bytes_done);
-    dump_header(s, "x-amz-rdma-cookie", format_cookie(rreq.cookie));
-    if (!etag.empty()) {
-      dump_header(s, "x-amz-rdma-etag", etag);
-      dump_etag(s, etag);
-    }
-    dump_header_if_nonempty(s, "x-amz-rdma-version-id", version_id);
-    // the checksums of the bytes the client wrote, and the object's
-    // stored one, as S3 reports it
-    rgw::rdma::dump_checksums(s, final_crc64, final_crc32c);
-    if (cksum && cksum->aws()) {
-      dump_header(s, cksum->header_name(), cksum->to_armor());
-    }
+    // the checksums of the bytes the client wrote
+    dump_ready_reply(etag);
+    // and the headers an S3 PUT answers with: the object's encryption,
+    // version, expiration and stored checksum
+    dump_stored_headers();
   }
   end_header(s, this, nullptr, 0);
 }
@@ -846,9 +876,8 @@ class CancelOp : public RGWOp {
   }
 
   void execute(optional_yield y) override {
-    auto* svc = Service::get();
-    if (!svc || !svc->available()) {
-      status = status_of(Error::UNSUPPORTED);
+    auto* svc = available_service(status);
+    if (!svc) {
       return;
     }
     switch (auto e = svc->cancel(session_id, principal_of(s)); e) {
@@ -1033,7 +1062,13 @@ RGWHandler_REST* RESTMgr::get_handler(rgw::sal::Driver* driver, req_state* s,
         t->query.find('&') != std::string::npos) {
       return reject(unsupported("only versionId may qualify an RDMA target"));
     }
-    instance = url_decode(t->query.substr(vid.size()));
+    // strictly, as the bucket and key: a lenient decode turns a bad
+    // escape into no version, which reads the current one
+    auto v = percent_decode(t->query.substr(vid.size()));
+    if (!v) {
+      return reject(bad_request("malformed versionId in x-amz-rdma-target"));
+    }
+    instance = std::move(*v);
   }
   s->init_state.url_bucket = t->bucket;
   s->object_key = rgw_obj_key(t->key, instance);

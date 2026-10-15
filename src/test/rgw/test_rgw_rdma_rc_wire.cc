@@ -4,16 +4,19 @@
 #include "rgw/rgw_rdma_rc_wire.h"
 #include "rgw/rgw_rdma_cksum.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <ctime>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "acconfig.h"
 #include "common/ceph_context.h"
+#include "common/crc64nvme.h"
 #include "common/dout.h"
 #include "rgw/rgw_common.h"
 #ifdef WITH_RDMA_RC
@@ -124,6 +127,9 @@ TEST(RdmaRcWire, Psn)
   EXPECT_FALSE(parse_psn("1"));        // fixed width
   EXPECT_FALSE(parse_psn("0000001"));
   EXPECT_FALSE(parse_psn("00000g"));
+  EXPECT_FALSE(parse_psn("+00001"));   // digits only
+  EXPECT_FALSE(parse_psn(" 00001"));
+  EXPECT_FALSE(parse_psn("-00001"));
   EXPECT_EQ("000001", format_psn(1));
   EXPECT_EQ("FFFFFF", format_psn(0xffffff));
   EXPECT_EQ("000001", format_psn(0x1000001)); // masked to 24 bits
@@ -149,6 +155,13 @@ TEST(RdmaRcWire, BareHex)
   EXPECT_FALSE(parse_hex(""));
   EXPECT_FALSE(parse_hex("0x10"));
   EXPECT_FALSE(parse_hex("1ffffffffffffffff"));
+  EXPECT_THAT(parse_hex("DEADbeef"), testing::Optional(0xdeadbeefull));
+  // digits only, at most 16 of them
+  EXPECT_FALSE(parse_hex("-1"));
+  EXPECT_FALSE(parse_hex("+1"));
+  EXPECT_FALSE(parse_hex(" 1"));
+  EXPECT_FALSE(parse_hex("1 "));
+  EXPECT_FALSE(parse_hex("00000000000000001"));
   EXPECT_EQ("7f1234567000", format_hex(0x7f1234567000ull));
   EXPECT_EQ("0", format_hex(0));
 }
@@ -164,6 +177,11 @@ TEST(RdmaRcWire, Decimal)
   EXPECT_FALSE(parse_decimal("-1"));
   EXPECT_FALSE(parse_decimal("0x10"));
   EXPECT_FALSE(parse_decimal("12 "));
+  EXPECT_FALSE(parse_decimal("+1"));
+  EXPECT_FALSE(parse_decimal(" 1"));
+  EXPECT_FALSE(parse_decimal("ff"));
+  // at most 20 digits
+  EXPECT_FALSE(parse_decimal("000000000000000000001"));
 }
 
 TEST(RdmaRcWire, Target)
@@ -208,6 +226,36 @@ TEST(RdmaRcWire, BuildTargetRoundTrip)
   EXPECT_EQ("versionId=v1", t->query);
 }
 
+TEST(RdmaRcWire, BuildTargetEscapes)
+{
+  // RFC 3986 unreserved characters and '/' stay, every other byte is
+  // escaped in upper case
+  EXPECT_EQ("/b.1/A-z_0.9~/x%2By%3Fz%26%C3%A9",
+            build_target("b.1", "A-z_0.9~/x+y?z&\xc3\xa9"));
+  auto t = parse_target(build_target("b", "\xc3\xa9 +"));
+  ASSERT_TRUE(t);
+  EXPECT_EQ("\xc3\xa9 +", t->key);
+}
+
+TEST(RdmaRcWire, PercentDecode)
+{
+  using testing::Optional;
+  EXPECT_THAT(percent_decode(""), Optional(std::string{}));
+  EXPECT_THAT(percent_decode("abc"), Optional(std::string{"abc"}));
+  EXPECT_THAT(percent_decode("a%2Fb%2fc"), Optional(std::string{"a/b/c"}));
+  EXPECT_THAT(percent_decode("%C3%A9"), Optional(std::string{"\xc3\xa9"}));
+  // '+' is literal, not a space
+  EXPECT_THAT(percent_decode("a+b"), Optional(std::string{"a+b"}));
+  // a malformed escape fails: an RC GET's versionId=%zz is refused,
+  // and does not read the current version
+  EXPECT_FALSE(percent_decode("%zz"));
+  EXPECT_FALSE(percent_decode("v1%2"));
+  EXPECT_FALSE(percent_decode("v1%"));
+  EXPECT_FALSE(percent_decode("%+1"));
+  EXPECT_FALSE(percent_decode("%-1"));
+  EXPECT_FALSE(percent_decode("% 1"));
+}
+
 TEST(RdmaRcWire, ChecksumHeaders)
 {
   // the check values of "123456789", rendered as S3 renders them
@@ -239,6 +287,60 @@ TEST(RdmaRcWire, ChecksumHeaders)
   EXPECT_EQ(R::RDMA_DELIVERY_WANT_CRC64 | R::RDMA_DELIVERY_WANT_CRC32C,
             rgw::rdma::delivery_want_flags({true, true}));
   EXPECT_EQ(0u, rgw::rdma::delivery_want_flags({}));
+}
+
+TEST(RdmaRcWire, ChainedChecksums)
+{
+  // an RC GET or PUT chains the CRCs of the chunks it copies, which are
+  // those of the whole buffer: no pass over the session buffer
+  std::vector<char> buf((1u << 20) + 13);
+  for (size_t i = 0; i < buf.size(); i++) {
+    buf[i] = static_cast<char>(i * 131 + (i >> 9));
+  }
+  const uint64_t crc64 = ceph::crc64nvme(0, buf.data(), buf.size());
+  const uint32_t crc32c = rgw::rdma::crc32c_of(buf.data(), buf.size());
+  for (size_t chunk : {size_t{4097}, size_t{1} << 16, buf.size()}) {
+    SCOPED_TRACE(chunk);
+    chained_crcs c;
+    c.reset({true, true});
+    for (size_t o = 0; o < buf.size(); o += chunk) {
+      c.append(&buf[o], std::min(chunk, buf.size() - o));
+    }
+    EXPECT_THAT(c.result().crc64, testing::Optional(crc64));
+    EXPECT_THAT(c.result().crc32c, testing::Optional(crc32c));
+  }
+}
+
+TEST(RdmaRcWire, ChainedChecksumsWant)
+{
+  const char* check = "123456789";
+  // none until reset() names them: an op that resets the chain before
+  // it parses x-amz-rdma-checksum-algorithm gets no result, and falls
+  // back to a pass over its buffer
+  chained_crcs c;
+  c.append(check, 9);
+  EXPECT_FALSE(c.result().crc64);
+  EXPECT_FALSE(c.result().crc32c);
+  c.reset({});
+  c.append(check, 9);
+  EXPECT_FALSE(c.result().crc64);
+  EXPECT_FALSE(c.result().crc32c);
+
+  // only those asked for
+  c.reset({.crc32c = true});
+  c.append(check, 4);
+  c.append(check + 4, 5);
+  EXPECT_FALSE(c.result().crc64);
+  EXPECT_THAT(c.result().crc32c, testing::Optional(0xe3069283u));
+
+  // reset() starts over, with none before the first append
+  c.reset({.crc64nvme = true});
+  EXPECT_FALSE(c.result().crc64);
+  EXPECT_FALSE(c.result().crc32c);
+  c.append(check, 1);
+  c.append(check + 1, 8);
+  EXPECT_THAT(c.result().crc64, testing::Optional(0xae8b14860a799888ull));
+  EXPECT_FALSE(c.result().crc32c);
 }
 
 TEST(RdmaRcWire, SignedHeaders)
@@ -352,6 +454,23 @@ TEST(RdmaRcWire, LandedRanges)
   EXPECT_EQ(310u, r.prefix());
   EXPECT_EQ(1u, r.count());
   r.add(400, 0);            // empty adds nothing
+  EXPECT_EQ(1u, r.count());
+}
+
+TEST(RdmaRcWire, LandedRangesOverlap)
+{
+  // a staged read after a relayed one places the same bytes again
+  landed_ranges r;
+  r.add(100, 100);          // [100,200)
+  r.add(300, 100);          // [300,400)
+  r.add(150, 200);          // overlaps both: [100,400)
+  EXPECT_EQ(1u, r.count());
+  EXPECT_EQ(0u, r.prefix());
+  r.add(0, 100);            // touches it: [0,400)
+  EXPECT_EQ(400u, r.prefix());
+  r.add(0, 400);
+  r.add(50, 400);           // [0,450)
+  EXPECT_EQ(450u, r.prefix());
   EXPECT_EQ(1u, r.count());
 }
 

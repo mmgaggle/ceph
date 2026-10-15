@@ -263,6 +263,11 @@ class RGWPutObj_ObjStore_S3 : public RGWPutObj_ObjStore {
 private:
   std::map<std::string, std::string> crypt_http_responses;
 
+protected:
+  /// the headers of a successful PUT that describe the stored object:
+  /// its encryption, version, expiration and checksum
+  void dump_stored_headers();
+
 public:
   RGWPutObj_ObjStore_S3() {}
   ~RGWPutObj_ObjStore_S3() override {}

@@ -496,22 +496,26 @@ TEST(RdmaDelivery, FoldCrc64Ranges)
   EXPECT_FALSE(ceph::rdma::fold_crc64_ranges({}).has_value());
 }
 
-// An op's out-of-band result reaches its caller in the form the caller
-// asked for. librados takes the callback form; the split-read completion
-// used to copy the aggregate through the pointer form only, so every
-// shard-direct passthrough read told librados (and RGW) that nothing had
-// been delivered. Both the reply path and the split completion go
-// through rdma_oob_wanted() and deliver_rdma_oob_result(); this pins
-// what those promise, on an Op built the way prepare_read_op() builds it.
-TEST(RdmaDelivery, ResultReachesEitherForm)
+// a result handler that copies the op's result into *got
+static ::ObjectOperation::rdma_oob_handler_t copy_to(
+  ceph::rdma::oob_result_t* got)
+{
+  return [got](const ceph::rdma::oob_result_t& r) { *got = r; };
+}
+
+// An op's out-of-band result reaches the handler its caller registered,
+// once. Both the reply path and the split completion go through
+// rdma_oob_wanted() and deliver_rdma_oob_result(); this pins what those
+// promise, on an Op built the way prepare_read_op() builds it.
+TEST(RdmaDelivery, ResultReachesItsHandler)
 {
   ::ObjectOperation op;
   ceph::buffer::list bl0, bl1, bl2;
   int rv0 = 0, rv1 = 0, rv2 = 0;
 
-  ceph::rdma::oob_result_t by_pointer;
+  ceph::rdma::oob_result_t got0;
   op.read(0, 4096, &bl0, &rv0, nullptr);
-  op.set_rdma_delivery("t0", 0, 0, &by_pointer);
+  op.set_rdma_delivery("t0", 0, 0, copy_to(&got0));
 
   std::optional<ceph::rdma::oob_result_t> by_callback;
   int calls = 0;
@@ -528,12 +532,9 @@ TEST(RdmaDelivery, ResultReachesEitherForm)
   auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
                              std::move(op.ops), 0, (Context*)nullptr,
                              nullptr);
-  o->rdma_delivery.swap(op.rdma_delivery);
-  o->rdma_oob_result.swap(op.rdma_oob_result);
-  o->rdma_oob_handler.swap(op.rdma_oob_handler);
+  Objecter::take_rdma(o, op);
 
   EXPECT_TRUE(Objecter::rdma_oob_wanted(o, 0));
-  // the callback form alone: the case the split completion skipped
   EXPECT_TRUE(Objecter::rdma_oob_wanted(o, 1));
   EXPECT_FALSE(Objecter::rdma_oob_wanted(o, 2));
   EXPECT_FALSE(Objecter::rdma_oob_wanted(o, 7));
@@ -541,7 +542,7 @@ TEST(RdmaDelivery, ResultReachesEitherForm)
   ceph::rdma::oob_result_t r0;
   r0.bytes = 4096;
   Objecter::deliver_rdma_oob_result(o, 0, r0);
-  EXPECT_EQ(4096u, by_pointer.bytes);
+  EXPECT_EQ(4096u, got0.bytes);
 
   ceph::rdma::oob_result_t r1;
   r1.bytes = 4096;
@@ -558,7 +559,7 @@ TEST(RdmaDelivery, ResultReachesEitherForm)
   ASSERT_EQ(2u, by_callback->ranges.size());
   EXPECT_EQ(6144u, by_callback->ranges[1].ofs);
 
-  // the callback is one-shot: a later delivery for the same op (a
+  // the handler is one-shot: a later delivery for the same op (a
   // resend's reply) does not call it again
   Objecter::deliver_rdma_oob_result(o, 1, r1);
   EXPECT_EQ(1, calls);
@@ -567,6 +568,41 @@ TEST(RdmaDelivery, ResultReachesEitherForm)
   // an op with no descriptor and no result asked for is left alone
   Objecter::deliver_rdma_oob_result(o, 2, r1);
 
+  o->put();
+}
+
+// A descriptor may go out without a handler for its result: the op is
+// still delivered out of band, no handler storage is allocated for it,
+// and its result in a reply goes nowhere, while a later op's handler
+// still gets its own.
+TEST(RdmaDelivery, DescriptorWithoutHandlerAsksNoResult)
+{
+  using R = ceph::rdma::oob_result_t;
+  ::ObjectOperation op;
+  ceph::buffer::list bl0, bl1;
+  int rv0 = 0, rv1 = 0;
+  op.read(0, 4096, &bl0, &rv0, nullptr);
+  op.set_rdma_delivery("t0", 0, 0, nullptr);
+  EXPECT_TRUE(op.has_rdma_delivery());
+  EXPECT_FALSE(op.rdma_oob_handler);
+
+  R got;
+  op.read(4096, 4096, &bl1, &rv1, nullptr);
+  op.set_rdma_delivery("t1", 4096, 0, copy_to(&got));
+  auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                             std::move(op.ops), 0, (Context*)nullptr,
+                             nullptr);
+  Objecter::take_rdma(o, op);
+  EXPECT_FALSE(o->rdma_delivery[0].empty());
+  EXPECT_FALSE(Objecter::rdma_oob_wanted(o, 0));
+  EXPECT_TRUE(Objecter::rdma_oob_wanted(o, 1));
+
+  R r0, r1;
+  r0.bytes = 4096;
+  r1.bytes = 2048;
+  Objecter::deliver_rdma_oob_results(o, {r0, r1});
+  EXPECT_EQ(2048u, got.bytes);
+  EXPECT_FALSE(Objecter::rdma_oob_wanted(o, 1));
   o->put();
 }
 
@@ -624,12 +660,16 @@ TEST(RdmaDelivery, ResentResultsAreMarked)
   int rv = 0;
   ceph::rdma::oob_result_t got;
   op.read(0, 4096, &bl, &rv, nullptr);
-  op.set_rdma_delivery("t0", 0, 0, &got);
+  op.set_rdma_delivery("t0", 0, 0, copy_to(&got));
   auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
                              std::move(op.ops), 0, (Context*)nullptr,
                              nullptr);
-  o->rdma_delivery.swap(op.rdma_delivery);
-  o->rdma_oob_result.swap(op.rdma_oob_result);
+  Objecter::take_rdma(o, op);
+  // a handler runs once, for the reply that completes the op: re-arm it
+  // to replay another attempt's reply
+  auto rearm = [&] {
+    (*o->rdma_oob_handler)[0] = copy_to(&got);
+  };
 
   ceph::rdma::oob_result_t declined;
   declined.flags = ceph::rdma::oob_result_t::FLAG_DECLINED;
@@ -637,6 +677,7 @@ TEST(RdmaDelivery, ResentResultsAreMarked)
   Objecter::deliver_rdma_oob_result(o, 0, declined);
   EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_DECLINED, got.flags);
 
+  rearm();
   o->attempts = 2;
   Objecter::deliver_rdma_oob_result(o, 0, declined);
   EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_DECLINED |
@@ -644,6 +685,7 @@ TEST(RdmaDelivery, ResentResultsAreMarked)
 
   // a resend whose earlier attempts were all answered declined or
   // landed went out vouched for, and its result is not resent
+  rearm();
   o->rdma_retry_settled = true;
   Objecter::deliver_rdma_oob_result(o, 0, declined);
   EXPECT_EQ(ceph::rdma::oob_result_t::FLAG_DECLINED, got.flags);
@@ -663,12 +705,17 @@ TEST(RdmaDelivery, WithheldDescriptorsReadDeclined)
   int rv0 = 0, rv1 = 0;
   R got;
   op.read(0, 4096, &bl0, &rv0, nullptr);
-  op.set_rdma_delivery("t0", 0, 0, &got);
+  op.set_rdma_delivery("t0", 0, 0, copy_to(&got));
   op.read(4096, 4096, &bl1, &rv1, nullptr);  // no descriptor
   auto* o = new Objecter::Op(object_t("obj"), object_locator_t(1),
                              std::move(op.ops), 0, (Context*)nullptr,
                              nullptr);
   Objecter::take_rdma(o, op);
+  // a handler runs once, for the reply that completes the op: re-arm it
+  // to replay another attempt's reply
+  auto rearm = [&] {
+    (*o->rdma_oob_handler)[0] = copy_to(&got);
+  };
 
   // attempts as _prepare_osd_op() counts them before stamping
   o->attempts = 1;
@@ -679,6 +726,7 @@ TEST(RdmaDelivery, WithheldDescriptorsReadDeclined)
   EXPECT_EQ(R::FLAG_DECLINED, got.flags);
   EXPECT_EQ(0u, got.bytes);
 
+  rearm();
   o->attempts = 2;
   EXPECT_TRUE(Objecter::stamp_rdma_attempt(o, false).empty());
   Objecter::deliver_rdma_oob_results(o, {});
@@ -694,11 +742,13 @@ TEST(RdmaDelivery, WithheldDescriptorsReadDeclined)
   EXPECT_EQ("t0", d[0].token);
   EXPECT_TRUE(d[0].flags & ceph::rdma::delivery_t::FLAG_PRIOR_SETTLED);
   EXPECT_TRUE(d[1].empty());
+  rearm();
   Objecter::deliver_rdma_oob_results(o, {});
   EXPECT_EQ(0u, got.flags);
 
   // that attempt had no settled reply: a later withheld one is declined
   // for itself, but resent
+  rearm();
   o->attempts = 4;
   EXPECT_TRUE(Objecter::stamp_rdma_attempt(o, false).empty());
   Objecter::deliver_rdma_oob_results(o, {});
@@ -785,18 +835,16 @@ TEST(RdmaDelivery, DupKeepsPerOpVectorsAligned)
   int rv = 0;
   ceph::rdma::oob_result_t got;
   op.read(0, 8192, &bl, &rv, nullptr);
-  op.set_rdma_delivery("t0", 0, 0, &got);
+  op.set_rdma_delivery("t0", 0, 0, copy_to(&got));
   op.dup(sops);
   ASSERT_EQ(2u, op.ops.size());
   EXPECT_EQ(2u, op.rdma_delivery.size());
-  EXPECT_EQ(2u, op.rdma_oob_result.size());
   EXPECT_FALSE(op.has_rdma_delivery());
-  EXPECT_EQ(nullptr, op.rdma_oob_result[0]);
+  EXPECT_FALSE(op.rdma_oob_handler);
 
   op.assert_version(1);
   ASSERT_EQ(3u, op.ops.size());
   EXPECT_EQ(3u, op.rdma_delivery.size());
-  EXPECT_EQ(3u, op.rdma_oob_result.size());
 }
 
 // An attempt is settled - nothing of it can land after its reply - when
@@ -839,6 +887,116 @@ TEST(RdmaDelivery, PriorAttemptsSettled)
   // nothing to deliver: nothing vouched for
   EXPECT_FALSE(prior_attempts_settled({none}));
   EXPECT_FALSE(prior_attempts_settled({}));
+}
+
+// A split read fans each plain READ's descriptor out to its sub-reads,
+// shifted to each one's own extent, and has each sub-read's result left
+// in the split's slot, which SplitOp::complete() folds into the parent's
+// result. SplitOp::create() does this through fan_out_rdma(), on sub-ops
+// built as these are. A result that went nowhere, or into a copy of its
+// slot, would fold as nothing delivered. That create() calls it before
+// the sub-op goes out takes a cluster to show.
+TEST(RdmaDelivery, SplitFansOutDescriptorsAndResults)
+{
+  using R = ceph::rdma::oob_result_t;
+  // the parent: a READ with a descriptor, a READ without one and a
+  // SPARSE_READ with one, the way librados builds them
+  ::ObjectOperation op;
+  ceph::buffer::list bl0, bl1, bl2;
+  int rv0 = 0, rv1 = 0, rv2 = 0;
+  std::map<uint64_t, uint64_t> m2;
+  std::optional<R> got0, got2;
+  op.read(8192, 16384, &bl0, &rv0, nullptr);
+  op.set_rdma_delivery("t0", 1 << 20, ceph::rdma::delivery_t::FLAG_CRC64NVME,
+                       [&](const R& r) { got0 = r; });
+  op.read(24576, 4096, &bl1, &rv1, nullptr);
+  op.sparse_read(28672, 4096, &m2, &bl2, &rv2);
+  op.set_rdma_delivery("t2", 2 << 20, 0, [&](const R& r) { got2 = r; });
+  auto* parent = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                                  std::move(op.ops), 0, (Context*)nullptr,
+                                  nullptr);
+  Objecter::take_rdma(parent, op);
+
+  // a replica sub-read: the second half of op 0, ops 1 and 2 whole, and
+  // the split's own version read
+  ::ObjectOperation rd;
+  ceph::buffer::list sbl0, sbl1, sbl2, vbl;
+  boost::system::error_code ec0, ec1, vec;
+  std::map<uint64_t, uint64_t> sm2;
+  int srv2 = 0;
+  rd.read(16384, 8192, &ec0, &sbl0);
+  rd.read(24576, 4096, &ec1, &sbl1);
+  rd.sparse_read(28672, 4096, &sm2, &sbl2, &srv2);
+  rd.get_internal_versions(&vec, &vbl);
+  auto* sub = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                               std::move(rd.ops), 0, (Context*)nullptr,
+                               nullptr);
+  Objecter::take_rdma(sub, rd);
+  ASSERT_FALSE(sub->has_rdma_delivery());
+
+  // the slots start out empty, whatever they held
+  std::vector<R> results(1);
+  results[0].bytes = 1;
+  Objecter::fan_out_rdma(parent, sub, {0, 1, 2, -1}, results);
+  ASSERT_EQ(4u, results.size());
+  EXPECT_EQ(0u, results[0].bytes);
+  ASSERT_EQ(4u, sub->rdma_delivery.size());
+  EXPECT_EQ("t0", sub->rdma_delivery[0].token);
+  EXPECT_EQ(uint64_t((1 << 20) + 8192), sub->rdma_delivery[0].base_offset);
+  EXPECT_EQ(ceph::rdma::delivery_t::FLAG_CRC64NVME,
+            sub->rdma_delivery[0].flags);
+  // none for an op whose parent has none, a sparse read or the version
+  // read, and none of those asks for a result
+  EXPECT_TRUE(sub->rdma_delivery[1].empty());
+  EXPECT_TRUE(sub->rdma_delivery[2].empty());
+  EXPECT_TRUE(sub->rdma_delivery[3].empty());
+  EXPECT_TRUE(Objecter::rdma_oob_wanted(sub, 0));
+  EXPECT_FALSE(Objecter::rdma_oob_wanted(sub, 1));
+  EXPECT_FALSE(Objecter::rdma_oob_wanted(sub, 2));
+  EXPECT_FALSE(Objecter::rdma_oob_wanted(sub, 3));
+
+  // the sub-read's reply lands in the split's slot, not in the parent's
+  // handler, which waits for the fold
+  R r0;
+  r0.bytes = 8192;
+  r0.crc64 = 0x55;
+  r0.flags = R::FLAG_CRC64NVME | R::FLAG_RANGES;
+  r0.ranges = {{(1 << 20) + 8192, 8192, 0x55}};
+  Objecter::deliver_rdma_oob_results(sub, {r0, R{}, R{}, R{}});
+  EXPECT_EQ(8192u, results[0].bytes);
+  EXPECT_EQ(0x55u, results[0].crc64);
+  EXPECT_EQ(r0.flags, results[0].flags);
+  ASSERT_EQ(1u, results[0].ranges.size());
+  EXPECT_EQ(uint64_t((1 << 20) + 8192), results[0].ranges[0].ofs);
+  EXPECT_EQ(0u, results[1].bytes);
+  EXPECT_FALSE(got0.has_value());
+  EXPECT_FALSE(got2.has_value());
+  EXPECT_TRUE(Objecter::rdma_oob_wanted(parent, 0));
+  EXPECT_TRUE(Objecter::rdma_oob_wanted(parent, 2));
+
+  // an EC-direct sub-read carries the parent's extent: no shift. A resent
+  // sub-read's result is marked in its slot, for the fold to pass on.
+  ::ObjectOperation ec_rd;
+  ec_rd.read(8192, 16384, &ec0, &sbl0);
+  ec_rd.get_internal_versions(&vec, &vbl);
+  auto* ec_sub = new Objecter::Op(object_t("obj"), object_locator_t(1),
+                                  std::move(ec_rd.ops), 0, (Context*)nullptr,
+                                  nullptr);
+  Objecter::take_rdma(ec_sub, ec_rd);
+  std::vector<R> ec_results;
+  Objecter::fan_out_rdma(parent, ec_sub, {0, -1}, ec_results);
+  ASSERT_EQ(2u, ec_results.size());
+  EXPECT_EQ("t0", ec_sub->rdma_delivery[0].token);
+  EXPECT_EQ(uint64_t(1 << 20), ec_sub->rdma_delivery[0].base_offset);
+  ec_sub->attempts = 2;
+  R declined;
+  declined.flags = R::FLAG_DECLINED;
+  Objecter::deliver_rdma_oob_results(ec_sub, {declined});
+  EXPECT_EQ(R::FLAG_DECLINED | R::FLAG_RESENT, ec_results[0].flags);
+
+  ec_sub->put();
+  sub->put();
+  parent->put();
 }
 
 // A split read's result: declined only when every sub-read declined,
@@ -943,7 +1101,6 @@ TEST(RdmaDelivery, CutOffPushFallsBackToHttp)
     o->out_bl.swap(op.out_bl);
     o->out_rval.swap(op.out_rval);
     o->rdma_delivery.swap(op.rdma_delivery);
-    o->rdma_oob_result.swap(op.rdma_oob_result);
     o->rdma_oob_handler.swap(op.rdma_oob_handler);
     o->attempts = attempts;
 

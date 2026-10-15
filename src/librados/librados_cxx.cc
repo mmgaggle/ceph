@@ -36,6 +36,7 @@
 #include "librados/RadosXattrIter.h"
 #include "librados/ListObjectImpl.h"
 #include "librados/librados_util.h"
+#include "librados/rdma_result.h"
 #include "cls/lock/cls_lock_client.h"
 
 #include <string>
@@ -225,21 +226,6 @@ void librados::ObjectReadOperation::sparse_read(uint64_t off, uint64_t len,
 }
 
 namespace {
-/// the wire result, as a librados caller sees it
-void copy_rdma_result(const ceph::rdma::oob_result_t& r,
-		      librados::ObjectOperation::rdma_delivery_result* out)
-{
-  out->bytes = r.bytes;
-  out->crc64 = r.crc64;
-  out->crc32c = r.crc32c;
-  out->flags = r.flags;
-  out->ranges.clear();
-  out->ranges.reserve(r.ranges.size());
-  for (const auto& x : r.ranges) {
-    out->ranges.push_back({x.ofs, x.len, x.crc64, x.crc32c});
-  }
-}
-
 /// the wire request flags for a caller's: only the RDMA_DELIVERY_WANT_*
 /// bits are its to set. The other wire bits belong to the client
 /// library (FLAG_PRIOR_SETTLED vouches for a resend's earlier attempts,

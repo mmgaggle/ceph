@@ -19,9 +19,14 @@
  * pulled in x-amz-rdma-checksum-<algorithm>, all equal to this client's.
  *
  * For tests of the failure paths: OFI_S3_PUT_CRC=<base64> sends that
- * checksum instead of the object's, which the gateway must refuse with
- * 400 and store nothing; OFI_S3_PUT_WINDOW=write registers the window for
- * writes only, so the OSDs' reads fail and the gateway declines.
+ * checksum instead of the object's, with the body too after a decline,
+ * which the gateway must refuse with 400 and store nothing: a HEAD of
+ * the key must answer after the PUT as it did before it, the same
+ * status, ETag and Last-Modified. So the key must be absent or hold
+ * other bytes than <file>; one that holds <file> is a usage error, as
+ * a PUT that stored it again could leave that HEAD unchanged.
+ * OFI_S3_PUT_WINDOW=write registers the window for writes only, so the
+ * OSDs' reads fail and the gateway declines.
  *
  *   ceph_test_rgw_ofi_put <provider> <domain|-> <node|-> <endpoint> \
  *     <bucket> <key> <access> <secret> <file>
@@ -54,6 +59,7 @@ struct http_result {
   std::string rdma_crc32c; // x-amz-rdma-checksum-crc32c
   std::string cksum;       // x-amz-checksum-crc64nvme or -crc32c
   std::string etag;
+  std::string last_modified;
   std::string body;
   std::string error;
 };
@@ -77,6 +83,7 @@ size_t on_header(char* p, size_t size, size_t n, void* arg)
     if (name == "x-amz-checksum-crc64nvme" || name == "x-amz-checksum-crc32c")
       r->cksum = value;
     if (name == "etag") r->etag = value;
+    if (name == "last-modified") r->last_modified = value;
   }
   return size * n;
 }
@@ -107,7 +114,8 @@ std::string arg_or_empty(const char* a)
   return std::strcmp(a, "-") == 0 ? std::string{} : std::string{a};
 }
 
-/// a signed S3 request; body, when given, is sent as the PUT's body
+/// a signed S3 request (PUT, GET or HEAD); body, when given, is sent as
+/// the PUT's body
 http_result request(const std::string& url, const std::string& userpwd,
 		    const char* method, const std::vector<std::string>& headers,
 		    const std::vector<char>* body)
@@ -130,6 +138,8 @@ http_result request(const std::string& url, const std::string& userpwd,
 		     static_cast<curl_off_t>(up.left));
     // no "Expect: 100-continue" for an empty body
     hdrs = curl_slist_append(hdrs, "Expect:");
+  } else if (std::strcmp(method, "HEAD") == 0) {
+    curl_easy_setopt(c, CURLOPT_NOBODY, 1L);
   }
   curl_easy_setopt(c, CURLOPT_HTTPHEADER, hdrs);
   curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, on_header);
@@ -214,11 +224,40 @@ int main(int argc, char** argv)
   const std::string crc = use32c ? crc32c : crc64;
   const char* crc_env = std::getenv("OFI_S3_PUT_CRC");
   const std::string sent_crc = crc_env ? crc_env : crc;
+  const bool wrong_crc = sent_crc != crc;
   std::printf("%s\nwindow %zu bytes, CRC64NVME %s, CRC32C %s, token %s\n",
 	      ep->describe().c_str(), size, crc64.c_str(), crc32c.c_str(),
 	      token.c_str());
 
   const std::string url = endpoint + "/" + bucket + "/" + key;
+  // what the key holds before a PUT that must store nothing
+  http_result before;
+  if (wrong_crc) {
+    before = request(url, userpwd, "HEAD", {}, nullptr);
+    if (!before.error.empty() ||
+	(before.status != 200 && before.status != 404)) {
+      std::printf("FAIL: HEAD before the PUT returned %ld %s\n",
+		  before.status, before.error.c_str());
+      return 1;
+    }
+    // a PUT that stored these bytes again, to a key that holds them,
+    // would keep its ETag, and its Last-Modified within the same second
+    if (before.status == 200) {
+      const http_result held = request(url, userpwd, "GET", {}, nullptr);
+      if (!held.error.empty() || held.status != 200) {
+	std::printf("FAIL: GET before the PUT returned %ld %s\n",
+		    held.status, held.error.c_str());
+	return 1;
+      }
+      if (held.body.size() == size &&
+	  std::memcmp(held.body.data(), data.data(), size) == 0) {
+	std::fprintf(stderr, "%s already holds <file>: a wrong checksum "
+		     "needs a key that is absent or holds other bytes\n",
+		     url.c_str());
+	return 2;
+      }
+    }
+  }
   const auto t0 = std::chrono::steady_clock::now();
   http_result res = request(url, userpwd, "PUT",
 			    {"x-amz-rdma-token: " + token,
@@ -238,21 +277,35 @@ int main(int argc, char** argv)
     return 1;
   }
   if (res.status == 501 && res.reply == "501") {
-    // declined: nothing was stored; send the body, as a client would
+    // declined: nothing was stored; send the body, as a client would,
+    // with the same checksum
     std::printf("declined: %s\n", res.body.c_str());
     pulled = false;
-    res = request(url, userpwd, "PUT", {cksum_hdr + crc},
+    res = request(url, userpwd, "PUT", {cksum_hdr + sent_crc},
 		  &data);
     std::printf("PUT with body: HTTP %ld\n", res.status);
   }
-  if (crc_env && sent_crc != crc) {
+  if (wrong_crc) {
     // the wrong checksum must fail the PUT, and store nothing
-    if (res.status == 400 && res.body.find("BadDigest") != std::string::npos) {
-      std::printf("PASS: a wrong checksum was refused with 400 BadDigest\n");
-      return 0;
+    if (res.status != 400 || res.body.find("BadDigest") == std::string::npos) {
+      std::printf("FAIL: a wrong checksum got HTTP %ld\n", res.status);
+      return 1;
     }
-    std::printf("FAIL: a wrong checksum got HTTP %ld\n", res.status);
-    return 1;
+    const http_result after = request(url, userpwd, "HEAD", {}, nullptr);
+    if (!after.error.empty() || after.status != before.status ||
+	after.etag != before.etag ||
+	after.last_modified != before.last_modified) {
+      std::printf("FAIL: the refused PUT changed the key: HEAD returned %ld, "
+		  "ETag %s, Last-Modified %s before it, and %ld, ETag %s, "
+		  "Last-Modified %s after it %s\n", before.status,
+		  before.etag.c_str(), before.last_modified.c_str(),
+		  after.status, after.etag.c_str(),
+		  after.last_modified.c_str(), after.error.c_str());
+      return 1;
+    }
+    std::printf("PASS: a wrong checksum was refused with 400 BadDigest, and "
+		"the key is unchanged (HEAD %ld)\n", after.status);
+    return 0;
   }
   if (res.status != 200) {
     std::printf("FAIL: PUT returned %ld: %s\n", res.status, res.body.c_str());

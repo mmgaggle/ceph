@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "acconfig.h"
@@ -116,9 +117,9 @@ TEST(RdmaRcWire, SessionId)
 
 TEST(RdmaRcWire, Psn)
 {
-  EXPECT_EQ(1u, *parse_psn("000001"));
-  EXPECT_EQ(0xffffffu, *parse_psn("ffffff"));
-  EXPECT_EQ(0xa1b2cu, *parse_psn("0A1B2C"));
+  EXPECT_THAT(parse_psn("000001"), testing::Optional(1u));
+  EXPECT_THAT(parse_psn("ffffff"), testing::Optional(0xffffffu));
+  EXPECT_THAT(parse_psn("0A1B2C"), testing::Optional(0xa1b2cu));
   EXPECT_FALSE(parse_psn("000000"));   // zero is invalid
   EXPECT_FALSE(parse_psn("1"));        // fixed width
   EXPECT_FALSE(parse_psn("0000001"));
@@ -130,8 +131,8 @@ TEST(RdmaRcWire, Psn)
 
 TEST(RdmaRcWire, Cookie)
 {
-  EXPECT_EQ(0x1a2b3c4du, *parse_cookie("1a2b3c4d"));
-  EXPECT_EQ(0xffffffffu, *parse_cookie("FFFFFFFF"));
+  EXPECT_THAT(parse_cookie("1a2b3c4d"), testing::Optional(0x1a2b3c4du));
+  EXPECT_THAT(parse_cookie("FFFFFFFF"), testing::Optional(0xffffffffu));
   EXPECT_FALSE(parse_cookie("00000000"));
   EXPECT_FALSE(parse_cookie("1a2b3c4"));
   EXPECT_FALSE(parse_cookie("1a2b3c4d5"));
@@ -141,9 +142,10 @@ TEST(RdmaRcWire, Cookie)
 
 TEST(RdmaRcWire, BareHex)
 {
-  EXPECT_EQ(0u, *parse_hex("0"));
-  EXPECT_EQ(0x7f1234567000ull, *parse_hex("7f1234567000"));
-  EXPECT_EQ(UINT64_MAX, *parse_hex("ffffffffffffffff"));
+  EXPECT_THAT(parse_hex("0"), testing::Optional(0u));
+  EXPECT_THAT(parse_hex("7f1234567000"),
+              testing::Optional(0x7f1234567000ull));
+  EXPECT_THAT(parse_hex("ffffffffffffffff"), testing::Optional(UINT64_MAX));
   EXPECT_FALSE(parse_hex(""));
   EXPECT_FALSE(parse_hex("0x10"));
   EXPECT_FALSE(parse_hex("1ffffffffffffffff"));
@@ -153,9 +155,10 @@ TEST(RdmaRcWire, BareHex)
 
 TEST(RdmaRcWire, Decimal)
 {
-  EXPECT_EQ(0u, *parse_decimal("0"));
-  EXPECT_EQ(4096u, *parse_decimal("4096"));
-  EXPECT_EQ(18446744073709551615ull, *parse_decimal("18446744073709551615"));
+  EXPECT_THAT(parse_decimal("0"), testing::Optional(0u));
+  EXPECT_THAT(parse_decimal("4096"), testing::Optional(4096u));
+  EXPECT_THAT(parse_decimal("18446744073709551615"),
+              testing::Optional(18446744073709551615ull));
   EXPECT_FALSE(parse_decimal("18446744073709551616"));
   EXPECT_FALSE(parse_decimal(""));
   EXPECT_FALSE(parse_decimal("-1"));
@@ -347,26 +350,32 @@ TEST(RdmaRcWire, PlanPushesStreaming)
   p.max_write = 250;
   p.tail_hold = 10;
   // below min_push: wait
-  EXPECT_TRUE(plan_pushes(50, 0, 1000, false, p)->empty());
+  EXPECT_THAT(plan_pushes(50, 0, 1000, false, p),
+              testing::Optional(testing::IsEmpty()));
   // enough landed: push it, split at max_write
-  auto w = *plan_pushes(600, 0, 1000, false, p);
-  ASSERT_EQ(3u, w.size());
-  EXPECT_EQ((push_t{0, 250, false}), w[0]);
-  EXPECT_EQ((push_t{250, 250, false}), w[1]);
-  EXPECT_EQ((push_t{500, 100, false}), w[2]);
+  auto w = plan_pushes(600, 0, 1000, false, p);
+  ASSERT_TRUE(w);
+  ASSERT_EQ(3u, w->size());
+  EXPECT_EQ((push_t{0, 250, false}), (*w)[0]);
+  EXPECT_EQ((push_t{250, 250, false}), (*w)[1]);
+  EXPECT_EQ((push_t{500, 100, false}), (*w)[2]);
   // the tail is held back even when everything landed
-  w = *plan_pushes(1000, 600, 1000, false, p);
-  ASSERT_EQ(2u, w.size());
-  EXPECT_EQ((push_t{600, 250, false}), w[0]);
-  EXPECT_EQ((push_t{850, 140, false}), w[1]);
+  w = plan_pushes(1000, 600, 1000, false, p);
+  ASSERT_TRUE(w);
+  ASSERT_EQ(2u, w->size());
+  EXPECT_EQ((push_t{600, 250, false}), (*w)[0]);
+  EXPECT_EQ((push_t{850, 140, false}), (*w)[1]);
   // reaching the tail point pushes even a short run
-  w = *plan_pushes(1000, 950, 1000, false, p);
-  ASSERT_EQ(1u, w.size());
-  EXPECT_EQ((push_t{950, 40, false}), w[0]);
+  w = plan_pushes(1000, 950, 1000, false, p);
+  ASSERT_TRUE(w);
+  ASSERT_EQ(1u, w->size());
+  EXPECT_EQ((push_t{950, 40, false}), (*w)[0]);
   // nothing new
-  EXPECT_TRUE(plan_pushes(1000, 990, 1000, false, p)->empty());
+  EXPECT_THAT(plan_pushes(1000, 990, 1000, false, p),
+              testing::Optional(testing::IsEmpty()));
   // an object smaller than the tail streams nothing
-  EXPECT_TRUE(plan_pushes(8, 0, 8, false, p)->empty());
+  EXPECT_THAT(plan_pushes(8, 0, 8, false, p),
+              testing::Optional(testing::IsEmpty()));
 }
 
 TEST(RdmaRcWire, PlanPushesFinal)

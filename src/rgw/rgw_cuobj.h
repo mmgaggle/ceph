@@ -28,9 +28,13 @@ public:
   ~RGWCuObjServer();
 
   /// arena: the gateway's out-of-band memory, which the server registers
-  /// once and stages each transfer in; it must outlive the server
+  /// once and stages each transfer in; it must outlive the server.
+  /// Called once the frontends dropped privileges, when they take
+  /// requests already
   static int init(CephContext* cct, ceph::oob::Arena* arena);
+  /// once the frontends are joined, so that no request holds the server
   static void shutdown();
+  /// the server once init() has set it up, else null
   static RGWCuObjServer* get_instance();
 
   /// the server is up, and the calling thread has a channel, which this
@@ -77,7 +81,8 @@ private:
   /// DC initiators: one for each frontend thread
   int m_num_dcis = 0;
 
-  static std::unique_ptr<RGWCuObjServer> s_instance;
+  /// set once do_init() succeeded: the frontends take requests already
+  static std::atomic<RGWCuObjServer*> s_instance;
   static thread_local uint16_t tls_channel_id;
   static thread_local bool tls_channel_valid;
   /// the library had no channel left for this thread; reported once

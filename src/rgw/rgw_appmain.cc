@@ -536,17 +536,6 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
     }
   }
 
-#ifdef WITH_CUOBJ
-  if (oob_arena &&
-      ceph::oob::read_transports(dpp->get_cct()).client_cuobj()) {
-    int cuobj_r = RGWCuObjServer::init(dpp->get_cct(), oob_arena.get());
-    if (cuobj_r < 0) {
-      derr << "WARNING: cuObj RDMA server init failed: " << cuobj_r
-           << " (RDMA acceleration disabled)" << dendl;
-    }
-  }
-#endif
-
   // initialize RGWProcessEnv
   env.rest = &rest;
   env.auth_registry = rgw::auth::StrategyRegistry::create(
@@ -617,6 +606,27 @@ int rgw::AppMain::init_frontends2(RGWLib* rgwlib)
 
     fes.push_back(fe);
   }
+
+#ifdef WITH_CUOBJ
+  // after the frontends dropped privileges, as for the RC service below:
+  // the kernel takes an rdma_cm or legacy verbs write() only from a
+  // thread with the credentials that opened the file, which this thread
+  // and the threads the library starts from here share. The frontend
+  // threads started before the drop, which gave each its own, so such a
+  // write() that the library makes on a frontend thread during a
+  // transfer is still refused; not tested (RC posts from a thread of the
+  // opener instead: Device::start_post_proxy). Until the server is up, a
+  // request with a cuObject descriptor moves its data over HTTP, as it
+  // does when the server fails to start
+  if (oob_arena &&
+      ceph::oob::read_transports(dpp->get_cct()).client_cuobj()) {
+    int cuobj_r = RGWCuObjServer::init(dpp->get_cct(), oob_arena.get());
+    if (cuobj_r < 0) {
+      derr << "WARNING: cuObj RDMA server init failed: " << cuobj_r
+           << " (RDMA acceleration disabled)" << dendl;
+    }
+  }
+#endif
 
 #ifdef WITH_RDMA_RC
   // the frontends bound their ports and dropped privileges (--setuser)

@@ -286,10 +286,18 @@ void OSDCuObj::credit_abandoned(uint64_t handle)
   switch (tls_abandoned.credit(handle, &held)) {
   case credit_t::unknown:
     // its plan's buffer went back when the channel was reset, it is
-    // what a failed submission posted, or the library returned a write
-    // that this channel did not post
+    // what a failed submission posted, the library returned a write
+    // that this channel did not post, or it returned one a second time
+    // after the plan that posted it took the first: the running plan,
+    // or a timed-out plan whose last write completed since
     dout(5) << "completion of write " << handle << " that no plan on "
 	    << "this channel waits for" << dendl;
+    break;
+  case credit_t::repeated:
+    // the library returned the write's completion twice: the plan still
+    // waits for the writes that it has not returned yet
+    dout(5) << "completion of write " << handle << " of a timed-out plan, "
+	    << "which completed already" << dendl;
     break;
   case credit_t::counted:
     break;
@@ -602,6 +610,10 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
   size_t next = 0;
   size_t outstanding = 0;
   size_t completed = 0;
+  // whether each write posted, first to first + next - 1, is still
+  // posted: a completion that the library returns twice counts once
+  std::vector<bool> posted;
+  posted.reserve(items.size());
   ssize_t err = 0;
   // set when a submission failed: it may have posted part of its write,
   // which no completion need report and which can go on retrying for
@@ -610,12 +622,19 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
   // the library reset the channel, flushing all that was posted on it
   bool reset = false;
   // a completion counts toward this plan only when it carries the handle
-  // of a write that the plan posted, writes first to first + next - 1:
-  // not the failed submission's, first + next, so that outstanding does
-  // not wrap
+  // of a write that the plan posted and that has not completed yet: not
+  // the failed submission's, first + next, nor one whose completion the
+  // library returned before, so that outstanding does not wrap, and the
+  // plan does not end while a write is still posted
   auto mine = [&](const void* handle) {
-    return outstanding > 0 &&
-      ceph::osd::oob::owns_handle(first, next, handle_value(handle));
+    return ceph::osd::oob::still_posted(first, posted, handle_value(handle));
+  };
+  // count a completion that mine() found this plan waits for
+  auto credit_mine = [&](const void* handle) {
+    posted[handle_value(handle) - first] = false;
+    outstanding--;
+    m_writes_inflight--;
+    completed++;
   };
   // what a plan that stops waiting keeps
   auto held = [&] {
@@ -656,6 +675,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	break;
       }
       next++;
+      posted.push_back(true);
       outstanding++;
       m_writes_inflight++;
     }
@@ -683,7 +703,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	m_writes_inflight -= outstanding;
 	m_buffers_leaked++;
 	m_plans_failed++;
-	tls_abandoned.abandon(first, next, outstanding, held());
+	tls_abandoned.abandon(first, std::move(posted), held());
 	return -ETIMEDOUT;
       }
       continue;
@@ -699,9 +719,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	  credit_abandoned(handle_value(e.async_handle));
 	  continue;
 	}
-	outstanding--;
-	m_writes_inflight--;
-	completed++;
+	credit_mine(e.async_handle);
       }
       derr << "ERROR: poll failed for " << key << ": " << n << dendl;
       err = err ? err : -EIO;
@@ -716,7 +734,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	m_writes_inflight -= outstanding;
 	m_buffers_leaked++;
 	m_plans_failed++;
-	tls_abandoned.abandon(first, next, outstanding, held());
+	tls_abandoned.abandon(first, std::move(posted), held());
 	return err == -EOPNOTSUPP ? -EIO : err;
       }
       // on -EIO the library has reset the QP, flushing the remaining
@@ -739,20 +757,19 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
 	continue;
       }
       if (!mine(events[i].async_handle)) {
-	// not a write this plan posted: what a failed submission posted,
-	// this plan's or an earlier one's, or a write of a timed-out plan,
-	// though none of those is left posted when a plan starts
+	// not a write this plan waits for: what a failed submission posted,
+	// this plan's or an earlier one's, a write of a timed-out plan,
+	// though none of those is left posted when a plan starts, or a
+	// completion that the library returned before
 	dout(5) << "plan " << first << " for " << key << " took the "
 		<< "completion of write "
 		<< handle_value(events[i].async_handle)
-		<< ", which it did not post: wc_status=" << events[i].status
-		<< dendl;
+		<< ", which it does not wait for: wc_status="
+		<< events[i].status << dendl;
 	credit_abandoned(handle_value(events[i].async_handle));
 	continue;
       }
-      outstanding--;
-      m_writes_inflight--;
-      completed++;
+      credit_mine(events[i].async_handle);
       if (events[i].status != 0 /* IBV_WC_SUCCESS */) {
 	derr << "ERROR: RDMA " << what << " completion failed for " << key
 	     << ": wc_status=" << events[i].status << dendl;
@@ -772,7 +789,7 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
       m_writes_inflight -= outstanding;
       m_buffers_leaked++;
       m_plans_failed++;
-      tls_abandoned.abandon(first, next, outstanding, held());
+      tls_abandoned.abandon(first, std::move(posted), held());
       return -ETIMEDOUT;
     }
   }

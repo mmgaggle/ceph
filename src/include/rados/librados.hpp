@@ -395,8 +395,9 @@ inline namespace v14_2_0 {
     static constexpr uint32_t RDMA_DELIVERY_LANDED = 16;
     /// result flag: the operation was sent more than once, and an earlier
     /// attempt may have started a transfer that this result knows nothing
-    /// of, which may land until the pool's lease and drain after it. Not
-    /// set when every earlier attempt was answered with each of its
+    /// of, which may land until the pool's lease and drain after it. A
+    /// late libfabric cut-off adds its tolerance (see set_rdma_delivery()).
+    /// Not set when every earlier attempt was answered with each of its
     /// descriptor-bearing reads declined or landed (a replica that bounced
     /// a balanced read, say).
     static constexpr uint32_t RDMA_DELIVERY_RESENT = 32;
@@ -704,14 +705,20 @@ inline namespace v14_2_0 {
      * RDMA_DELIVERY_DECLINED. result may be NULL.
      * An OSD will not initiate a transfer against the descriptor
      * later than the pool's rdma_delivery_lease after receiving the
-     * op, and every write it started has landed or been cut off by
-     * the pool's rdma_delivery_drain after that. On this path it also
-     * means a caller that abandoned a request may reuse the window
-     * once lease plus drain have elapsed (see
+     * op. Every write it started has landed or been cut off by the
+     * pool's rdma_delivery_drain after that (see
      * IoCtx::pool_rdma_delivery_lease() and
-     * IoCtx::pool_rdma_delivery_drain()), because nothing else will
-     * write it. Passing
-     * RDMA_DELIVERY_WANT_CRC64 in flags asks the OSD to also report
+     * IoCtx::pool_rdma_delivery_drain()). A libfabric cut-off can end
+     * up to the OSDs' osd_oob_cutoff_late_tolerance (1 s by default)
+     * later. A caller abandons a request by cancelling it
+     * (IoCtx::aio_cancel()) or by letting it time out
+     * (rados_osd_op_timeout). Until then the op stays live, and the
+     * Objecter can send an attempt of it long after the caller
+     * submitted it, as when it waits for a map. No attempt goes out
+     * after the op completes. The caller may reuse the window once
+     * the lease, the drain, that tolerance and the transit of an
+     * attempt already sent have passed since the op completed.
+     * Passing RDMA_DELIVERY_WANT_CRC64 in flags asks the OSD to also report
      * the canonical CRC-64/NVME of the delivered bytes; it is valid
      * only when result->flags has RDMA_DELIVERY_CRC64_VALID set (best
      * effort - older OSDs omit it). A caller folding several results
@@ -728,9 +735,13 @@ inline namespace v14_2_0 {
      * delivered must not let anything else write the window until no
      * write of the read can land any more. It need not wait when every
      * descriptor-bearing read it sent reported RDMA_DELIVERY_DECLINED or
-     * RDMA_DELIVERY_LANDED and none reported RDMA_DELIVERY_RESENT;
-     * otherwise, and for a read that got no result at all, it waits the
-     * pool's lease plus drain.
+     * RDMA_DELIVERY_LANDED and none reported RDMA_DELIVERY_RESENT.
+     * Otherwise it waits the pool's lease plus drain after the read
+     * completed. For a resent read it also waits the late tolerance,
+     * because no reply covers the earlier attempt. For a read that got
+     * no reply, because it timed out or was cancelled, it waits as for
+     * an abandoned request: the lease, the drain, the tolerance and the
+     * transit of an attempt already sent, after the read completed.
      */
     void set_rdma_delivery(const std::string& token, uint64_t base_offset,
 			   uint32_t flags, rdma_delivery_result *result);
@@ -1042,9 +1053,13 @@ inline namespace v14_2_0 {
     /**
      * The pool's rdma_delivery_drain in seconds: how long after the
      * delivery lease runs out every out-of-band write an OSD started
-     * for an operation has landed or been cut off. A caller that gave
-     * up on a request may write its window again once lease plus drain
-     * have elapsed since it sent the request.
+     * for an operation has landed or been cut off. A libfabric cut-off
+     * can end up to the OSDs' osd_oob_cutoff_late_tolerance (1 s by
+     * default) later. A caller that gave up on a request, by cancelling
+     * it or letting it time out, may write its window again once the
+     * lease, the drain, that tolerance and the transit of an attempt
+     * already sent have passed since the request completed (see
+     * ObjectReadOperation::set_rdma_delivery()).
      */
     int pool_rdma_delivery_drain(double *seconds);
 

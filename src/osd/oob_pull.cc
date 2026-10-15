@@ -46,7 +46,7 @@ uint64_t total_len(const std::vector<pull_op>& pulls)
 int plan_pulls(CephContext* cct, const std::string& key,
 	       const std::vector<OSDOp>& ops,
 	       const std::vector<ceph::rdma::delivery_t>& deliveries,
-	       uint64_t max_write, const bounds_t& bounds,
+	       uint64_t max_write,
 	       const std::function<OSDOobExecutor*(const std::string&)>& puller_for,
 	       std::vector<pull_op>* pulls)
 {
@@ -82,9 +82,6 @@ int plan_pulls(CephContext* cct, const std::string& key,
       dout(10) << "op " << i << " of " << key << ": no transport pulls "
 	       << "from this token" << dendl;
       return -EOPNOTSUPP;
-    }
-    if (ceph::mono_clock::now() >= bounds.land_by) {
-      return -ETIMEDOUT;
     }
     pull_op p;
     p.idx = i;
@@ -175,7 +172,8 @@ std::optional<kick_target> pull_set::settle(std::vector<pull_result>&& r)
 }
 
 int pull_set::consume(std::vector<OSDOp>& ops,
-		      std::vector<ceph::rdma::oob_result_t>& pulled)
+		      std::vector<ceph::rdma::oob_result_t>& pulled,
+		      uint64_t max_record)
 {
   std::lock_guard l(lock);
   ceph_assert(state == state_t::settled);
@@ -188,6 +186,18 @@ int pull_set::consume(std::vector<OSDOp>& ops,
   for (auto& r : results) {
     ceph_assert(r.idx < ops.size() && r.idx < pulled.size());
     ops[r.idx].indata = std::move(r.payload);
+    // a write returns no data of its own: the record takes its place,
+    // for the PG log to keep. One that does not fit, with RETURNVEC,
+    // would fail the request
+    ceph::buffer::list record;
+    encode_pull_record(r.oob, record);
+    if (record.length() <= max_record) {
+      // the encoding took a whole append buffer, which the PG log entry
+      // and the dups trimmed from it would pin for as long as they last
+      record.rebuild();
+      record.reassign_to_mempool(mempool::mempool_osd_pglog);
+      ops[r.idx].outdata = std::move(record);
+    }
     pulled[r.idx] = std::move(r.oob);
   }
   state = state_t::consumed;
@@ -395,18 +405,21 @@ int pull_payloads(const pull_env& env, OpRequest& op,
     // a pull settles before its request runs on: a run whose pulls are
     // still out waits for them before it gets here
     ceph_assert(set->settled());
-    return set->consume(ops, op.oob_pulled);
+    return set->consume(ops, op.oob_pulled, env.max_reply);
   }
   const std::string& key = m->get_hobj().oid.name;
-  // A pull places nothing in client memory, so the lease that bounds
-  // read delivery does not protect anything here: a pull may start as
-  // long as it can land. The same bound keeps the request from waiting
-  // on a client that gave it up.
-  auto bounds = make_bounds(m->get_recv_stamp(), env.lease, env.drain,
+  // A pull places nothing in client memory, and the client keeps its
+  // window until the reply: the lease that bounds read delivery from
+  // receipt protects nothing here, and a request that waited in the PG
+  // (a laggy or degraded PG, a scrub, an object lock) pulls as one just
+  // received does. The bounds count from now: a pull may start as long
+  // as it can land, by the lease plus the drain, which also bounds how
+  // long an op thread that runs the pulls waits on them.
+  auto bounds = make_bounds(ceph::mono_clock::now(), env.lease, env.drain,
 			    std::nullopt, ceph::signedspan::zero());
   bounds.post_by = bounds.land_by;
   std::vector<pull_op> pulls;
-  if (int r = plan_pulls(cct, key, ops, deliveries, env.max_write, bounds,
+  if (int r = plan_pulls(cct, key, ops, deliveries, env.max_write,
 			 env.puller_for, &pulls);
       r < 0) {
     return r;
@@ -469,7 +482,76 @@ int pull_payloads(const pull_env& env, OpRequest& op,
     return PULLS_PARKED;
   }
   ceph_assert(set->settled());
-  return set->consume(ops, op.oob_pulled);
+  return set->consume(ops, op.oob_pulled, env.max_reply);
+}
+
+void encode_pull_record(const ceph::rdma::oob_result_t& r,
+			ceph::buffer::list& bl)
+{
+  ENCODE_START(1, 1, bl);
+  ceph::encode(r.bytes, bl);
+  ceph::encode(r.flags, bl);
+  ceph::encode(r.crc64, bl);
+  ceph::encode(r.crc32c, bl);
+  ENCODE_FINISH(bl);
+}
+
+bool decode_pull_record(const ceph::buffer::list& bl,
+			const ceph::rdma::delivery_t& d,
+			ceph::rdma::oob_result_t* r)
+{
+  using R = ceph::rdma::oob_result_t;
+  R res;
+  try {
+    auto p = bl.cbegin();
+    DECODE_START(1, p);
+    ceph::decode(res.bytes, p);
+    ceph::decode(res.flags, p);
+    ceph::decode(res.crc64, p);
+    ceph::decode(res.crc32c, p);
+    DECODE_FINISH(p);
+    if (!p.end()) {
+      return false;
+    }
+  } catch (const ceph::buffer::error&) {
+    return false;
+  }
+  // only what pull_job::pull() reports of a payload it pulled
+  constexpr uint32_t pull_flags = R::FLAG_COMBINABLE | R::FLAG_RANGES |
+    R::FLAG_CRC64NVME | R::FLAG_CRC32C;
+  if (res.bytes == 0 || (res.flags & ~pull_flags)) {
+    return false;
+  }
+  if (res.flags & R::FLAG_RANGES) {
+    res.ranges.push_back({d.base_offset, res.bytes, res.crc64, res.crc32c});
+  }
+  *r = std::move(res);
+  return true;
+}
+
+void dup_pull_results(
+  const std::vector<ceph::rdma::delivery_t>& deliveries,
+  const std::vector<pg_log_op_return_item_t>& op_returns, int r,
+  std::vector<ceph::rdma::oob_result_t>& oob)
+{
+  if (op_returns.size() != deliveries.size()) {
+    // none kept (no RETURNVEC), or not for these ops
+    return;
+  }
+  for (size_t i = 0; i < deliveries.size() && i < oob.size(); i++) {
+    const auto& d = deliveries[i];
+    ceph::rdma::oob_result_t res;
+    if (d.empty() || !d.is_pull() ||
+	!decode_pull_record(op_returns[i].bl, d, &res)) {
+      continue;
+    }
+    if (r >= 0) {
+      oob[i] = std::move(res);
+    } else {
+      // the pull read the window, as clear_declined() says of it
+      oob[i].flags &= ~ceph::rdma::oob_result_t::FLAG_DECLINED;
+    }
+  }
 }
 
 } // namespace ceph::osd::oob

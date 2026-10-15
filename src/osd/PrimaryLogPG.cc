@@ -9602,9 +9602,11 @@ std::vector<ceph::osd::oob::read_push> PrimaryLogPG::deliver_oob_prepare(
   // may still initiate a transfer against the descriptor; a client
   // that abandoned the request reasons about window reuse from the
   // same bound, so a late push must degrade to inline rather than
-  // race that reuse
+  // race that reuse. The age is monotonic, as the read lease's check
+  // above is: a step of the wall clock since receipt does not hide it
   const double lease = pool.info.get_rdma_delivery_lease();
-  const double age = ceph_clock_now() - m->get_recv_stamp();
+  const double age = std::chrono::duration<double>(
+    ceph::mono_clock::now() - ctx->op->get_mono_recv_stamp()).count();
   if (age > lease) {
     dout(10) << __func__ << " lease expired (" << age << "s > " << lease
 	     << "s), delivering inline" << dendl;
@@ -9614,10 +9616,11 @@ std::vector<ceph::osd::oob::read_push> PrimaryLogPG::deliver_oob_prepare(
   // every push of the request keeps to the same bounds, fixed here
   // under the PG lock: it starts before the lease runs out, and not
   // past readable_until as it is now, and its writes land, or are cut
-  // off, by receipt plus the lease plus the pool's drain. From here on
-  // no step of the wall clock moves them.
+  // off, by receipt plus the lease plus the pool's drain. No step of
+  // the wall clock moves them.
   const auto bounds = ceph::osd::oob::make_bounds(
-    m->get_recv_stamp(), lease, pool.info.get_rdma_delivery_drain(),
+    ctx->op->get_mono_recv_stamp(), lease,
+    pool.info.get_rdma_delivery_drain(),
     recovery_state.get_readable_until(), osd->get_mnow());
   const bool ec_direct = ctx->op->ec_direct_read();
   std::optional<ceph::osd::oob::ec_direct_geometry> ec;
@@ -9735,6 +9738,7 @@ int PrimaryLogPG::pull_oob_payloads(OpContext *ctx)
       con->get_peer_type()).throttler_bytes;
   };
   env.max_write = cct->_conf->osd_max_write_size << 20;
+  env.max_reply = cct->_conf->osd_max_write_op_reply_len;
   env.lease = pool.info.get_rdma_delivery_lease();
   env.drain = pool.info.get_rdma_delivery_drain();
   env.runs_inline = [osd = osd](const OSDOobExecutor* e) {

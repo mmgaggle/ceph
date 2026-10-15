@@ -40,23 +40,32 @@ ceph::timespan unsigned_span(ceph::signedspan d)
 }
 }
 
+bounds_t make_bounds(ceph::mono_clock::time_point received, double lease,
+		     double drain,
+		     std::optional<ceph::signedspan> readable_until,
+		     ceph::signedspan mnow)
+{
+  bounds_t b;
+  b.land_by = received + ceph::make_timespan(lease + drain);
+  b.post_by = received + ceph::make_timespan(lease);
+  if (readable_until) {
+    // within an interval readable_until only grows, so the PG's lease
+    // as it is now is a safe bound
+    b.post_by = std::min(b.post_by,
+			 ceph::mono_clock::now() + (*readable_until - mnow));
+  }
+  return b;
+}
+
 bounds_t make_bounds(utime_t recv_stamp, double lease, double drain,
 		     std::optional<ceph::signedspan> readable_until,
 		     ceph::signedspan mnow)
 {
-  // the age on the wall clock, as the lease checks take it; from here
-  // on the bounds are monotonic
+  // the age on the wall clock, now; from here on the bounds are
+  // monotonic
   const double age = ceph_clock_now() - recv_stamp;
-  const auto now = ceph::mono_clock::now();
-  bounds_t b;
-  b.land_by = now + ceph::make_timespan(lease + drain - age);
-  b.post_by = now + ceph::make_timespan(lease - age);
-  if (readable_until) {
-    // within an interval readable_until only grows, so the PG's lease
-    // as it is now is a safe bound
-    b.post_by = std::min(b.post_by, now + (*readable_until - mnow));
-  }
-  return b;
+  return make_bounds(ceph::mono_clock::now() - ceph::make_timespan(age),
+		     lease, drain, readable_until, mnow);
 }
 
 std::chrono::milliseconds budget_left(const bounds_t& b)

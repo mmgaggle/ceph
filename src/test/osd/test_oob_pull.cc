@@ -15,7 +15,10 @@
  * charges the throttle no more; the checksums are what the code before
  * the pull set computed; and a reply that fails the request declines
  * only the ops whose pull started nothing, and none while the pulls
- * run.
+ * run. Each op keeps the record of its pull for the PG log, from which
+ * the reply to a resend answered as a dup reports it. The pulls count
+ * their bounds from their plan: a request that waited in the PG pulls
+ * as one just received does.
  *
  * With transfer threads the pulls run there, and the request parks: the
  * set's settle kicks the PG where it waits exactly once, and a set that
@@ -83,6 +86,8 @@ struct fake_puller : OSDOobExecutor {
   std::mutex m;
   std::vector<std::string> calls;  ///< the tokens pulled from, in order
   std::vector<std::thread::id> ran_on;
+  /// the time each pull had left to land, as the job gave it
+  std::vector<std::chrono::milliseconds> budgets;
 
   fake_puller() {
     for (size_t i = 0; i < window.size(); i++) {
@@ -114,6 +119,7 @@ struct fake_puller : OSDOobExecutor {
       std::lock_guard l(m);
       calls.push_back(token);
       ran_on.push_back(std::this_thread::get_id());
+      budgets.push_back(budget);
     }
     EXPECT_EQ("obj", key);
     EXPECT_GT(budget.count(), 0);
@@ -294,6 +300,7 @@ struct OobPull : public ::testing::Test {
     };
     env.client_throttle = [t] { return t; };
     env.max_write = 90 << 20;
+    env.max_reply = 64;
     env.lease = 6;
     env.drain = 4;
     env.target = test_target();
@@ -622,16 +629,33 @@ TEST_F(OobPull, InvalidSecondPullStartsNothing)
       EXPECT_EQ(oob_result_t::FLAG_DECLINED, r.flags);
     }
   }
+}
 
-  // a request whose client gave it up starts nothing either
-  fake_puller e;
-  Throttle t(cct.get(), "osd_client_bytes", 1 << 30, false);
-  auto op = new_op({good, good}, ceph_clock_now() - utime_t(10, 1000));
-  EXPECT_EQ(-ETIMEDOUT, pull_payloads(env(x.get(), &e, &t), *op,
-				      ops_of(op)));
-  EXPECT_TRUE(e.calls.empty());
-  EXPECT_EQ(0, t.get_current());
-  EXPECT_FALSE(op->oob_pull);
+TEST_F(OobPull, WaitedPastTheLeaseStillPulls)
+{
+  // A request that waited in the PG past the pool's lease plus drain
+  // after receipt (a laggy or degraded PG, a scrub, the object's lock)
+  // pulls as one just received does: a pull writes nothing to client
+  // memory, and the client keeps its window until the reply. The
+  // bounds count from the plan, and the pulls have their whole budget
+  for (unsigned threads : {0u, 2u}) {
+    SCOPED_TRACE(threads);
+    auto x = service(threads);
+    fake_puller e;
+    Throttle t(cct.get(), "osd_client_bytes", 1 << 30, false);
+    const op_spec spec = {CEPH_OSD_OP_WRITE, 4096, "ok",
+			  delivery_t::FLAG_PULL | delivery_t::FLAG_CRC64NVME, 0};
+    auto op = new_op({spec, spec}, ceph_clock_now() - utime_t(10, 1000));
+    ASSERT_EQ(0, run_request(env(x.get(), &e, &t), op));
+    EXPECT_EQ(2u, e.calls.size());
+    // lease 6 plus drain 4, less the moments the test took
+    ASSERT_EQ(2u, e.budgets.size());
+    EXPECT_GT(e.budgets[0], 9s);
+    EXPECT_LE(e.budgets[0], 10s);
+    EXPECT_EQ(8192, t.get_current());
+    EXPECT_EQ(e.window.substr(0, 4096), ops_of(op)[0].indata.to_str());
+    EXPECT_EQ(4096u, op->oob_pulled[1].bytes);
+  }
 }
 
 TEST_F(OobPull, NoRoomStartsNothing)
@@ -831,7 +855,7 @@ TEST_F(OobPull, AJobThatNeverRunsStartsNothing)
     std::vector<OSDOp> ops(2);
     std::vector<oob_result_t> pulled(2);
     EXPECT_EQ(r == -ETIMEDOUT ? -ETIMEDOUT : -EOPNOTSUPP,
-	      set->consume(ops, pulled));
+	      set->consume(ops, pulled, 64));
     EXPECT_EQ(0u, ops[1].indata.length());
     std::vector<oob_result_t> oob(2);
     oob[1].flags = oob_result_t::FLAG_DECLINED;
@@ -1008,7 +1032,7 @@ TEST_F(OobPull, KicksOncePerSettledSet)
     EXPECT_FALSE(set.park(t1));
     std::vector<OSDOp> ops(1);
     std::vector<oob_result_t> pulled(1);
-    EXPECT_EQ(0, set.consume(ops, pulled));
+    EXPECT_EQ(0, set.consume(ops, pulled, 64));
     EXPECT_EQ("data", ops[0].indata.to_str());
     EXPECT_TRUE(set.consumed());
   }
@@ -1056,7 +1080,7 @@ TEST_F(OobPull, SettleRacesPark)
       ASSERT_FALSE(k);
       std::vector<OSDOp> ops(1);
       std::vector<oob_result_t> pulled(1);
-      ASSERT_EQ(0, set.consume(ops, pulled));
+      ASSERT_EQ(0, set.consume(ops, pulled, 64));
       consumed++;
     }
   }
@@ -1170,7 +1194,7 @@ TEST_F(OobPull, AbandonedSetStartsNothing)
   EXPECT_EQ(1u, kicks.count());
   std::vector<OSDOp> ops(2);
   std::vector<oob_result_t> pulled(2);
-  EXPECT_EQ(-ESHUTDOWN, op->oob_pull->consume(ops, pulled));
+  EXPECT_EQ(-ESHUTDOWN, op->oob_pull->consume(ops, pulled, 64));
   for (const auto& r : error_results(op)) {
     EXPECT_EQ(oob_result_t::FLAG_DECLINED, r.flags);
   }
@@ -1300,4 +1324,193 @@ TEST_F(OobPull, OnlyPullsOnTransferThreadsAreOut)
   ASSERT_TRUE(kicks.wait_for(1));
   wait_until_idle(*x);
   EXPECT_EQ(0u, out.size());
+}
+
+// The receipt of a request on the monotonic clock is fixed when its
+// OpRequest is built, from the age the wall clock gives it then: no
+// later step of the wall clock moves an age taken from it, as the
+// delivery lease's is
+TEST_F(OobPull, MonoReceiptStamp)
+{
+  auto age = [](const OpRequestRef& op) {
+    return std::chrono::duration<double>(
+      ceph::mono_clock::now() - op->get_mono_recv_stamp()).count();
+  };
+  auto op = new_op({}, ceph_clock_now() - utime_t(3, 0));
+  EXPECT_NEAR(3.0, age(op), 0.1);
+  // a step of the wall clock back by 2 s would read the age as 1 s
+  const auto stamp = op->get_mono_recv_stamp();
+  op->get_nonconst_req()->set_recv_stamp(ceph_clock_now() - utime_t(1, 0));
+  EXPECT_EQ(stamp, op->get_mono_recv_stamp());
+  EXPECT_NEAR(3.0, age(op), 0.1);
+  // never received, or stamped ahead of the clock: received now
+  for (const utime_t recv : {utime_t(), ceph_clock_now() + utime_t(60, 0)}) {
+    EXPECT_NEAR(0.0, age(new_op({}, recv)), 0.1);
+  }
+}
+
+// The record of a pull, which the op keeps in its outdata for the PG
+// log: its byte count, flags and checksums, and a range at the
+// descriptor's offset when the result has one
+TEST_F(OobPull, PullRecord)
+{
+  delivery_t d;
+  d.token = "ok";
+  d.base_offset = 8192;
+  d.flags = delivery_t::FLAG_PULL | delivery_t::FLAG_CRC64NVME |
+    delivery_t::FLAG_CRC32C;
+  oob_result_t r;
+  r.bytes = 5000;
+  r.crc64 = 0x1122334455667788ull;
+  r.crc32c = 0x99aabbcc;
+  r.flags = oob_result_t::FLAG_COMBINABLE | oob_result_t::FLAG_RANGES |
+    oob_result_t::FLAG_CRC64NVME | oob_result_t::FLAG_CRC32C;
+  r.ranges.push_back({8192, 5000, r.crc64, r.crc32c});
+  ceph::buffer::list bl;
+  encode_pull_record(r, bl);
+  // within osd_max_write_op_reply_len, at its default
+  EXPECT_EQ(30u, bl.length());
+  oob_result_t got;
+  ASSERT_TRUE(decode_pull_record(bl, d, &got));
+  expect_same(r, got);
+
+  // no checksum asked for: the byte count, and no range
+  oob_result_t plain;
+  plain.bytes = 100;
+  bl.clear();
+  encode_pull_record(plain, bl);
+  ASSERT_TRUE(decode_pull_record(bl, d, &got));
+  expect_same(plain, got);
+
+  // anything else is no record of a pull
+  auto rejects = [&](const ceph::buffer::list& b) {
+    oob_result_t untouched;
+    untouched.bytes = 7;
+    EXPECT_FALSE(decode_pull_record(b, d, &untouched));
+    EXPECT_EQ(7u, untouched.bytes);
+  };
+  rejects(ceph::buffer::list());
+  ceph::buffer::list cut;
+  cut.substr_of(bl, 0, bl.length() - 1);
+  rejects(cut);
+  ceph::buffer::list longer = bl;
+  longer.append('x');
+  rejects(longer);
+  for (const uint32_t flags : {oob_result_t::FLAG_DECLINED,
+			       oob_result_t::FLAG_LANDED,
+			       oob_result_t::FLAG_RESENT}) {
+    oob_result_t odd = plain;
+    odd.flags = flags;
+    ceph::buffer::list b;
+    encode_pull_record(odd, b);
+    rejects(b);
+  }
+  oob_result_t none;
+  ceph::buffer::list b;
+  encode_pull_record(none, b);
+  rejects(b);
+
+  // the op keeps it only when it fits in osd_max_write_op_reply_len:
+  // one that did not would fail the request
+  auto x = service(0);
+  fake_puller e;
+  Throttle t(cct.get(), "osd_client_bytes", 1 << 20, false);
+  for (const uint64_t max_reply : {64u, 30u, 29u, 0u}) {
+    SCOPED_TRACE(max_reply);
+    auto op = new_op({{CEPH_OSD_OP_WRITE, 4096, "ok",
+		       delivery_t::FLAG_PULL | delivery_t::FLAG_CRC64NVME, 0}});
+    auto env1 = env(x.get(), &e, &t);
+    env1.max_reply = max_reply;
+    ASSERT_EQ(0, pull_payloads(env1, *op, ops_of(op)));
+    EXPECT_EQ(4096u, op->oob_pulled[0].bytes);
+    const auto& kept = ops_of(op)[0].outdata;
+    EXPECT_EQ(max_reply >= 30 ? 30u : 0u, kept.length());
+    if (kept.length() > 0) {
+      // in a buffer of its own length, counted with the PG log, which
+      // keeps it, and the dups trimmed from it, as long as they last
+      ASSERT_EQ(1u, kept.get_num_buffers());
+      EXPECT_EQ(kept.length(), kept.front().raw_length());
+      EXPECT_EQ(mempool::mempool_osd_pglog, kept.front().get_mempool());
+    }
+  }
+}
+
+// A resend of a pulled write that the PG answers as a dup, the write
+// being done, reports what the pulls of the attempt that did it
+// reported, as the PG log kept them with the write (RETURNVEC, which the
+// client library sets on a request that pulls when no other op of it
+// returns anything, MOSDOp::wants_pull_records()), and not declined,
+// with no bytes: the gateway would take that for a failed OSD-direct PUT
+TEST_F(OobPull, DupReportsThePull)
+{
+  auto x = service(0);
+  fake_puller e;
+  Throttle t(cct.get(), "osd_client_bytes", 1 << 20, false);
+  const std::vector<op_spec> specs = {
+    {CEPH_OSD_OP_CREATE, 0, ""},
+    {CEPH_OSD_OP_WRITEFULL, 4096, "ok",
+     delivery_t::FLAG_PULL | delivery_t::FLAG_CRC64NVME, 0},
+    {CEPH_OSD_OP_WRITE, 5000, "ok",
+     delivery_t::FLAG_PULL | delivery_t::FLAG_CRC64NVME |
+     delivery_t::FLAG_CRC32C, 8192},
+    {CEPH_OSD_OP_WRITE, 100, "ok", delivery_t::FLAG_PULL, 20000},
+    {CEPH_OSD_OP_READ, 4096, "ok", 0, 0},
+  };
+  auto first = new_op(specs, ceph_clock_now(), 7);
+  ASSERT_EQ(0, pull_payloads(env(x.get(), &e, &t), *first, ops_of(first)));
+
+  // what the PG log keeps of the write, through its encoding
+  pg_log_entry_t entry;
+  entry.set_op_returns(ops_of(first));
+  {
+    ceph::buffer::list bl;
+    entry.encode_with_checksum(bl);
+    auto p = bl.cbegin();
+    entry = pg_log_entry_t();
+    entry.decode_with_checksum(p);
+  }
+  ASSERT_EQ(specs.size(), entry.op_returns.size());
+  for (size_t i = 0; i < specs.size(); i++) {
+    SCOPED_TRACE(i);
+    // a pulled op's record, and nothing for the others
+    EXPECT_EQ(i >= 1 && i <= 3, entry.op_returns[i].bl.length() > 0);
+  }
+
+  // the resend never ran: OSDService::reply_op_error() declines each of
+  // its descriptors, then takes the records
+  auto resend = new_op(specs, ceph_clock_now(), 7);
+  const auto& deliveries = resend->get_req<MOSDOp>()->get_rdma_deliveries();
+  auto oob = error_results(resend);
+  dup_pull_results(deliveries, entry.op_returns, 0, oob);
+  ASSERT_EQ(specs.size(), oob.size());
+  expect_same(oob_result_t{}, oob[0]);
+  for (size_t i = 1; i <= 3; i++) {
+    SCOPED_TRACE(i);
+    expect_same(first->oob_pulled[i], oob[i]);
+  }
+  // the read's descriptor started nothing
+  EXPECT_EQ(oob_result_t::FLAG_DECLINED, oob[4].flags);
+
+  // the attempt that did it failed after its pulls: as its reply said,
+  // the pulled ops are not declined, and report no bytes
+  oob = error_results(resend);
+  dup_pull_results(deliveries, entry.op_returns, -ENOSPC, oob);
+  for (size_t i = 1; i <= 3; i++) {
+    SCOPED_TRACE(i);
+    expect_same(oob_result_t{}, oob[i]);
+  }
+  EXPECT_EQ(oob_result_t::FLAG_DECLINED, oob[4].flags);
+
+  // no return data kept (an earlier client, without RETURNVEC), or not
+  // for these ops: declined, as before
+  for (const auto& kept : {std::vector<pg_log_op_return_item_t>{},
+			   std::vector<pg_log_op_return_item_t>(2)}) {
+    oob = error_results(resend);
+    dup_pull_results(deliveries, kept, 0, oob);
+    for (size_t i = 1; i < specs.size(); i++) {
+      SCOPED_TRACE(i);
+      EXPECT_EQ(oob_result_t::FLAG_DECLINED, oob[i].flags);
+      EXPECT_EQ(0u, oob[i].bytes);
+    }
+  }
 }

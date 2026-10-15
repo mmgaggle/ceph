@@ -220,6 +220,23 @@ TEST(OobXfer, Bounds)
   EXPECT_NEAR(3.0, std::chrono::duration<double>(b.land_by - now).count(),
 	      0.1);
 
+  // received on the monotonic clock (OpRequest::get_mono_recv_stamp()):
+  // the bounds are the receipt's, exactly, whatever the wall clock reads
+  const auto received = mono_clock::now() - 1s;
+  b = make_bounds(received, 6, 4, std::nullopt, ceph::signedspan(mnow));
+  EXPECT_EQ(received + 6s, b.post_by);
+  EXPECT_EQ(received + 10s, b.land_by);
+  b = make_bounds(received, 6, 4, ceph::signedspan(mnow + 2s),
+		  ceph::signedspan(mnow));
+  now = mono_clock::now();
+  EXPECT_NEAR(2.0, std::chrono::duration<double>(b.post_by - now).count(),
+	      0.1);
+  EXPECT_EQ(received + 10s, b.land_by);
+  // and a pulled write's, from when it plans its pulls
+  const auto planned = mono_clock::now();
+  b = make_bounds(planned, 6, 4, std::nullopt, ceph::signedspan(mnow));
+  EXPECT_EQ(planned + 10s, b.land_by);
+
   bounds_t left{mono_clock::now(), mono_clock::now() + 1500ms};
   EXPECT_LE(budget_left(left), 1500ms);
   EXPECT_GT(budget_left(left), 1400ms);

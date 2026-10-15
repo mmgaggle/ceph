@@ -141,12 +141,15 @@ public:
   /**
    * Under the PG lock, once settled; all or nothing. When every pull
    * completed, move each payload into its op's indata and its result
-   * into pulled, which is aligned with ops, and return 0. Else return
-   * the errno of the first pull that failed, and leave ops and pulled
-   * as they are.
+   * into pulled, which is aligned with ops, put the record of the
+   * result in the op's outdata when it takes no more than max_record
+   * bytes (encode_pull_record()), and return 0. Else return the errno
+   * of the first pull that failed, and leave ops and pulled as they
+   * are.
    */
   int consume(std::vector<OSDOp>& ops,
-	      std::vector<ceph::rdma::oob_result_t>& pulled);
+	      std::vector<ceph::rdma::oob_result_t>& pulled,
+	      uint64_t max_record);
 
 private:
   enum class state_t {
@@ -208,11 +211,12 @@ private:
  */
 class pull_job final : public xfer_job {
 public:
-  /// pulls: the request's, in op order; bounds: its post_by is its
-  /// land_by, since a pull may start as long as it can land; here: run
-  /// on the thread that submits it (see inline_only()); kick: what the
-  /// settle does with where the request waits, if it does; out: where
-  /// set was added for reqid, which the settle removes it from, or null
+  /// pulls: the request's, in op order; bounds: from when they were
+  /// planned, and its post_by is its land_by, since a pull may start as
+  /// long as it can land; here: run on the thread that submits it (see
+  /// inline_only()); kick: what the settle does with where the request
+  /// waits, if it does; out: where set was added for reqid, which the
+  /// settle removes it from, or null
   pull_job(CephContext* cct, std::shared_ptr<pull_set> set, std::string key,
 	   std::vector<pull_op> pulls, bounds_t bounds, bool here,
 	   kick_fn kick = nullptr, pulls_out* out = nullptr,
@@ -264,7 +268,11 @@ struct pull_env {
   std::function<Throttle*()> client_throttle;
   /// osd_max_write_size, in bytes: no one payload may exceed it
   uint64_t max_write = 0;
-  /// the pool's delivery lease and drain
+  /// osd_max_write_op_reply_len: the most an op's outdata may hold, as
+  /// the record of its pull does when it fits (pull_set::consume())
+  uint64_t max_reply = 0;
+  /// the pool's delivery lease and drain, which bound the pulls from
+  /// the moment they are planned
   double lease = 0;
   double drain = 0;
   /// true when an executor's transfers stay on the thread that submits
@@ -306,5 +314,39 @@ inline constexpr int PULLS_PARKED = 1;
  */
 int pull_payloads(const pull_env& env, OpRequest& op,
 		  std::vector<OSDOp>& ops);
+
+/**
+ * The record of what the pull of a write reported (pull_result::oob),
+ * which the op keeps in its outdata once it took its payload. The
+ * client library asks for the return data of a request that pulls
+ * (CEPH_OSD_FLAG_RETURNVEC) when no other op of it returns any
+ * (MOSDOp::wants_pull_records()), and the PG log keeps it with the
+ * request's entry (pg_log_op_return_item_t): the reply to a resend that
+ * the PG answers as a dup then reports the pull of the attempt that did
+ * the write (dup_pull_results()), not a declined one. Its byte count,
+ * flags and checksums; a range, when the result has one, is the whole
+ * payload, at the base_offset of the descriptor, which a resend carries
+ * unchanged.
+ */
+void encode_pull_record(const ceph::rdma::oob_result_t& r,
+			ceph::buffer::list& bl);
+/// the result encode_pull_record() kept in bl, for the op whose
+/// descriptor is d; false when bl holds no such record
+bool decode_pull_record(const ceph::buffer::list& bl,
+			const ceph::rdma::delivery_t& d,
+			ceph::rdma::oob_result_t* r);
+
+/**
+ * The results of the pulled writes of a request that the PG answers as
+ * a dup (OSDService::reply_op_error()), from the op returns the PG log
+ * kept for the attempt that did it, and r, its result: as the reply to
+ * that attempt said, an op whose pull completed reports that pull when
+ * the request succeeded, and is not declined when it failed. oob is
+ * aligned with deliveries; an op without a record stays as it is.
+ */
+void dup_pull_results(
+  const std::vector<ceph::rdma::delivery_t>& deliveries,
+  const std::vector<pg_log_op_return_item_t>& op_returns, int r,
+  std::vector<ceph::rdma::oob_result_t>& oob);
 
 } // namespace ceph::osd::oob

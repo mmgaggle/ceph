@@ -43,14 +43,23 @@ struct bounds_t {
 };
 
 /**
- * The bounds of a transfer of a request received at recv_stamp, under
+ * The bounds of a transfer of a request received at received, under
  * the PG lock: post_by is receipt plus the pool's delivery lease, and
  * not past the PG's readable_until when given (a read push); land_by
- * is receipt plus the lease plus the drain. The request's age is taken
- * on the wall clock, as the lease checks always took it; readable_until
- * and mnow are OSDService::get_mnow() spans. A pulled write may start
- * as long as it can land: its caller sets post_by to land_by.
+ * is receipt plus the lease plus the drain. received is on the
+ * monotonic clock (OpRequest::get_mono_recv_stamp()), so that no step
+ * of the wall clock since receipt moves them; readable_until and mnow
+ * are OSDService::get_mnow() spans. A pulled write counts from when it
+ * plans its pulls, and may start as long as it can land: its caller
+ * passes that time, and sets post_by to land_by.
  */
+bounds_t make_bounds(ceph::mono_clock::time_point received, double lease,
+		     double drain,
+		     std::optional<ceph::signedspan> readable_until,
+		     ceph::signedspan mnow);
+/// as above, for a request received at recv_stamp on the wall clock:
+/// its age is taken now, so a step of the clock since receipt moves the
+/// bounds by as much
 bounds_t make_bounds(utime_t recv_stamp, double lease, double drain,
 		     std::optional<ceph::signedspan> readable_until,
 		     ceph::signedspan mnow);

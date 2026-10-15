@@ -174,25 +174,6 @@ int Device::open(CephContext* cct, const DeviceConfig& cfg)
       ibv_free_device_list(list);
       return -ENODEV;
     }
-  } else if (!cfg.gid_hint.empty()) {
-    // the first device whose selected GID renders with the hint prefix
-    for (int i = 0; i < num && !dev; i++) {
-      ibv_context* c = ibv_open_device(list[i]);
-      if (!c) continue;
-      ibv_gid g = {};
-      const int idx = cfg.gid_index >= 0 ? cfg.gid_index : 0;
-      if (ibv_query_gid(c, cfg.port, idx, &g) == 0 &&
-          gid_to_string(g).rfind(cfg.gid_hint, 0) == 0) {
-        dev = list[i];
-      }
-      ibv_close_device(c);
-    }
-    if (!dev) {
-      lderr(cct) << "rgw_rdma_rc: no verbs device with a GID starting "
-                 << cfg.gid_hint << dendl;
-      ibv_free_device_list(list);
-      return -ENODEV;
-    }
   } else {
     dev = list[0];
   }

@@ -46,7 +46,6 @@ namespace rgw::rdma::rc {
 
 struct DeviceConfig {
   std::string device_name;  ///< verbs device, e.g. mlx5_0; empty = first
-  std::string gid_hint;     ///< dotted GID prefix selecting the device
   uint8_t port = 1;
   int gid_index = -1;       ///< -1 = pick a RoCEv2 (or the port) GID
   uint64_t client_mtu = 0;  ///< bytes, see path_mtu_of(); 0 = the port's
@@ -193,7 +192,6 @@ class Connection {
   int rearm(CephContext* cct, Device& dev);
 
   uint32_t qpn() const { return qp ? qp->qp_num : 0; }
-  bool created() const { return qp != nullptr; }
 
   /// RDMA write [ptr, ptr+len) of mr into the peer's (remote_addr,
   /// rkey); with_imm attaches the immediate (network byte order is

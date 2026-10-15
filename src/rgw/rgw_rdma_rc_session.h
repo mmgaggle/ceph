@@ -17,9 +17,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -38,7 +40,7 @@ namespace rgw::rdma::dc { class Target; }
  * hipobj-rc-v2 session service.
  *
  * A session is one transfer: created by PREPARE, driven by READY,
- * destroyed by the FINAL reply, CANCEL, or the expiry reaper. Each
+ * ended by the FINAL reply, CANCEL, or the expiry reaper. Each
  * session owns an RC Connection and one buffer of the arena, registered
  * for that session alone. For a GET the buffer is where the object
  * lands (pushed by the OSDs straight into it when the gateway's DC
@@ -47,8 +49,10 @@ namespace rgw::rdma::dc { class Target; }
  * the client writes into.
  *
  * The REST handlers call in on radosgw request threads; the reaper
- * runs on its own thread. The service mutex covers the session table
- * and state changes; the data phase runs outside it with an io
+ * runs on its own thread, and tears down the queue pair and the buffer
+ * of every session that ended, so that the request that ended a
+ * session does not wait for that. The service mutex covers the session
+ * table and state changes; the data phase runs outside it with an io
  * reference pinning the session.
  */
 namespace rgw::rdma::rc {
@@ -83,8 +87,6 @@ enum class Op : uint8_t { GET = 0, PUT = 1 };
 enum class State : uint8_t {
   PREPARED,      ///< waiting for READY
   TRANSFERRING,  ///< a READY handler owns the data phase
-  COMPLETING,    ///< transfer done, FINAL being sent
-  REAPING,       ///< marked for teardown
 };
 
 /// what a READY data phase ended with
@@ -111,7 +113,6 @@ struct Session {
   uint32_t server_psn = 0;
 
   PeerEndpoint peer;           ///< gid/lid from PREPARE, qpn/psn at READY
-  bool peer_known = false;     ///< false for the all-zero loopback token
   uint64_t client_mr_addr = 0; ///< client window for a GET push
   uint32_t client_mr_rkey = 0;
 
@@ -119,15 +120,15 @@ struct Session {
   std::unique_ptr<Buffer> buf;
 
   State state = State::PREPARED;
-  clock::time_point created = clock::now();
   clock::time_point deadline;  ///< PREPARE or exec deadline by state
   int io_refs = 0;             ///< handlers pinning the session
   bool reap_pending = false;
   Outcome last_outcome = Outcome::OK;
-  uint64_t bytes = 0;          ///< transferred, for the terminal log
   /// how long an OSD write of the data phase may still land in buf, as
-  /// finish() was told; the reap releases the buffer with it
+  /// finish() was told; the teardown releases the buffer with it
   std::chrono::milliseconds quarantine{};
+  /// its place in the order sessions ended in, once it left the table
+  uint64_t ended_seq = 0;
 };
 
 /// service-level errors; the REST layer maps them to HTTP statuses
@@ -227,6 +228,31 @@ class Limits {
   std::map<std::string, uint32_t> per_user;
 };
 
+/// the order sessions end in, and which of their teardowns run outside
+/// the service lock, by the reaper or by a PREPARE short of a buffer. A
+/// PREPARE waits only for the sessions that ended before it found the
+/// arena full, not for those that end meanwhile: under a steady stream
+/// of transfers, those never run out. Takes no lock; the service calls
+/// in under its own
+class Teardowns {
+ public:
+  /// a session ended; its place in the order
+  uint64_t ended() { return ++last_ended; }
+  /// the place of the last session that ended
+  uint64_t last() const { return last_ended; }
+  /// the teardown of the session that ended at seq begins, or is done
+  void begin(uint64_t seq) { running.insert(seq); }
+  void end(uint64_t seq) { running.erase(seq); }
+  /// whether the teardown of a session that ended by seq still runs
+  bool running_upto(uint64_t seq) const {
+    return !running.empty() && *running.begin() <= seq;
+  }
+
+ private:
+  uint64_t last_ended = 0;
+  std::set<uint64_t> running;
+};
+
 class Service {
  public:
   /// arena: the gateway's out-of-band memory, which the session buffers
@@ -243,9 +269,7 @@ class Service {
   /// true when the gateway exposes its windows to the OSDs, over a DC
   /// target or libfabric
   bool osd_direct() const;
-  size_t buffer_size() const { return buf_size; }
   uint32_t queue_depth() const { return send_depth; }
-  std::chrono::milliseconds exec_timeout() const { return t_exec; }
 
   /// routing lookup before authentication: the target and op of a
   /// session, without the owner check (READY re-checks it)
@@ -253,18 +277,15 @@ class Service {
 
   Error prepare(const PrepareRequest& req, PrepareReply& reply);
 
-  /// look a session up for re-authorization before READY claims it
-  Error info(const std::string& id, const std::string& principal,
-             SessionInfo& out);
-
   /// claim the transfer: PREPARED -> TRANSFERRING, pair the queue pair
   /// against the client, and (PUT) arm the receive. On success *out is
   /// pinned until finish() and may be used from the calling thread.
   Error claim(const ReadyRequest& req, Session** out);
 
-  /// end the data phase. OK moves to COMPLETING and tears the session
-  /// down once the handler is done with it; BUSY re-arms the queue pair
-  /// and returns to PREPARED for another READY; anything else reaps.
+  /// end the data phase. BUSY re-arms the queue pair and returns to
+  /// PREPARED for another READY; OK and anything else end the session,
+  /// and s must not be used after. A session that ends with writes still
+  /// in its send queue loses its queue pair before this returns.
   /// quarantine keeps the buffer out of the arena for that long after
   /// teardown (a relay that may still have OSD writes in flight), and
   /// the libfabric key quarantine at least when it had a libfabric
@@ -275,9 +296,6 @@ class Service {
               std::chrono::milliseconds quarantine = {});
 
   Error cancel(const std::string& id, const std::string& principal);
-
-  /// mark every session for teardown (shutdown)
-  void cancel_all();
 
  private:
   Service() = default;
@@ -292,6 +310,12 @@ class Service {
   /// exposed to the OSDs. Null when the arena has no room. Takes no lock
   /// of the service.
   std::unique_ptr<Buffer> make_buffer(Op op, size_t size);
+  /// make_buffer() again for a PREPARE that found the arena full, as the
+  /// sessions that ended until then give their buffers back: those still
+  /// queued are torn down here, one at a time until the buffer fits, and
+  /// those torn down elsewhere waited for. Null when it still does not
+  /// fit. Takes the lock
+  std::unique_ptr<Buffer> make_buffer_from_ended(Op op, size_t size);
   /// close what exposes the buffer of a session whose queue pair is gone,
   /// and give it back to the arena; or, when an OSD write may still land
   /// in it, return it to be held until its held_until. Takes no lock of
@@ -307,8 +331,18 @@ class Service {
 #endif
   std::string new_session_id();
 
-  /// tear down and erase; caller holds the lock
-  void reap_locked(std::unique_lock<std::mutex>& lock, const std::string& id);
+  /// erase and hand to the reaper; caller holds the lock
+  void reap_locked(const std::string& id);
+  /// tear down the sessions that ended until now, one at a time outside
+  /// the lock; caller holds it
+  void tear_down_ended(std::unique_lock<std::mutex>& lock);
+  /// tear down the session that ended first, outside the lock; caller
+  /// holds it, and ended is not empty
+  void tear_down_one(std::unique_lock<std::mutex>& lock);
+  /// destroy the queue pair of a session that ended, then release its
+  /// buffer; a buffer to hold, as release_buffer() gives. Takes no lock
+  /// of the service.
+  std::unique_ptr<Buffer> tear_down(Session& s);
   void reaper_loop();
 
   CephContext* cct = nullptr;
@@ -332,6 +366,15 @@ class Service {
 
   mutable std::mutex mtx;
   std::map<std::string, std::unique_ptr<Session>> sessions;
+  /// sessions out of the table whose queue pair and buffer are still to
+  /// be torn down: destroying a queue pair takes the device a while, so
+  /// the reaper does it rather than the request that ended the session.
+  /// They no longer count against the limits; their buffers, which stay
+  /// out of the arena until then, bound them
+  std::deque<std::unique_ptr<Session>> ended;
+  Teardowns teardowns;
+  /// a teardown is done
+  std::condition_variable teardown_cv;
   Limits limits;
   /// buffers of ended sessions that an OSD write may still land in; the
   /// reaper gives each back to the arena once its held_until passes

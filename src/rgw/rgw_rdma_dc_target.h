@@ -46,9 +46,6 @@ class Target {
   int open(CephContext* cct, rc::Device& dev, uint64_t dc_key);
   void close();
 
-  bool is_open() const { return dct != nullptr; }
-  uint32_t dctn() const { return dct_num; }
-
   /// the cuObject descriptor for a registered window, in the form the
   /// OSDs' cuObject server library parses:
   /// "raddr:rsize:rkey:lid:dctn:has_gid:gid" (lowercase hex)

@@ -172,6 +172,7 @@ thread that has a cuObject channel.
 * Objects that the placement compresses or that the gateway encrypts,
   torrents, and PUTs that a Lua data filter reads.
 * PUTs with a client checksum other than ``CRC64NVME`` or ``CRC32C``.
+* PUTs on a gateway with a nonzero ``rados_osd_op_timeout``.
 * PUTs behind the ``d4n`` SAL filter, which must see the bytes to cache
   them, and PUTs to a store other than RADOS. Other filters, such as
   ``rgw_filter`` ``base``, pass the pulled write on.
@@ -214,6 +215,10 @@ the bytes back when it completes. The pulled and inline bytes of one
 request together must not exceed ``osd_max_write_size``. The OSD fails
 a larger request with ``EMSGSIZE`` before it pulls anything.
 
+The OSD's op scheduler, such as mClock, also charges a request for its
+pulled payloads, as it does for inline data. The OSD reads their lengths
+when the request arrives, before it queues the request.
+
 In the client, the RADOS client counts a pulled write's length against
 ``objecter_inflight_op_bytes``, as it counts the data of an inline
 write.
@@ -229,16 +234,43 @@ declined only when nothing of that op's pull reached the transport. The
 reply leaves the result flags of an op at 0 when its pull started. That
 holds whether the write fails in its pull or after it.
 
+The OSD can answer a resent pulled write as a duplicate, when an
+earlier attempt already did the write. The reply then reports what the
+earlier attempt pulled: the byte count and the checksums. For this, the
+OSD keeps a 30-byte record of each pull as the return data of its op.
+The PG log keeps that record with the write.
+
+The RADOS client asks for return data with ``CEPH_OSD_FLAG_RETURNVEC``.
+It sets that flag on a request that pulls only when its other ops
+return no data, as the gateway's stripe writes do. A request with a
+``CALL`` or a read, for example, does not get the flag. The record must
+also fit in ``osd_max_write_op_reply_len``, 64 bytes by default.
+Without a record, the reply to a duplicate marks the descriptor
+declined, with no bytes, and the gateway declines the PUT.
+
 The window must stay registered and unchanged until the reply arrives.
 A token for a readable window lets any holder read that memory. When
 the PUT is complete, re-key the window.
 
+An OSD counts the lease and the drain of a pull from when it plans the
+pull, not from when the write arrived. So a stripe write that waited
+long in its placement group still pulls when it runs. A laggy or
+degraded PG, a scrub or the object's lock can cause such a wait. The
+gateway answers a PUT only after every stripe write completes, so the
+client keeps its window until then. A librados caller that gives up a
+pulled write before its reply must close or re-key the window before it
+reuses the memory.
+
+A gateway with a nonzero ``rados_osd_op_timeout`` declines OSD-direct
+PUTs with ``501``. A stripe write could time out while it waits, and the
+client could then reuse its window before the waiting write pulls it.
+
 An OSD can still read the window after the reply, when the RADOS client
 resent a stripe write to another OSD. The pull of the earlier attempt
-runs until it ends: at most the pool's lease plus drain after that
-attempt reached its OSD. That OSD writes nothing from what it reads. A
-re-key before then only makes that read fail. See `Pulled writes on
-transfer threads`_.
+runs until it ends: at most the pool's lease plus drain after that OSD
+planned it. That OSD writes nothing from what it reads. A re-key before
+then only makes that read fail. See `Pulled writes on transfer
+threads`_.
 
 Transports
 ----------
@@ -475,7 +507,8 @@ OSDs and the gateways an unlimited one. On a host, set
 ``--ulimit memlock=-1:-1`` to the container arguments (see `Deploying
 with cephadm`_). For a vstart cluster, run ``ulimit -l unlimited``.
 ``CAP_IPC_LOCK`` does not help, because a daemon that switches to the
-``ceph`` user (``--setuser ceph``) keeps no effective capability.
+``ceph`` user (``--setuser ceph``) does not keep it in its effective
+set.
 
 Each OSD registers an arena of its own, so a host locks ``oob_memory``
 once for each OSD that it runs. On a host with many OSDs, set a smaller
@@ -524,9 +557,34 @@ cephadm splits a plain string at its spaces, so ``--ulimit
 memlock=-1:-1`` becomes two arguments. Give an environment variable,
 such as ``FI_UNIVERSE_SIZE`` for soft-RoCE, as an ``-e`` argument.
 
-cephadm runs each daemon with ``--setuser ceph``. So UET does not work
-under cephadm yet (see `UET`_), and the gateway's cuObject server has
-the limit that `Limitations`_ describes.
+cephadm runs each daemon with ``--setuser ceph``. The gateway's
+cuObject server then has the limit that `Limitations`_ describes.
+
+UET works under cephadm when an OSD gets its ``uet`` transport before it
+switches users (see `UET`_). Give ``oob_cluster_transport`` or
+``oob_client_transports`` as an entrypoint argument in the OSD's service
+specification. See :ref:`cephadm-extra-entrypoint-args`. For example:
+
+.. code-block:: yaml
+
+   service_type: osd
+   service_id: uet
+   # placement and data_devices as usual
+   extra_entrypoint_args:
+     - "--oob_cluster_transport=uet"
+
+An option on the command line overrides the configuration that the
+monitors store, as ``ceph.conf`` does. So
+``ceph config set osd oob_cluster_transport ...`` has no effect on
+these OSDs. To change the transport, change the service specification
+and redeploy the OSDs.
+
+The OSD's privileged container holds ``CAP_NET_RAW``. A gateway with
+``uet`` relay windows needs ``--cap-add=NET_RAW`` in its
+``extra_container_args``, because podman's default capabilities do not
+include it. Each daemon also needs the provider's wrapper in its
+container. Mount the wrapper's directory with ``-v``, and point
+``FI_PROVIDER_PATH`` at it with ``-e``.
 
 How a read reaches client memory
 ================================
@@ -713,13 +771,13 @@ the data and the version from before the write.
 A push or a pull waits in a queue until a transfer thread is free. A
 queued push starts nothing once the pool's lease ends, or once the PG
 read lease that the OSD read at handoff ends. A queued pull starts
-nothing once the pool's lease plus drain ends.
-``osd_oob_transfer_queue_max`` and ``osd_oob_transfer_queue_bytes`` cap
-the transfers that wait for or run on the transfer threads, and the OSD
-refuses a transfer over either cap. In each case, the OSD delivers the
-read of a push inline and marks it declined. A pull fails its write
-with ``ETIMEDOUT`` when it waited too long, and with ``EOPNOTSUPP``
-when the OSD refused it.
+nothing once the pool's lease plus drain has passed since the op thread
+planned it. ``osd_oob_transfer_queue_max`` and
+``osd_oob_transfer_queue_bytes`` cap the transfers that wait for or run
+on the transfer threads, and the OSD refuses a transfer over either cap.
+In each case, the OSD delivers the read of a push inline and marks it
+declined. A pull fails its write with ``ETIMEDOUT`` when it waited too
+long, and with ``EOPNOTSUPP`` when the OSD refused it.
 
 When ``osd_fast_shutdown`` is off, a stopping OSD refuses each new push
 or pull for its transfer threads. Once its op threads stop, it sheds the
@@ -771,7 +829,7 @@ an object listing, pass a hold.
 Nothing answers the write while its pulls run, not even with an error.
 A client that is blocklisted meanwhile gets ``EBLOCKLISTED`` only after
 the pulls end. The pulls end by the pool's lease plus drain after the
-OSD received the write. Unlike a read, a waiting write keeps its unit of
+op thread planned them. Unlike a read, a waiting write keeps its unit of
 ``osd_client_message_cap`` and its reservation in the client message
 throttle until it completes.
 
@@ -898,12 +956,15 @@ use again:
   attempt of it settled, so that none of them can still write the
   window. See `Retries`_.
 * Two pool options bound every transfer, and the OSD enforces both.
-  An OSD takes on a transfer only within ``rdma_delivery_lease`` of
-  receiving the operation. Every write of it lands, or is cut off,
-  within ``rdma_delivery_drain`` after the lease, also a write that the
-  executor posts after the lease, as when it waited for a new peer.
-  This covers an OSD that disappears during the request, and an
-  operation that the gateway's RADOS client sent again.
+  An OSD takes on a push, a transfer that writes into a window, only
+  within ``rdma_delivery_lease`` of receiving the operation. Every
+  write of it lands, or is cut off, within ``rdma_delivery_drain`` after
+  the lease, also a write that the executor posts after the lease, as
+  when it waited for a new peer. This covers an OSD that disappears
+  during the request, and an operation that the gateway's RADOS client
+  sent again. A pull counts the lease and the drain from when the OSD
+  plans it, not from receipt, and only reads the window (see
+  `OSD-direct PUT`_).
 
   The gateway waits 10 s before a fallback rewrites the window, and
   before it answers the client with an error. It counts the 10 s from
@@ -1082,9 +1143,10 @@ exit, even with ``osd_oob_cutoff_policy`` set to ``abort``. Restart the
 OSD once the transport is fixed.
 
 The lease and the drain bound the OSD side only. They are not a bound
-on how long a client keeps a window registered. Both are measured
-against the wall clock, so they are a best-effort fence across clock
-steps. Give them some slack.
+on how long a client keeps a window registered. The OSD measures the age
+of a request on its monotonic clock, from when the request arrived, and
+that of a pull from when the OSD planned it. So a step of the wall clock
+does not move the lease or the drain.
 
 Reusing a window
 ----------------
@@ -1551,6 +1613,15 @@ daemonizes closes standard error first, so the library's messages are
 lost, errors included. The OSD does not configure the library's log,
 and ``debug_osd`` has no effect on it.
 
+The gateway starts its cuObject server after its frontends. Until the
+server is up, a request that needs gateway-staged mode moves its data
+over HTTP. A GET gets the HTTP body with ``x-amz-rdma-reply: 501``. A
+PUT with a body stores that body, and a PUT without one is declined
+with ``501``. If the server fails to start, the gateway logs
+``cuObj RDMA server init failed``, and such requests always use HTTP.
+Passthrough GETs and OSD-direct PUTs with a cuObject descriptor do not
+use the gateway's server. The OSDs serve them whether or not it is up.
+
 If the library has no DC initiator for a gateway frontend thread, the
 thread logs ``cuObject channel allocation failed`` once. It then serves
 its gateway-staged requests over HTTP. A GET gets the HTTP body with
@@ -1765,20 +1836,70 @@ Each OSD needs these settings:
   reference provider needs one interface for each process, so give each
   OSD an interface of its own, and set ``oob_network_interface`` to its
   name. The value can use ``$id``, for example ``uet-o$id``.
-* The ``CAP_NET_RAW`` capability, for the raw socket. An OSD normally
-  drops every capability that its block-device plugins do not need.
-  When either option names ``uet``, the OSD keeps ``CAP_NET_RAW``
-  through that step, if it still holds it.
+* The ``CAP_NET_RAW`` capability, for the raw socket that the provider
+  opens.
 
 The gateway's relay windows need ``uet`` in ``oob_cluster_transport``,
 an address in ``oob_network`` on the gateway's own UET interface, and
 ``CAP_NET_RAW``.
 
-A daemon that switches to the ``ceph`` user (``--setuser ceph``) keeps
-no effective capability, and nothing raises ``CAP_NET_RAW`` again. The
-packaged systemd units and cephadm start the daemons that way, so UET
-does not work in them yet. UET works in a daemon that runs as a user
-that holds ``CAP_NET_RAW``, for example in its ambient set.
+The packaged systemd units and cephadm start each daemon as root, with
+``--setuser ceph``. A daemon normally loses every capability when it
+switches to the ``ceph`` user. For ``uet``, the OSD and the gateway
+keep ``CAP_NET_RAW``, and no other capability, in their permitted set.
+Each raises it into its effective set only while its endpoint opens, on
+a short-lived thread of its own. The threads that the provider and
+ofi-rma start during the open keep it in their effective set.
+
+An OSD keeps the capability when ``uet`` is the provider of its
+libfabric endpoint. That provider is ``oob_cluster_transport`` when it
+names a libfabric provider, or else the first libfabric provider in
+``oob_client_transports``. For example, with no cluster transport,
+``oob_client_transports = tcp, uet`` makes ``tcp`` the provider, and the
+OSD keeps nothing. The OSD switches users before it reads the
+configuration that the monitors store. So the setting must be in
+``ceph.conf``, in ``CEPH_ARGS`` or on the command line.
+
+When the OSD keeps the capability, it logs
+``set uid:gid to <uid>:<gid> (ceph:ceph), keeping CAP_NET_RAW for uet``.
+Its main thread then shows ``CapPrm: 0000000000002000`` and
+``CapEff: 0000000000000000`` in ``/proc/<pid>/status``. When root does
+not hold the capability, that line ends in
+``without CAP_NET_RAW, which uet needs`` instead. Without the
+capability, the endpoint fails to open, and the OSD logs
+``libfabric endpoint:`` with ``the process does not hold CAP_NET_RAW``
+and a hint.
+
+With ``set_keepcaps`` on (it is off by default), the OSD keeps its whole
+permitted set through the switch instead. With ``bluestore_use_ebd`` on,
+the default, the OSD's main thread later drops every capability that
+the block-device plugins do not need, when it first opens BlueStore's
+block device. It keeps ``CAP_NET_RAW`` through that step when ``uet``
+is the provider. That step comes after the OSD reads the monitors'
+configuration, and it changes only the main thread. The threads that
+the main thread starts afterwards, the op threads among them, get the
+smaller set. Threads that started between the switch and that step
+keep the whole permitted set, such as the messenger worker threads,
+which start when the OSD reads the monitors' configuration. With
+``bluestore_use_ebd`` off, nothing trims the set.
+
+A gateway keeps ``CAP_NET_RAW`` when ``rgw_rdma_osd_direct`` is on,
+``oob_client_transports`` names ``rc``, and ``oob_cluster_transport`` is
+``uet``. The gateway switches users when its frontends start, after it
+reads the monitors' configuration, so ``ceph config set`` works for it.
+It logs ``kept CAP_NET_RAW for the uet relay windows``, or
+``WARNING: CAP_NET_RAW, which the uet relay windows need, is not available``.
+
+Every thread that the OSD starts after the switch holds ``CAP_NET_RAW``
+in its permitted set, its messenger and op threads included. In the
+gateway, only the threads that its main thread starts after the switch
+hold it, such as those of the RC service. The HTTP worker threads start
+before the switch, and hold no capability. Code that runs on a thread
+that holds the capability can raise it.
+
+A daemon that runs as another user from the start, without
+``--setuser``, needs ``CAP_NET_RAW`` itself, for example in its ambient
+set.
 
 An OSD-direct PUT (see `OSD-direct PUT`_) needs RMA reads. The OSD
 always asks for them, and the wrapper must offer ``FI_READ`` and
@@ -1953,7 +2074,9 @@ of a pulled write still wait for its pulls.
 ``rdma_delivery_lease``
   How long, in seconds, after it receives a stripe operation an OSD can
   still take on a transfer against its delivery descriptor. A transfer
-  that would start later is delivered inline. The default is 5.
+  that would start later is delivered inline. A pull counts the lease
+  and the drain from when the OSD plans it, and can start until both
+  have passed. The default is 5.
 
 ``rdma_delivery_drain``
   How long, in seconds, after the lease every write that an OSD started
@@ -2106,11 +2229,11 @@ See `Transfer threads`_.
 ``osd_oob_transfer_thread_timeout``
   The heartbeat grace of a transfer thread. A thread that runs one
   transfer for longer marks the OSD unhealthy, but the OSD never kills
-  it. A transfer ends within the pool's lease plus drain from receipt,
-  which is 10 s at most, plus ``osd_oob_cutoff_late_tolerance`` for a
-  late cut-off. With transfer threads, the OSD raises a value that does
-  not cover that to 1 s past it, and logs a warning. The default is
-  30 s.
+  it. A transfer ends within the pool's lease plus drain, which is 10 s
+  at most, plus ``osd_oob_cutoff_late_tolerance`` for a late cut-off. A
+  push counts that time from receipt, and a pull from its plan. With
+  transfer threads, the OSD raises a value that does not cover that to
+  1 s past it, and logs a warning. The default is 30 s.
 
 ``osd_oob_cuobj_transfer_threads``
   Run cuObject transfers on the transfer threads too. The default is
@@ -2140,8 +2263,11 @@ writes in flight, and these counters:
   or a poll of the channel failed without resetting it. It also keeps
   it when a submission failed.
 * ``buffers_reclaimed``: the kept buffers that came back since.
-* ``stale_completions``: the completions of earlier plans' writes that a
-  later read took.
+* ``stale_completions``: the completions on a thread's channel that no
+  running plan waited for. These are the completions of writes that
+  earlier plans left posted, which a later transfer or an idle transfer
+  thread took. They also include completions that the library returned
+  a second time, which count toward no plan.
 * ``channel_busy``: the reads delivered inline, with nothing staged,
   because writes of a plan that timed out, or whose poll failed, were
   still posted on the thread's channel. The buffer of a failed
@@ -2231,7 +2357,7 @@ shows. See `Transfer threads`_.
 * ``refused``: the transfers refused over a cap or while the OSD
   stopped.
 * ``expired``: the transfers that waited too long to start: a push past
-  its lease, a pull past the lease plus drain.
+  its lease, a pull past the lease plus drain from its plan.
 * ``shed``: the transfers still queued when the OSD stopped.
 * ``queue_lat``: how long a transfer waited for a transfer thread.
 * ``push_lat``: how long a push took, on a transfer thread or on an op
@@ -2324,6 +2450,11 @@ Testing
   writes that start too late, concurrent writes and their CPU use,
   that a write with a re-keyed window's old token does not land, and
   the gather window cycle under load, with cut-offs alongside.
+* ``unittest_osd_ofi`` tests the OSD's libfabric executor over ``tcp``.
+  It covers the lending of gather windows, a pull of a write's payload,
+  and cut-offs that fail or take too long. The tests that need ``tcp``
+  skip only when libfabric offers no ``tcp`` provider with what ofi-rma
+  asks for. Any other failure to open the endpoint fails the test.
 * ``unittest_ec_gather`` tests the check of gathered shard data against
   its shard's checksum, and that a reply says when its shard sent
   nothing into the window. It also runs a shard's push through the
@@ -2332,7 +2463,9 @@ Testing
 * ``unittest_oob_xfer`` tests the transfer threads: their caps,
   transfers past their leases, and shedding at stop. It also tests
   transfers that run on the submitting thread, the heartbeat of a long
-  transfer, and what ``dump_oob_transfers`` shows.
+  transfer, and what ``dump_oob_transfers`` shows. It checks the bounds
+  of a transfer from a monotonic receipt time, and those of a pull from
+  its plan.
 * ``unittest_oob_read_delivery`` tests that the read push gives the same
   replies as the earlier code, for every kind of read and outcome. It
   also tests the handoff to the transfer threads, pushes past their
@@ -2347,11 +2480,23 @@ Testing
   only the ops whose pull started nothing. It covers the park and the
   kick, the job of a dropped write, and a resend that waits for an
   earlier job.
+
+  It also checks the PG log's record of a pull, and that the reply to a
+  duplicate reports the pull from it. It checks that a write that waited
+  past the lease plus drain still pulls, and it checks the monotonic
+  receipt time of a request.
 * ``unittest_oob_placement`` tests placement plans.
 * ``unittest_oob_abandoned`` tests how the cuObject executor counts a
   completion against the plan that posted it, and when it gives the
-  staging buffer of a plan that timed out back.
+  staging buffer of a plan that timed out back. It checks that a
+  completion that the library returns twice counts once, and gives back
+  no buffer that a posted write still uses.
 * ``unittest_rdma_token`` tests token parsing and transport lists.
+* ``unittest_oob_caps`` tests when an OSD or a gateway keeps
+  ``CAP_NET_RAW`` across ``--setuser``, and how it raises the capability
+  while an endpoint opens. It runs the tests that need
+  capabilities in a user namespace, and skips them where the system
+  refuses one. Its test of the switch itself needs root.
 * ``unittest_crc64nvme`` tests CRC-64/NVME against the NVM Command Set
   test cases, and checks that its implementations agree.
 * ``unittest_rdma_delivery`` tests the wire formats of delivery
@@ -2364,6 +2509,9 @@ Testing
   version 8 encodings. It checks that the client library reports
   withheld descriptors as declined, and that ``ObjectOperation::dup()``
   keeps the descriptor and result vectors aligned with the operations.
+  It checks that the scheduler cost of a request counts its pulled
+  bytes, and on which requests the client library sets
+  ``CEPH_OSD_FLAG_RETURNVEC``.
 * ``qa/standalone/erasure-code/test-erasure-eio.sh`` covers shard-direct
   reads whose shard read fails with ``-EIO``, and their bounce to the
   primary.
@@ -2383,10 +2531,12 @@ Testing
   splits the PG before the pull starts, and while it runs.
 
   It checks that a pulled write with a ``CALL`` on an erasure-coded pool
-  with ``allow_ec_optimizations`` pulls on its op thread. The ``put``
-  mode of ``ceph_test_osd_oob_read`` sends the pulled writes. It prints
-  ``crc=declined`` for a write whose resend the OSD answered as a
-  duplicate.
+  with ``allow_ec_optimizations`` pulls on its op thread. It checks that
+  the reply to a resend that the OSD answers as a duplicate reports the
+  earlier pull. It checks that a pulled write that waited past the lease
+  plus drain still pulls. The ``put`` mode of ``ceph_test_osd_oob_read``
+  sends the pulled writes. With ``--call``, it prints ``crc=declined``
+  for a write whose resend the OSD answered as a duplicate.
 * ``unittest_rgw_rdma_fence`` tests when the gateway fences, and how it
   reads each stripe's reply.
 * ``unittest_rgw_rdma_rc_wire`` tests the ``hipobj-rc-v2`` wire
@@ -2448,20 +2598,20 @@ Limitations
   cuObject channel. If that token names no window, or an empty one, the
   PUT fails with ``400``. On a thread without a channel, the body is
   stored as over HTTP.
-* The gateway starts its cuObject server before it drops privileges,
-  and the systemd unit and cephadm start it with ``--setuser ceph``.
-  The kernel refuses ``rdma_cm`` calls through a file that the process
-  opened with other credentials. If the library opens its ``rdma_cm``
-  channel when the server starts, its later calls fail with
-  ``EACCES``. This is not tested. The RC server opens its device after
-  the drop.
+* The systemd unit and cephadm start the gateway with
+  ``--setuser ceph``. The gateway starts its cuObject server after its
+  frontends drop privileges, so the threads that the library starts can
+  use its ``rdma_cm`` channel. The frontend threads start before the
+  drop, and the drop gives each of them credentials of its own. The
+  kernel refuses an ``rdma_cm`` call through a file that other
+  credentials opened. So such a call that the library makes on a
+  frontend thread during a transfer fails with ``EACCES``, but this is
+  not tested. Like the OSD's cuObject server, it runs as the ``ceph``
+  user, and cannot open device nodes that only root can open, such as
+  ``umad``.
 * An OSD-direct PUT does not serve appends, multipart parts, compressed
-  or encrypted objects. The pulled payload counts against the OSD's
-  client message throttle, but not against the cost that the OSD's
-  mClock scheduler charges the request. If a stripe write was resent
-  after its OSD committed it, the stripe has no checksum, and the
-  gateway declines the PUT. The cuObject pull is compiled against a
-  header stub only and is not tested on hardware.
+  or encrypted objects. The cuObject pull is compiled against a header
+  stub only and is not tested on hardware.
 * The gateway does not serve encrypted objects, or objects with a DLO
   or SLO manifest, to RC clients. PREPARE answers ``501`` with the
   unsupported marker, and the client reads the object over HTTP.

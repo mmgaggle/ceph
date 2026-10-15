@@ -55,6 +55,15 @@ constexpr auto CUOBJ_RETRY_BUDGET =
 /// caps poll() at 16 events and documents no larger per-channel bound)
 constexpr int POLL_BATCH = 16;
 
+/// A plan polls its channel with only a yield in between for POLL_SPIN
+/// after it starts or last sees a completion, then sleeps POLL_SLEEP
+/// between polls. A sleep lasts about 50 us more than asked, the kernel's
+/// default timer slack, so a plan that slept at once would wait about
+/// 55 us for a write that completes in a few. Spinning about as long as
+/// one sleep lasts at most doubles the wait for a write that is slower.
+constexpr auto POLL_SPIN = std::chrono::microseconds(50);
+constexpr auto POLL_SLEEP = std::chrono::microseconds(5);
+
 /// A write's async handle is a number unique in the process, not a
 /// pointer into its plan: a write that a plan left posted when it timed
 /// out completes during a later plan on the channel, and its handle
@@ -539,8 +548,8 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
     m_budget_refused++;
     return -ETIMEDOUT;
   }
-  // counted from here, not from after staging: taking a channel, copying
-  // the data and registering a one-time buffer come out of the budget too.
+  // counted from here, not from after staging: taking a channel and a
+  // buffer of the arena, and copying the data, come out of the budget too.
   // On the monotonic clock: a step of the wall clock must not move it.
   const auto deadline =
     ceph::mono_clock::now() + (budget - CUOBJ_RETRY_BUDGET);
@@ -612,6 +621,8 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
   auto held = [&] {
     return held_t{buf, submit_failed};
   };
+  // polled with only a yield in between until then
+  auto spin_until = ceph::mono_clock::now() + POLL_SPIN;
   while (completed < items.size()) {
     while (err == 0 && next < items.size() && outstanding < POLL_BATCH) {
       // a write posted past the deadline could retry past the budget
@@ -657,8 +668,13 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
     }
     int n = m_server->poll(events, POLL_BATCH, channel);
     if (n == 0) {
-      // nothing completed yet; don't hot-spin the op worker
-      std::this_thread::sleep_for(std::chrono::microseconds(5));
+      // nothing completed yet: poll again at once while a completion is
+      // likely soon, then without hot-spinning the op worker
+      if (ceph::mono_clock::now() < spin_until) {
+	std::this_thread::yield();
+      } else {
+	std::this_thread::sleep_for(POLL_SLEEP);
+      }
       if (ceph::mono_clock::now() > deadline) {
 	derr << "ERROR: plan " << first << " for " << key << " timed out with "
 	     << outstanding << " writes outstanding; keeping the staging "
@@ -716,6 +732,8 @@ ssize_t OSDCuObj::run_plan(bool pull, const std::string& key,
       }
       break;
     }
+    // the channel moves: the next completions are likely close behind
+    spin_until = ceph::mono_clock::now() + POLL_SPIN;
     for (int i = 0; i < n; i++) {
       if (!events[i].async_handle) {
 	continue;

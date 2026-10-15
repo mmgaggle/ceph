@@ -17,14 +17,18 @@
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstring>
+#include <iterator>
 
 #include <fmt/format.h>
 
+#include "common/crc64nvme.h"
 #include "common/dout.h"
 #include "common/errno.h"
 #include "rgw_auth_s3.h"
 #include "rgw_common.h"
+#include "rgw_hex.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -32,33 +36,38 @@ namespace rgw::rdma::rc {
 
 namespace {
 
-int hex_nibble(char c)
-{
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  return -1;
-}
-
 bool all_hex(std::string_view s)
 {
   return !s.empty() &&
-    std::all_of(s.begin(), s.end(), [](char c) { return hex_nibble(c) >= 0; });
+    std::all_of(s.begin(), s.end(),
+                [](unsigned char c) { return std::isxdigit(c); });
 }
 
-// fixed-width hex field of exactly `digits` digits with a value in
-// [1, max]
-std::optional<uint32_t> parse_fixed_hex(std::string_view s, size_t digits,
-                                        uint32_t max)
+// an unsigned number of 1 to max_digits digits in base, with no sign,
+// prefix or blanks
+template <typename T>
+std::optional<T> parse_digits(std::string_view s, int base, size_t max_digits)
 {
-  if (s.size() != digits || !all_hex(s)) {
+  if (s.empty() || s.size() > max_digits) {
     return std::nullopt;
   }
-  uint32_t v = 0;
-  for (char c : s) {
-    v = (v << 4) | hex_nibble(c);
+  T v = 0;
+  const auto end = s.data() + s.size();
+  auto [ptr, ec] = std::from_chars(s.data(), end, v, base);
+  if (ec != std::errc() || ptr != end) {
+    return std::nullopt;
   }
-  if (v == 0 || v > max) {
+  return v;
+}
+
+// fixed-width hex field of exactly `digits` digits, never 0
+std::optional<uint32_t> parse_fixed_hex(std::string_view s, size_t digits)
+{
+  if (s.size() != digits) {
+    return std::nullopt;
+  }
+  auto v = parse_digits<uint32_t>(s, 16, digits);
+  if (!v || *v == 0) {
     return std::nullopt;
   }
   return v;
@@ -78,54 +87,6 @@ uint64_t get_le(const uint8_t* p, size_t bytes)
     v |= static_cast<uint64_t>(p[i]) << (8 * i);
   }
   return v;
-}
-
-// RFC 3986 unreserved characters pass through unescaped
-bool unreserved(unsigned char c)
-{
-  return std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~';
-}
-
-std::string percent_encode(std::string_view s)
-{
-  static constexpr char hex[] = "0123456789ABCDEF";
-  std::string out;
-  out.reserve(s.size());
-  for (unsigned char c : s) {
-    if (unreserved(c) || c == '/') {
-      out.push_back(static_cast<char>(c));
-    } else {
-      out.push_back('%');
-      out.push_back(hex[c >> 4]);
-      out.push_back(hex[c & 0xf]);
-    }
-  }
-  return out;
-}
-
-// path-style unescape: "%XX" only, '+' stays literal; nullopt on a
-// truncated or non-hex escape
-std::optional<std::string> percent_decode(std::string_view s)
-{
-  std::string out;
-  out.reserve(s.size());
-  for (size_t i = 0; i < s.size(); i++) {
-    if (s[i] != '%') {
-      out.push_back(s[i]);
-      continue;
-    }
-    if (i + 2 >= s.size()) {
-      return std::nullopt;
-    }
-    int hi = hex_nibble(s[i + 1]);
-    int lo = hex_nibble(s[i + 2]);
-    if (hi < 0 || lo < 0) {
-      return std::nullopt;
-    }
-    out.push_back(static_cast<char>((hi << 4) | lo));
-    i += 2;
-  }
-  return out;
 }
 
 } // anonymous namespace
@@ -149,13 +110,9 @@ std::string encode_token(const token_t& t)
   buf[off++] = t.port;
   put_le(&buf[off], t.lid, 2); off += 2;
 
-  static constexpr char hex[] = "0123456789abcdef";
   std::string out;
   out.reserve(TOKEN_HEX_LEN);
-  for (uint8_t b : buf) {
-    out.push_back(hex[b >> 4]);
-    out.push_back(hex[b & 0xf]);
-  }
+  buf_to_hex(buf, std::back_inserter(out));
   return out;
 }
 
@@ -166,8 +123,8 @@ std::optional<token_t> decode_token(std::string_view hex)
   }
   std::array<uint8_t, TOKEN_BINARY_LEN> buf;
   for (size_t i = 0; i < TOKEN_BINARY_LEN; i++) {
-    buf[i] = static_cast<uint8_t>((hex_nibble(hex[2 * i]) << 4) |
-                                  hex_nibble(hex[2 * i + 1]));
+    const char* p = hex.data() + 2 * i;
+    std::from_chars(p, p + 2, buf[i], 16);
   }
   token_t t;
   size_t off = 0;
@@ -195,7 +152,7 @@ bool valid_session_id(std::string_view s)
 
 std::optional<uint32_t> parse_psn(std::string_view s)
 {
-  return parse_fixed_hex(s, 6, 0xffffff);
+  return parse_fixed_hex(s, 6);
 }
 
 std::string format_psn(uint32_t psn)
@@ -205,7 +162,7 @@ std::string format_psn(uint32_t psn)
 
 std::optional<uint32_t> parse_cookie(std::string_view s)
 {
-  return parse_fixed_hex(s, 8, 0xffffffff);
+  return parse_fixed_hex(s, 8);
 }
 
 std::string format_cookie(uint32_t cookie)
@@ -215,14 +172,7 @@ std::string format_cookie(uint32_t cookie)
 
 std::optional<uint64_t> parse_hex(std::string_view s)
 {
-  if (s.empty() || s.size() > 16 || !all_hex(s)) {
-    return std::nullopt;
-  }
-  uint64_t v = 0;
-  for (char c : s) {
-    v = (v << 4) | hex_nibble(c);
-  }
-  return v;
+  return parse_digits<uint64_t>(s, 16, 16);
 }
 
 std::string format_hex(uint64_t v)
@@ -232,20 +182,7 @@ std::string format_hex(uint64_t v)
 
 std::optional<uint64_t> parse_decimal(std::string_view s)
 {
-  if (s.empty() || s.size() > 20 ||
-      !std::all_of(s.begin(), s.end(),
-                   [](char c) { return c >= '0' && c <= '9'; })) {
-    return std::nullopt;
-  }
-  uint64_t v = 0;
-  for (char c : s) {
-    const uint64_t d = c - '0';
-    if (v > (UINT64_MAX - d) / 10) {
-      return std::nullopt;
-    }
-    v = v * 10 + d;
-  }
-  return v;
+  return parse_digits<uint64_t>(s, 10, 20);
 }
 
 std::optional<target_t> parse_target(std::string_view target)
@@ -274,13 +211,37 @@ std::optional<target_t> parse_target(std::string_view target)
   return t;
 }
 
+std::optional<std::string> percent_decode(std::string_view s)
+{
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); i++) {
+    if (s[i] != '%') {
+      out.push_back(s[i]);
+      continue;
+    }
+    if (i + 2 >= s.size()) {
+      return std::nullopt;
+    }
+    auto c = parse_digits<uint8_t>(s.substr(i + 1, 2), 16, 2);
+    if (!c) {
+      return std::nullopt;
+    }
+    out.push_back(static_cast<char>(*c));
+    i += 2;
+  }
+  return out;
+}
+
 std::string build_target(std::string_view bucket, std::string_view key,
                          std::string_view query)
 {
+  // RFC 3986 unreserved characters and '/' pass through unescaped
+  using rgw::auth::s3::aws4_uri_encode;
   std::string t = "/";
-  t += percent_encode(bucket);
+  t += aws4_uri_encode(std::string{bucket}, false);
   t += '/';
-  t += percent_encode(key);
+  t += aws4_uri_encode(std::string{key}, false);
   if (!query.empty()) {
     t += '?';
     t += query;
@@ -357,33 +318,34 @@ int check_signed(const DoutPrefixProvider* dpp, const req_info& info)
 
 void landed_ranges::add(uint64_t ofs, uint64_t len)
 {
-  if (len == 0) {
-    return;
-  }
-  uint64_t start = ofs;
-  uint64_t stop = ofs + len;
-  auto it = ranges.upper_bound(start);
-  if (it != ranges.begin()) {
-    auto prev = std::prev(it);
-    if (prev->second >= start) {
-      start = prev->first;
-      stop = std::max(stop, prev->second);
-      it = ranges.erase(prev);
-    }
-  }
-  while (it != ranges.end() && it->first <= stop) {
-    stop = std::max(stop, it->second);
-    it = ranges.erase(it);
-  }
-  ranges.emplace(start, stop);
+  // ranges that overlap or touch merge
+  ranges.union_insert(ofs, len);
 }
 
 uint64_t landed_ranges::prefix() const
 {
-  if (ranges.empty() || ranges.begin()->first != 0) {
+  if (ranges.empty() || ranges.range_start() != 0) {
     return 0;
   }
-  return ranges.begin()->second;
+  return ranges.begin().get_len();
+}
+
+void chained_crcs::reset(const cksum_want& w)
+{
+  want = w;
+  fold = crc_fold{w};
+}
+
+void chained_crcs::append(const void* p, uint64_t len)
+{
+  crcs c;
+  if (want.crc64nvme) {
+    c.crc64 = ceph::crc64nvme(0, p, len);
+  }
+  if (want.crc32c) {
+    c.crc32c = crc32c_of(p, len);
+  }
+  fold.append(c, len);
 }
 
 std::optional<std::vector<push_t>> plan_pushes(uint64_t prefix, uint64_t pushed,

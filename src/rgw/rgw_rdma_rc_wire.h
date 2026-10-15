@@ -14,11 +14,13 @@
 #pragma once
 
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "include/interval_set.h"
+#include "rgw_rdma_cksum.h"
 
 class DoutPrefixProvider;
 struct req_info;
@@ -139,6 +141,10 @@ struct target_t {
 /// nullopt when the shape is wrong or an escape is malformed
 std::optional<target_t> parse_target(std::string_view target);
 
+/// path-style unescape: "%XX" only, '+' stays literal; nullopt on a
+/// truncated or non-hex escape
+std::optional<std::string> percent_decode(std::string_view s);
+
 /// build the canonical target value from its parts
 std::string build_target(std::string_view bucket, std::string_view key,
                          std::string_view query = {});
@@ -165,13 +171,34 @@ int check_signed(const DoutPrefixProvider* dpp, const req_info& info);
  * only the contiguous run from the window's start.
  */
 class landed_ranges {
-  std::map<uint64_t, uint64_t> ranges;  ///< start -> end, merged
+  interval_set<uint64_t> ranges;
 
  public:
   void add(uint64_t ofs, uint64_t len);
   /// bytes complete from offset 0
   uint64_t prefix() const;
-  size_t count() const { return ranges.size(); }
+  size_t count() const { return ranges.num_intervals(); }
+};
+
+/**
+ * The CRCs that a client asked for of the bytes the gateway copies,
+ * chained over the copies in object order while they are in the cache,
+ * instead of a pass over the whole session buffer. It computes none
+ * until reset() names them, so an op resets it once the request's
+ * x-amz-rdma-checksum-algorithm is parsed.
+ */
+class chained_crcs {
+  cksum_want want;
+  crc_fold fold{want};
+
+ public:
+  /// start over, for the CRCs in w
+  void reset(const cksum_want& w);
+  /// the next len bytes, at p
+  void append(const void* p, uint64_t len);
+  /// those of everything appended since reset() that it asked for;
+  /// none before the first append
+  const crcs& result() const { return fold.result(); }
 };
 
 /// one RDMA write of window bytes [ofs, ofs+len) to the client

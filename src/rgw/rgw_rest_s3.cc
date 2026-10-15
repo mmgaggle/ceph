@@ -3096,6 +3096,19 @@ static int get_success_retcode(int code)
   return 0;
 }
 
+void RGWPutObj_ObjStore_S3::dump_stored_headers()
+{
+  for (auto &it : crypt_http_responses)
+    dump_header(s, it.first, it.second);
+  dump_header_if_nonempty(s, "x-amz-version-id", version_id);
+  dump_header_if_nonempty(s, "x-amz-expiration",
+			  get_s3_expiration_header(s, mtime));
+  if (cksum && cksum->aws()) {
+    dump_header(s, "x-amz-checksum-type", "FULL_OBJECT");
+    dump_header(s, cksum->header_name(), cksum->to_armor());
+  }
+}
+
 void RGWPutObj_ObjStore_S3::send_response()
 {
   if (op_ret) {
@@ -3112,11 +3125,6 @@ void RGWPutObj_ObjStore_S3::send_response()
 	s->cct->_conf->rgw_s3_success_create_obj_status);
       set_req_state_err(s, op_ret);
     }
-
-    string expires = get_s3_expiration_header(s, mtime);
-
-    for (auto &it : crypt_http_responses)
-      dump_header(s, it.first, it.second);
 
     if (copy_source.empty()) {
       dump_errno(s);
@@ -3138,20 +3146,10 @@ void RGWPutObj_ObjStore_S3::send_response()
         dump_header(s, "x-amz-rdma-bytes-transferred", s->obj_size);
         rgw::rdma::dump_checksums(s, rdma_pulled_crc64, rdma_pulled_crc32c);
       }
-      dump_header_if_nonempty(s, "x-amz-version-id", version_id);
-      dump_header_if_nonempty(s, "x-amz-expiration", expires);
-      if (cksum && cksum->aws()) {
-	dump_header(s, "x-amz-checksum-type", "FULL_OBJECT");
-	dump_header(s, cksum->header_name(), cksum->to_armor());
-      }
+      dump_stored_headers();
     } else {
       dump_errno(s);
-      dump_header_if_nonempty(s, "x-amz-version-id", version_id);
-      dump_header_if_nonempty(s, "x-amz-expiration", expires);
-      if (cksum && cksum->aws()) {
-	dump_header(s, "x-amz-checksum-type", "FULL_OBJECT");
-	dump_header(s, cksum->header_name(), cksum->to_armor());
-      }
+      dump_stored_headers();
       end_header(s, this, to_mime_type(s->format));
       dump_start(s);
       struct tm tmp;

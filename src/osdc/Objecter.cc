@@ -4035,9 +4035,6 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 
 bool Objecter::rdma_oob_wanted(const Op *op, unsigned i)
 {
-  if (i < op->rdma_oob_result.size() && op->rdma_oob_result[i]) {
-    return true;
-  }
   return op->rdma_oob_handler && i < op->rdma_oob_handler->size() &&
     (*op->rdma_oob_handler)[i];
 }
@@ -4053,11 +4050,7 @@ void Objecter::deliver_rdma_oob_result(Op *op, unsigned i,
   if (op->attempts > 1 && !op->rdma_retry_settled) {
     r.flags |= ceph::rdma::oob_result_t::FLAG_RESENT;
   }
-  if (i < op->rdma_oob_result.size() && op->rdma_oob_result[i]) {
-    *op->rdma_oob_result[i] = r;
-  }
-  if (op->rdma_oob_handler && i < op->rdma_oob_handler->size() &&
-      (*op->rdma_oob_handler)[i]) {
+  if (rdma_oob_wanted(op, i)) {
     auto& handler = (*op->rdma_oob_handler)[i];
     std::move(handler)(r);
     handler = nullptr;
@@ -4071,17 +4064,16 @@ void Objecter::deliver_rdma_oob_results(
   // (old OSD, refusal, or nothing requested) carries none, which reads
   // back as all-zero results - except for an attempt that went out
   // without its descriptors, whose descriptor-bearing ops read
-  // declined. Both result forms are served, so a caller learns
-  // "nothing delivered" even for an op the reply left out.
+  // declined. Every op that asked for its result is served, so a caller
+  // learns "nothing delivered" even for an op the reply left out.
   const ceph::rdma::oob_result_t none;
   ceph::rdma::oob_result_t withheld;
   withheld.flags = ceph::rdma::oob_result_t::FLAG_DECLINED;
-  for (unsigned i = 0; i < op->rdma_oob_result.size(); ++i) {
+  for (unsigned i = 0; i < op->rdma_delivery.size(); ++i) {
     if (!rdma_oob_wanted(op, i)) {
       continue;
     }
-    if (op->rdma_withheld && i < op->rdma_delivery.size() &&
-	!op->rdma_delivery[i].empty()) {
+    if (op->rdma_withheld && !op->rdma_delivery[i].empty()) {
       deliver_rdma_oob_result(op, i, withheld);
     } else {
       deliver_rdma_oob_result(op, i, i < oob.size() ? oob[i] : none);
@@ -4124,6 +4116,40 @@ Objecter::stamp_rdma_attempt(Op *op, bool send)
   }
   op->rdma_attempt_unsettled = true;
   return deliveries;
+}
+
+void Objecter::fan_out_rdma(const Op *op, Op *sub_op,
+			    const std::vector<int>& parent_ops,
+			    std::vector<ceph::rdma::oob_result_t>& results)
+{
+  ceph_assert(parent_ops.size() == sub_op->ops.size());
+  ceph_assert(sub_op->rdma_delivery.size() == sub_op->ops.size());
+  ceph_assert(op->rdma_delivery.size() == op->ops.size());
+  results.assign(sub_op->ops.size(), ceph::rdma::oob_result_t{});
+  // a sub-read asks for no results of its own: this replaces none
+  sub_op->rdma_oob_handler = std::make_unique<
+    std::vector<::ObjectOperation::rdma_oob_handler_t>>(sub_op->ops.size());
+  for (unsigned j = 0; j < sub_op->ops.size(); ++j) {
+    const int parent = parent_ops[j];
+    if (parent < 0 || sub_op->ops[j].op.op != CEPH_OSD_OP_READ ||
+	op->rdma_delivery[parent].empty()) {
+      continue;
+    }
+    auto d = op->rdma_delivery[parent];
+    // zero shift for EC-direct subs (they carry the parent extent)
+    d.base_offset += sub_op->ops[j].op.extent.offset -
+		     op->ops[parent].op.extent.offset;
+    // the crc request rides along unchanged: a shard OSD reports one
+    // range per chunk it placed, and the aggregate on completion folds
+    // every sub-read's ranges in window order, so interleaving across
+    // shards costs the caller nothing
+    sub_op->rdma_delivery[j] = std::move(d);
+    // the sub-read's result waits in its slot for that fold
+    (*sub_op->rdma_oob_handler)[j] =
+      [&slot = results[j]](const ceph::rdma::oob_result_t& r) {
+	slot = r;
+      };
+  }
 }
 
 void Objecter::complete_op_reply(Op *op, bs::error_code handler_error, OSDSession *s, unique_lock<std::shared_mutex> &sl, int rc) {

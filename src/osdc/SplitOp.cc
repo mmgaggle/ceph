@@ -579,17 +579,12 @@ void SplitOp::complete() {
     // crc32c of the op as one contiguous extent, each when every
     // sub-read reported it.
     //
-    // The result goes to the caller in whichever form it asked for:
-    // librados takes the callback form, which a pointer-only copy here
-    // used to skip, so every split passthrough read reported nothing
-    // delivered.
-    //
     // A failed read reports too, as an unsplit read's error reply does:
     // when every sub-read declined (each OSD answered with the error,
     // say) the caller need not fence its window before it answers. Its
     // bytes are not summed, so it never reads landed. Only a retry
     // reports nothing here: its own reply does.
-    for (unsigned i = 0; i < orig_op->rdma_oob_result.size(); ++i) {
+    for (unsigned i = 0; i < orig_op->rdma_delivery.size(); ++i) {
       if (!Objecter::rdma_oob_wanted(orig_op, i)) {
         continue;
       }
@@ -1248,26 +1243,8 @@ bool SplitOp::create(Objecter::Op *op, Objecter &objecter,
       nullptr, split_read->flags, -1, fin, objver);
 
     if (!split_read->oob_ops.empty()) {
-      ceph_assert(sub_read.parent_ops.size() == sub_op->ops.size());
-      ceph_assert(sub_op->rdma_delivery.size() == sub_op->ops.size());
-      sub_read.oob.assign(sub_op->ops.size(), ceph::rdma::oob_result_t{});
-      for (unsigned j = 0; j < sub_op->ops.size(); ++j) {
-        const int parent = sub_read.parent_ops[j];
-        if (parent < 0 || sub_op->ops[j].op.op != CEPH_OSD_OP_READ ||
-            op->rdma_delivery[parent].empty()) {
-          continue;
-        }
-        auto d = op->rdma_delivery[parent];
-        // zero shift for EC-direct subs (they carry the parent extent)
-        d.base_offset += sub_op->ops[j].op.extent.offset -
-                         op->ops[parent].op.extent.offset;
-        // the crc request rides along unchanged: a shard OSD reports
-        // one range per chunk it placed, and the aggregate on
-        // completion folds every sub-read's ranges in window order,
-        // so interleaving across shards costs the caller nothing
-        sub_op->rdma_delivery[j] = std::move(d);
-        sub_op->rdma_oob_result[j] = &sub_read.oob[j];
-      }
+      // before the sub-op goes out, so its reply finds the handlers
+      Objecter::fan_out_rdma(op, sub_op, sub_read.parent_ops, sub_read.oob);
     }
 
     auto &st = sub_op->target;

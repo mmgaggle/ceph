@@ -123,6 +123,8 @@
 # not x86_64
 %bcond_with system_qat
 %endif
+# out-of-band delivery over libfabric, which needs libfabric 1.20 or later
+%bcond_with oob_ofi
 %if 0%{?fedora} || 0%{?suse_version} || 0%{?rhel} >= 8 || 0%{?openEuler}
 %global weak_deps 1
 %endif
@@ -296,6 +298,9 @@ BuildRequires:	fmt-devel >= 6.2.1
 BuildRequires:	pkgconfig(libudev)
 BuildRequires:	libnl3-devel
 BuildRequires:	liboath-devel
+%if 0%{with oob_ofi}
+BuildRequires:	pkgconfig(libfabric) >= 1.20
+%endif
 BuildRequires:	libtool
 BuildRequires:	libxml2-devel
 BuildRequires:	make
@@ -1885,6 +1890,9 @@ cmake .. \
 %endif
 %if 0%{with system_pmdk}
     -DWITH_SYSTEM_PMDK:BOOL=ON \
+%endif
+%if 0%{with oob_ofi}
+    -DWITH_OOB_OFI:BOOL=ON \
 %endif
 %if 0%{without jaeger}
     -DWITH_JAEGER:BOOL=OFF \

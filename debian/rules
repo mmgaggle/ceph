@@ -18,6 +18,9 @@ endif
 ifneq ($(filter pkg.ceph.crimson,$(DEB_BUILD_PROFILES)),)
   extraopts += -DWITH_CRIMSON=ON
 endif
+ifneq ($(filter pkg.ceph.oob-ofi,$(DEB_BUILD_PROFILES)),)
+  extraopts += -DWITH_OOB_OFI=ON
+endif
 
 extraopts += -DWITH_JAEGER=ON
 extraopts += -DWITH_SYSTEM_JERASURE=ON

@@ -163,6 +163,13 @@ EOM
     if [ $WITH_RBD_RWL ]; then
         cmake_opts+=" -DWITH_RBD_RWL=ON"
     fi
+    # out-of-band delivery over libfabric: its unit tests run over the
+    # tcp and shm providers, so build it wherever a libfabric that
+    # ofi-rma can use (1.20 or later) is installed. WITH_OOB_OFI asks
+    # for it, and install-deps.sh then installs libfabric.
+    if [ $WITH_OOB_OFI ] || pkg-config --atleast-version=1.20 libfabric 2>/dev/null; then
+        cmake_opts+=" -DWITH_OOB_OFI=ON"
+    fi
     cmake_opts+=" -DWITH_RBD_SSD_CACHE=ON"
 
     cmake_opts+=" $(detect_ceph_dev_pkgs)"

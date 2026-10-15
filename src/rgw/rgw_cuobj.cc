@@ -18,7 +18,7 @@
 
 #define dout_subsys ceph_subsys_rgw
 
-std::unique_ptr<RGWCuObjServer> RGWCuObjServer::s_instance;
+std::atomic<RGWCuObjServer*> RGWCuObjServer::s_instance{nullptr};
 thread_local uint16_t RGWCuObjServer::tls_channel_id = 0;
 thread_local bool RGWCuObjServer::tls_channel_valid = false;
 thread_local bool RGWCuObjServer::tls_channel_refused = false;
@@ -34,26 +34,28 @@ RGWCuObjServer::~RGWCuObjServer()
 
 int RGWCuObjServer::init(CephContext* cct, ceph::oob::Arena* arena)
 {
-  if (s_instance) {
+  if (s_instance.load()) {
     return 0;
   }
-  s_instance.reset(new RGWCuObjServer());
-  s_instance->m_arena = arena;
-  int r = s_instance->do_init(cct);
-  if (r < 0) {
-    s_instance.reset();
+  // the frontends take requests already: request threads see the server
+  // only once it is complete, and never one whose setup failed
+  std::unique_ptr<RGWCuObjServer> srv{new RGWCuObjServer()};
+  srv->m_arena = arena;
+  if (int r = srv->do_init(cct); r < 0) {
+    return r;
   }
-  return r;
+  s_instance.store(srv.release(), std::memory_order_release);
+  return 0;
 }
 
 void RGWCuObjServer::shutdown()
 {
-  s_instance.reset();
+  delete s_instance.exchange(nullptr);
 }
 
 RGWCuObjServer* RGWCuObjServer::get_instance()
 {
-  return s_instance.get();
+  return s_instance.load(std::memory_order_acquire);
 }
 
 int RGWCuObjServer::do_init(CephContext* cct)

@@ -492,6 +492,35 @@ TEST(RdmaToken, CuobjDescriptor)
   EXPECT_FALSE(is_cuobj_descriptor("0:10"));
 }
 
+TEST(RdmaToken, FormatCuobjDescriptor)
+{
+  using ceph::rdma::format_cuobj_descriptor;
+  const uint8_t gid[16] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+			   0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10};
+  EXPECT_EQ(valid_token,
+	    format_cuobj_descriptor(0x0102030405060708ull, 0x01020304,
+				    0x0102aabb, 0x0102, 0x010203, gid));
+
+  // every field has a fixed width, so a descriptor is always as long
+  const uint8_t v4_gid[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+			      0, 0, 0xff, 0xff, 192, 168, 1, 10};
+  const std::string t =
+    format_cuobj_descriptor(0x7f0000001000ull, 0x800000, 0x5, 0, 0x12,
+			    v4_gid);
+  EXPECT_EQ("00007f0000001000:00800000:00000005:0000:000012:1:"
+	    "00000000000000000000ffffc0a8010a", t);
+  EXPECT_EQ(81u, t.size());
+  EXPECT_EQ(valid_token.size(), t.size());
+
+  // which the gateway and the OSD read back as a cuObject window
+  auto w = parse_rdma_token(t);
+  ASSERT_TRUE(w);
+  EXPECT_EQ(0x7f0000001000ull, w->addr);
+  EXPECT_EQ(0x800000ull, w->size);
+  EXPECT_TRUE(ceph::rdma::is_cuobj_descriptor(t));
+  EXPECT_FALSE(ceph::rdma::is_ofi_token(t));
+}
+
 TEST(RdmaToken, LongestOfiTokenFits)
 {
   // a token as long as ofi-rma writes one, without its NUL

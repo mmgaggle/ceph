@@ -3,7 +3,6 @@
 
 #include "osd/osd_ofi.h"
 
-#include <cstdlib>
 #include <cstring>
 #include <string_view>
 #include <thread>
@@ -137,9 +136,9 @@ int OSDOfi::init(const std::string& provider,
     return -ENODEV;
   }
   // a window gets a new key when it is released, and so does a staging
-  // buffer's region when the endpoint re-registers it: verbs caches
-  // registrations, and hands back the old key, unless the cache is off
-  setenv("FI_MR_CACHE_MONITOR", "disabled", 0);
+  // buffer's region when the endpoint re-registers it, which needs the
+  // verbs registration cache off: ceph-osd's main() sets
+  // FI_MR_CACHE_MONITOR before any thread starts
   std::string err;
   ep = ceph::ofi::Endpoint::open(cfg, &err);
   if (!ep) {

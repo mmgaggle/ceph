@@ -104,7 +104,11 @@ int OSDCuObj::do_init(const std::string& rdma_ip, bool lend_windows,
 {
   // the library chooses its rdma_cm port; no client connects to it
   constexpr uint16_t rdma_port = 0;
-  const auto dc_key = m_cct->_conf.get_val<uint64_t>("cuobj_dc_key");
+  uint64_t dc_key = 0;
+  if (std::string err; ceph::oob::dc_key(m_cct, &dc_key, &err) < 0) {
+    derr << "ERROR: " << err << dendl;
+    return -EINVAL;
+  }
 
   cuObjRDMATunable params;
   params.setNumDcis(num_dcis);

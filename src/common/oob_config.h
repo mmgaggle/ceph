@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <charconv>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 #include "common/rdma_token.h"
 
@@ -89,5 +91,37 @@ ceph::rdma::oob_transports read_transports(CephContext* cct);
 
 /// oob_memory
 uint64_t memory(CephContext* cct);
+
+/**
+ * Parse a cuobj_dc_key value: hexadecimal after 0x, as cufile.json
+ * gives rdma_dc_key, else decimal. Returns false when it is neither, or
+ * does not fit in 64 bits. Inline because the option's validator calls
+ * it too, and crimson builds the options without oob_config.cc.
+ */
+inline bool parse_dc_key(std::string_view v, uint64_t* key)
+{
+  // not strtoull(), which takes a sign and leading space, and in base 0
+  // reads a leading 0 as octal
+  int base = 10;
+  if (v.size() > 2 && v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) {
+    v.remove_prefix(2);
+    base = 16;
+  }
+  uint64_t k = 0;
+  const auto [end, ec] =
+    std::from_chars(v.data(), v.data() + v.size(), k, base);
+  if (v.empty() || ec != std::errc{} || end != v.data() + v.size()) {
+    return false;
+  }
+  *key = k;
+  return true;
+}
+
+/**
+ * cuobj_dc_key, the key of every cuObject DC initiator and target.
+ * Returns 0, or -EINVAL with *err when parse_dc_key() cannot read it,
+ * which the option's validator should prevent.
+ */
+int dc_key(CephContext* cct, uint64_t* key, std::string* err);
 
 } // namespace ceph::oob

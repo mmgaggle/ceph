@@ -392,4 +392,15 @@ uint64_t memory(CephContext* cct)
   return cct->_conf.get_val<Option::size_t>("oob_memory");
 }
 
+int dc_key(CephContext* cct, uint64_t* key, std::string* err)
+{
+  const auto s = cct->_conf.get_val<std::string>("cuobj_dc_key");
+  if (!parse_dc_key(s, key)) {
+    *err = "cuobj_dc_key '" + s + "' is not a 64-bit key in hexadecimal "
+      "after 0x, such as 0xffeeddcc, or in decimal";
+    return -EINVAL;
+  }
+  return 0;
+}
+
 } // namespace ceph::oob

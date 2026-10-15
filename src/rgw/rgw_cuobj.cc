@@ -81,9 +81,15 @@ int RGWCuObjServer::do_init(CephContext* cct)
   // on one thread can write to the client from any other
   m_num_dcis = std::max<int>(MIN_DCIS, cct->_conf->rgw_thread_pool_size);
 
+  uint64_t dc_key = 0;
+  if (int r = ceph::oob::dc_key(cct, &dc_key, &err); r < 0) {
+    lderr(cct) << "rgw_cuobj: ERROR: " << err << dendl;
+    return r;
+  }
+
   cuObjRDMATunable params;
   params.setNumDcis(m_num_dcis);
-  params.setDcKey(cct->_conf.get_val<uint64_t>("cuobj_dc_key"));
+  params.setDcKey(dc_key);
 
   ldout(cct, 1) << "rgw_cuobj: initializing cuObjServer on "
                 << rdma_ip << ":" << rdma_port

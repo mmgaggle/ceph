@@ -6,10 +6,13 @@
 #include "common/oob_config.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <utility>
 
 #include <net/if.h>
 #include <unistd.h>
@@ -383,6 +386,57 @@ TEST(OobConfig, ResolveRejectsMalformedNetworks)
   if (r == 0) {
     // the loopback is up
     EXPECT_EQ("127.0.0.1", loc.addr);
+  }
+}
+
+// cuobj_dc_key is hexadecimal after 0x, as cufile.json gives rdma_dc_key,
+// or decimal. The option's validator rejects anything else when it is
+// set, as it does for `ceph config set`, and the key stays as it was.
+TEST(OobConfig, DcKey)
+{
+  boost::intrusive_ptr<CephContext> cct{
+    new CephContext(CEPH_ENTITY_TYPE_OSD), false};
+  cct->_conf._clear_safe_to_start_threads();  // so we can set configs
+  uint64_t key = 0;
+  std::string err;
+  // the default is the client library's
+  EXPECT_EQ(0, ceph::oob::dc_key(cct.get(), &key, &err)) << err;
+  EXPECT_EQ(0xffeeddccull, key);
+  const std::pair<const char*, uint64_t> good[] = {
+    {"0x11223344", 0x11223344}, {"0X11223344", 0x11223344},
+    {"0xFFEEDDCC", 0xffeeddcc}, {"4293844428", 0xffeeddcc},
+    {"0", 0}, {"0x0", 0},
+    // decimal, not octal
+    {"010", 10},
+    {"0xffffffffffffffff", UINT64_MAX},
+    {"18446744073709551615", UINT64_MAX},
+  };
+  for (const auto& [val, want] : good) {
+    key = 1;
+    EXPECT_TRUE(ceph::oob::parse_dc_key(val, &key)) << val;
+    EXPECT_EQ(want, key) << val;
+    ASSERT_EQ(0, cct->_conf.set_val("cuobj_dc_key", val)) << val;
+    key = 1;
+    err.clear();
+    EXPECT_EQ(0, ceph::oob::dc_key(cct.get(), &key, &err))
+      << val << ": " << err;
+    EXPECT_EQ(want, key) << val;
+  }
+  ASSERT_EQ(0, cct->_conf.set_val("cuobj_dc_key", "0x11223344"));
+  for (const char* bad : {"", "0x", "x10", "ffeeddcc", "0xffeeddcg",
+			  "-1", "+1", " 1", "1 ", "0x-1", "0x 1", "0x0x1",
+			  "1K", "0x10000000000000000",
+			  "18446744073709551616"}) {
+    key = 7;
+    EXPECT_FALSE(ceph::oob::parse_dc_key(bad, &key)) << bad;
+    EXPECT_EQ(7u, key) << bad;
+    std::stringstream ss;
+    EXPECT_EQ(-EINVAL, cct->_conf.set_val("cuobj_dc_key", bad, &ss)) << bad;
+    EXPECT_NE(std::string::npos, ss.str().find("0xffeeddcc")) << ss.str();
+    err.clear();
+    EXPECT_EQ(0, ceph::oob::dc_key(cct.get(), &key, &err))
+      << bad << ": " << err;
+    EXPECT_EQ(0x11223344u, key) << bad;
   }
 }
 

@@ -200,8 +200,10 @@ int Service::do_init(CephContext* c)
 #ifdef HAVE_MLX5DV
     if (oob.cluster_cuobj()) {
       auto target = std::make_unique<dc::Target>();
-      const auto dc_key = conf.get_val<uint64_t>("cuobj_dc_key");
-      if (int r = target->open(cct, dev, dc_key); r == 0) {
+      uint64_t dc_key = 0;
+      if (ceph::oob::dc_key(cct, &dc_key, &err) < 0) {
+        lderr(cct) << "rgw_rdma_rc: " << err << dendl;
+      } else if (int r = target->open(cct, dev, dc_key); r == 0) {
         dct = std::move(target);
       } else {
         ldout(cct, 1) << "rgw_rdma_rc: DC target unavailable ("

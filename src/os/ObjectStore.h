@@ -30,6 +30,7 @@
 
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <functional>
 #include <map>
 #include <memory>
@@ -490,6 +491,49 @@ public:
      size_t len,
      ceph::buffer::list& bl,
      uint32_t op_flags = 0) = 0;
+
+  /**
+   * read_into -- read a byte range of data into the caller's memory
+   *
+   * As read(), but the data lands in iov, which must hold at least len
+   * bytes, instead of in buffers of the store's. A store that reads from
+   * a block device can read straight into iov, so that the data is not
+   * copied: memory that a transport registered, for example. The bytes
+   * of iov past the ones read are left as they were.
+   *
+   * This default reads into a ceph::buffer::list and copies it into iov.
+   *
+   * @param iov the caller's memory, iovcnt segments
+   * @returns number of bytes read on success, or negative error code on
+   * failure, as read() does; -EINVAL when iov holds fewer than len bytes.
+   */
+   virtual int read_into(
+     CollectionHandle &c,
+     const ghobject_t& oid,
+     uint64_t offset,
+     size_t len,
+     const struct iovec* iov,
+     int iovcnt,
+     uint32_t op_flags = 0) {
+     size_t room = 0;
+     for (int i = 0; i < iovcnt; i++) {
+       room += iov[i].iov_len;
+     }
+     if (room < len) {
+       return -EINVAL;
+     }
+     ceph::buffer::list bl;
+     int r = read(c, oid, offset, len, bl, op_flags);
+     if (r <= 0) {
+       return r;
+     }
+     auto it = bl.cbegin();
+     for (int i = 0; i < iovcnt && it.get_remaining(); i++) {
+       const unsigned n = std::min<size_t>(iov[i].iov_len, it.get_remaining());
+       it.copy(n, static_cast<char*>(iov[i].iov_base));
+     }
+     return r;
+   }
 
   /**
    * fiemap -- get extent std::map of data of an object

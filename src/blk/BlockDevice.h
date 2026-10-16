@@ -291,6 +291,20 @@ public:
     uint64_t len,
     ceph::buffer::list *pbl,
     IOContext *ioc) = 0;
+  /// true when aio_read_into() reads straight into the caller's memory
+  virtual bool supports_read_into() const { return false; }
+  /**
+   * As aio_read(), but into len bytes at buf, which the caller owns and
+   * keeps until the read completes. buf must be aligned to the block
+   * size. -EOPNOTSUPP when the device cannot (see supports_read_into()).
+   */
+  virtual int aio_read_into(
+    uint64_t off,
+    uint64_t len,
+    char *buf,
+    IOContext *ioc) {
+    return -EOPNOTSUPP;
+  }
   virtual int aio_write(
     uint64_t off,
     ceph::buffer::list& bl,

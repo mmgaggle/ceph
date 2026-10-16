@@ -1507,6 +1507,47 @@ int KernelDevice::aio_read(
   return r;
 }
 
+bool KernelDevice::supports_read_into() const
+{
+#ifdef HAVE_LIBAIO
+  return aio && dio;
+#else
+  return false;
+#endif
+}
+
+int KernelDevice::aio_read_into(
+  uint64_t off,
+  uint64_t len,
+  char *buf,
+  IOContext *ioc)
+{
+  dout(5) << __func__ << " 0x" << std::hex << off << "~" << len
+	  << " into " << (void*)buf << std::dec << dendl;
+#ifdef HAVE_LIBAIO
+  if (aio && dio) {
+    ceph_assert(is_valid_io(off, len));
+    // O_DIRECT reads into the caller's memory: it must be aligned as the
+    // device's buffers are
+    if (reinterpret_cast<uintptr_t>(buf) % block_size) {
+      return -EINVAL;
+    }
+    _aio_log_start(ioc, off, len);
+    ioc->pending_aios.push_back(aio_t(ioc, fd_directs[WRITE_LIFE_NOT_SET]));
+    ++ioc->num_pending;
+    aio_t& aio = ioc->pending_aios.back();
+    // a static buffer: the memory stays the caller's
+    aio.bl.push_back(
+      ceph::buffer::ptr_node::create(ceph::buffer::create_static(len, buf)));
+    aio.bl.prepare_iov(&aio.iov);
+    aio.preadv(off, len);
+    dout(30) << aio << dendl;
+    return 0;
+  }
+#endif
+  return -EOPNOTSUPP;
+}
+
 int KernelDevice::direct_read_unaligned(uint64_t off, uint64_t len, char *buf)
 {
   uint64_t aligned_off = p2align(off, block_size);

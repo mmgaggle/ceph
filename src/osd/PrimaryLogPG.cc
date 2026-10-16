@@ -64,6 +64,8 @@
 #include "PG.h"
 #include "Session.h"
 #ifdef HAVE_OSD_OOB_DELIVERY
+#include "common/deleter.h"
+#include "common/oob_arena.h"
 #include "oob_executor.h"
 #include "osd/oob_placement.h"
 #include "osd/oob_pull.h"
@@ -6125,8 +6127,24 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
       maybe_crc = oi.data_digest;
 
     if (ctx->op->ec_direct_read()) {
-      int r = pgbackend->objects_read_local(
-        soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata);
+      int r = -EOPNOTSUPP;
+#ifdef HAVE_OSD_OOB_DELIVERY
+      uint32_t flags = op.flags;
+      if (auto buf = oob_direct_read_buffer(ctx, osd_op, op.extent.length,
+					    &flags); buf) {
+        struct iovec iov{buf->c_str(), buf->length()};
+        r = pgbackend->objects_read_local_into(
+          soid, op.extent.offset, op.extent.length, flags, &iov, 1);
+        if (r >= 0) {
+          osd_op.outdata.clear();
+          osd_op.outdata.append(*buf, 0, r);
+        }
+      }
+#endif
+      if (r == -EOPNOTSUPP) {
+        r = pgbackend->objects_read_local(
+          soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata);
+      }
       if (r >= 0) {
         bytes_read = r;
         // Don't update op.extent.length - causes issues with recursive
@@ -6161,9 +6179,27 @@ int PrimaryLogPG::do_read(OpContext *ctx, OSDOp& osd_op) {
       bytes_read = op.extent.length;
     }
   } else {
-    int r = pgbackend->objects_read_sync(
-      soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata,
-      oi.size, ctx->op->coro_handles);
+    int r = -EOPNOTSUPP;
+#ifdef HAVE_OSD_OOB_DELIVERY
+    // an out-of-band read: straight into the memory the transport writes
+    // it from (osd_oob_direct_read)
+    uint32_t flags = op.flags;
+    if (auto buf = oob_direct_read_buffer(ctx, osd_op, op.extent.length,
+					  &flags); buf) {
+      struct iovec iov{buf->c_str(), buf->length()};
+      r = pgbackend->objects_read_local_into(
+	soid, op.extent.offset, op.extent.length, flags, &iov, 1);
+      if (r >= 0) {
+	osd_op.outdata.clear();
+	osd_op.outdata.append(*buf, 0, r);
+      }
+    }
+#endif
+    if (r == -EOPNOTSUPP) {
+      r = pgbackend->objects_read_sync(
+	soid, op.extent.offset, op.extent.length, op.flags, &osd_op.outdata,
+	oi.size, ctx->op->coro_handles);
+    }
     // whole object?  can we verify the checksum?
     if (r >= 0 && op.extent.offset == 0 &&
         (uint64_t)r == oi.size && oi.is_data_digest()) {
@@ -9550,6 +9586,48 @@ void PrimaryLogPG::apply_stats(
 }
 
 #ifdef HAVE_OSD_OOB_DELIVERY
+std::optional<ceph::buffer::ptr> PrimaryLogPG::oob_direct_read_buffer(
+  OpContext *ctx, const OSDOp& osd_op, uint64_t len, uint32_t* op_flags)
+{
+  const auto mode = cct->_conf.get_val<std::string>("osd_oob_direct_read");
+  if (mode == "off" || len == 0 || osd_op.op.op != CEPH_OSD_OP_READ) {
+    return std::nullopt;
+  }
+  auto m = ctx->op->get_req<MOSDOp>();
+  if (!m->has_rdma_delivery() || !ctx->ops) {
+    return std::nullopt;
+  }
+  // only an op of the request itself: a CHECKSUM, say, reads through a
+  // temporary op of its own
+  const auto& ops = *ctx->ops;
+  if (ops.empty() || &osd_op < ops.data() || &osd_op >= ops.data() + ops.size()) {
+    return std::nullopt;
+  }
+  const size_t idx = &osd_op - ops.data();
+  const auto& deliveries = m->get_rdma_deliveries();
+  if (deliveries.size() != ops.size() || deliveries[idx].empty()) {
+    return std::nullopt;
+  }
+  ceph::oob::Arena* arena = osd->oob_arena.get();
+  OSDOobExecutor* exec = osd->oob_executor_for(deliveries[idx].token);
+  if (!arena || !exec || !exec->stages_from_arena()) {
+    return std::nullopt;
+  }
+  // none free, or more than one buffer can hold: read as usual
+  const auto s = arena->alloc_shared(len);
+  if (!s) {
+    return std::nullopt;
+  }
+  if (mode == "nocache") {
+    *op_flags |= CEPH_OSD_OP_FLAG_FADVISE_NOCACHE;
+  }
+  dout(20) << __func__ << " " << len << " bytes of op " << idx
+	   << " into arena buffer 0x" << std::hex << s.offset << "~" << s.len
+	   << std::dec << dendl;
+  return ceph::buffer::ptr(ceph::buffer::claim_buffer(
+    len, arena->ptr(s), make_deleter([arena, s] { arena->free(s); })));
+}
+
 std::vector<ceph::osd::oob::read_push> PrimaryLogPG::deliver_oob_prepare(
   OpContext *ctx, const std::vector<OSDOp>& rops,
   std::vector<ceph::rdma::oob_result_t>& oob)

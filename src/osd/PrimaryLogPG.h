@@ -1354,6 +1354,16 @@ protected:
     OpContext *ctx, const std::vector<OSDOp>& rops,
     std::vector<ceph::rdma::oob_result_t>& oob);
   /**
+   * A shared buffer of the OSD's arena of len bytes to read osd_op's data
+   * straight into, when osd_oob_direct_read asks for it and the op is
+   * a READ that carries a delivery descriptor whose executor writes from
+   * the arena in place; nullopt otherwise, or when no buffer is free.
+   * The buffer's ptr holds one reference: whatever holds the data holds
+   * the buffer. *op_flags gets FADVISE_NOCACHE under nocache.
+   */
+  std::optional<ceph::buffer::ptr> oob_direct_read_buffer(
+    OpContext *ctx, const OSDOp& osd_op, uint64_t len, uint32_t* op_flags);
+  /**
    * Run the pushes deliver_oob_prepare() returned, send the reply, with
    * rops and oob back in it, once every push is over, and close ctx. A
    * push that placed its op's data strips it from the op, and each

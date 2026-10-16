@@ -1767,6 +1767,35 @@ options:
   - osd_oob_cuobj_transfer_threads
   flags:
   - startup
+- name: osd_oob_direct_read
+  type: str
+  level: advanced
+  desc: Read the data of a read that goes out of band straight from disk
+    into the memory the transport writes it from
+  long_desc: A read that a client asked to have placed in its memory
+    (OSD-direct) is usually read into the object store's buffers, and the
+    transport then copies it into the memory it registered (oob_memory)
+    before it writes it to the client. With cached or nocache, the OSD
+    reads such a read straight into a buffer of that memory, when the
+    transport can write from there (libfabric delivery), and nothing
+    copies the data on the way out. BlueStore reads what the device holds
+    straight into the buffer, and copies only what it has in its cache,
+    what is compressed, and the ends of a read that do not fall on its
+    block boundaries. With cached, BlueStore keeps a copy of what it read
+    in its cache, as it does for any read. With nocache, it does not, so
+    that a cold read is not copied at all. Replicated pools, and the
+    shard reads of erasure-coded pools that clients read directly.
+  default: 'off'
+  enum_values:
+  - 'off'
+  - cached
+  - nocache
+  services:
+  - osd
+  see_also:
+  - oob_memory
+  flags:
+  - runtime
 - name: osd_oob_transfer_queue_max
   type: uint
   level: advanced

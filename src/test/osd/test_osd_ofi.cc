@@ -6,12 +6,15 @@
 #include <atomic>
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "common/JSONFormatter.h"
 #include "common/ceph_context.h"
+#include "common/deleter.h"
 #include "common/config.h"
 #include "global/global_context.h"
 #include "common/ofi_rma.h"
@@ -244,6 +247,75 @@ TEST(OSDOfi, PullsAWritePayload)
   EXPECT_FALSE(started_huge);
   EXPECT_EQ(0u, big.length());
   EXPECT_TRUE(ofi.is_available());
+}
+
+// Data read straight into a shared buffer of the arena (osd_oob_direct_read)
+// is written from there with no copy into staging, and the buffer goes
+// back to the arena only once the bufferlist and the write both let go of
+// it. Data anywhere else is copied, as always.
+TEST(OSDOfi, WritesFromASharedArenaBufferInPlace)
+{
+  if (!tcp_available()) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  auto a = arena(1);
+  OSDOfi ofi(g_ceph_context, nullptr);
+  ASSERT_EQ(0, ofi.init("tcp", loopback(), false, a.get()));
+  EXPECT_TRUE(ofi.stages_from_arena());
+  auto c = lend(WINDOW, ceph::ofi::Endpoint::remote_write);
+  ASSERT_TRUE(c.ep);
+  ASSERT_FALSE(c.token.empty()) << c.ep->last_error();
+  std::fill(c.mem.begin(), c.mem.end(), 0);
+
+  // as the PG builds it: a shared buffer, which the bufferlist holds
+  const uint64_t n = 3 << 20;
+  const auto s = a->alloc_shared(n);
+  ASSERT_TRUE(s);
+  char* p = a->ptr(s);
+  for (uint64_t i = 0; i < n; i++) {
+    p[i] = static_cast<char>(i * 13 + 1);
+  }
+  ceph::buffer::list data;
+  {
+    auto* ar = a.get();
+    // a slice of it, past its first page, as a read can land
+    ceph::buffer::ptr whole(ceph::buffer::claim_buffer(
+      n, p, make_deleter([ar, s] { ar->free(s); })));
+    data.append(whole, 4096, n - 4096);
+  }
+  const uint64_t m = n - 4096;
+  bool started = false;
+  ASSERT_EQ(ssize_t(m), ofi.execute_plan(
+    "obj", c.token, data, ceph::osd::oob::linear_plan(1000, m),
+    std::chrono::seconds(5), &started));
+  EXPECT_TRUE(started);
+  c.ep->sync();
+  EXPECT_EQ(0, memcmp(c.mem.data() + 1000, p + 4096, m));
+  // the write gave its reference back; the bufferlist still holds one
+  EXPECT_EQ(s.len, a->stats().in_use);
+  data.clear();
+  EXPECT_EQ(0u, a->stats().in_use);
+
+  // a payload of the heap is copied through staging, as before
+  ceph::buffer::list heap;
+  heap.append(std::string(8192, 'z'));
+  ASSERT_EQ(8192, ofi.execute_plan(
+    "obj", c.token, heap, ceph::osd::oob::linear_plan(0, 8192),
+    std::chrono::seconds(5), nullptr));
+  c.ep->sync();
+  EXPECT_EQ(std::string(8192, 'z'), std::string(c.mem.data(), 8192));
+  EXPECT_EQ(0u, a->stats().in_use);
+
+  ceph::JSONFormatter f;
+  f.open_object_section("s");
+  ofi.dump_stats(&f);
+  f.close_section();
+  std::ostringstream os;
+  f.flush(os);
+  EXPECT_NE(std::string::npos, os.str().find("\"plans_staged\":1"))
+    << os.str();
+  EXPECT_NE(std::string::npos, os.str().find("\"bytes_staged\":" +
+					     std::to_string(m))) << os.str();
 }
 
 // The executor reads osd_oob_cutoff_policy when it opens its endpoint,

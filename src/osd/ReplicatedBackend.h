@@ -193,6 +193,14 @@ public:
    uint32_t op_flags,
    ceph::buffer::list *bl) override;
 
+  int objects_read_local_into(
+   const hobject_t &hoid,
+   uint64_t off,
+   uint64_t len,
+   uint32_t op_flags,
+   const struct iovec *iov,
+   int iovcnt) override;
+
   int objects_readv_sync(
     const hobject_t &hoid,
     std::map<uint64_t, uint64_t>& m,

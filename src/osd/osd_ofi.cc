@@ -264,6 +264,11 @@ void OSDOfi::check_past_tolerance()
   }
 }
 
+bool OSDOfi::stages_from_arena() const
+{
+  return arena && is_available();
+}
+
 bool OSDOfi::handles(const std::string& token) const
 {
   if (!is_available()) {
@@ -289,20 +294,46 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
   if (!ep || !t) {
     return -EINVAL;
   }
-  std::vector<struct iovec> iov;
-  iov.reserve(data.get_num_buffers());
-  for (const auto& b : data.buffers()) {
-    if (b.length()) {
-      iov.push_back({const_cast<char*>(b.c_str()), b.length()});
-    }
-  }
   std::vector<ceph::ofi::Endpoint::write_t> writes;
   writes.reserve(plan.size());
   for (const auto& tr : plan) {
     writes.push_back({tr.local_ofs, tr.len, tr.client_ofs});
   }
   plans_started++;
-  const int r = ep->write(*t, iov.data(), iov.size(), writes, budget, started);
+  int r = 0;
+  bool staged = false;
+  // data that the PG read straight into a shared buffer of the arena
+  // (osd_oob_direct_read) is written from there, with no copy into
+  // staging. The write takes a reference of its own, which the endpoint
+  // gives back once nothing can touch the buffer any more.
+  ceph::oob::Arena::slice_t s;
+  if (arena && data.get_num_buffers() == 1 && data.length() &&
+      arena->hold(data.front().c_str(), data.length(), &s)) {
+    const uint64_t delta = data.front().c_str() - arena->ptr(s);
+    for (auto& w : writes) {
+      w.src_ofs += delta;
+    }
+    r = ep->write_staged(*t, s.offset, s.len, writes, budget, started);
+    if (r == -EOPNOTSUPP || r == -EFAULT) {
+      // refused without taking the buffer: copy it, as any other
+      arena->free(s);
+      for (auto& w : writes) {
+	w.src_ofs -= delta;
+      }
+    } else {
+      staged = true;
+    }
+  }
+  if (!staged) {
+    std::vector<struct iovec> iov;
+    iov.reserve(data.get_num_buffers());
+    for (const auto& b : data.buffers()) {
+      if (b.length()) {
+	iov.push_back({const_cast<char*>(b.c_str()), b.length()});
+      }
+    }
+    r = ep->write(*t, iov.data(), iov.size(), writes, budget, started);
+  }
   if (r == -ENOTRECOVERABLE || ep->unsafe()) {
     check_unsafe();
   } else if (r == -ETIMEDOUT) {
@@ -320,6 +351,10 @@ ssize_t OSDOfi::execute_plan(const std::string& key,
   }
   plans_completed++;
   bytes_pushed += data.length();
+  if (staged) {
+    plans_staged++;
+    bytes_staged += data.length();
+  }
   dout(20) << "placed " << data.length() << " bytes of " << key << " in "
 	   << plan.size() << " range(s)" << dendl;
   return static_cast<ssize_t>(data.length());
@@ -449,6 +484,8 @@ void OSDOfi::dump_stats(ceph::Formatter* f) const
   f->dump_unsigned("plans_completed", plans_completed);
   f->dump_unsigned("plans_failed", plans_failed);
   f->dump_unsigned("bytes_pushed", bytes_pushed);
+  f->dump_unsigned("plans_staged", plans_staged);
+  f->dump_unsigned("bytes_staged", bytes_staged);
   f->dump_bool("pulls", ep->reads());
   f->dump_unsigned("pulls_started", pulls_started);
   f->dump_unsigned("pulls_completed", pulls_completed);

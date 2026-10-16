@@ -1495,6 +1495,23 @@ int ECBackend::objects_read_local(
           shard_len, *bl, op_flags);
 }
 
+int ECBackend::objects_read_local_into(
+    const hobject_t &hoid,
+    uint64_t off,
+    uint64_t len,
+    uint32_t op_flags,
+    const struct iovec *iov,
+    int iovcnt) {
+  if (!sinfo.supports_direct_reads()) {
+    return -EOPNOTSUPP;
+  }
+  ceph_assert(!get_parent()->get_local_missing().is_missing(hoid));
+  auto [shard_offset, shard_len] = extent_to_shard_extent(off, len);
+  return switcher->store->read_into(switcher->ch,
+          ghobject_t(hoid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
+          shard_offset, shard_len, iov, iovcnt, op_flags);
+}
+
 std::pair<uint64_t, uint64_t> ECBackend::extent_to_shard_extent(uint64_t off, uint64_t len) {
   // sync reads are supported for sub-chunk reads where no reconstruct is
   // required.

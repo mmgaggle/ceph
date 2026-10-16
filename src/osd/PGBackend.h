@@ -658,6 +658,18 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
       uint32_t op_flags,
       ceph::buffer::list *bl) = 0;
 
+   /// objects_read_local(), into the caller's memory (see
+   /// ObjectStore::read_into()); -EOPNOTSUPP where the backend cannot
+   virtual int objects_read_local_into(
+      const hobject_t &hoid,
+      uint64_t off,
+      uint64_t len,
+      uint32_t op_flags,
+      const struct iovec *iov,
+      int iovcnt) {
+     return -EOPNOTSUPP;
+   }
+
    virtual int objects_readv_sync(
      const hobject_t &hoid,
      std::map<uint64_t, uint64_t>& m,

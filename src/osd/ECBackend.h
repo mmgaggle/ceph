@@ -162,6 +162,15 @@ class ECBackend : public ECCommon {
     ceph::buffer::list *bl
   );
 
+  int objects_read_local_into(
+    const hobject_t &hoid,
+    uint64_t off,
+    uint64_t len,
+    uint32_t op_flags,
+    const struct iovec *iov,
+    int iovcnt
+  );
+
   std::pair<uint64_t, uint64_t> extent_to_shard_extent(uint64_t off, uint64_t len);
 
   int objects_readv_sync(const hobject_t &hoid,

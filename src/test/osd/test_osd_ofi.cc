@@ -318,6 +318,90 @@ TEST(OSDOfi, WritesFromASharedArenaBufferInPlace)
 					     std::to_string(m))) << os.str();
 }
 
+// An EC primary that gathered a read leaves the data in more than one
+// shared buffer of the arena: its own shard's, read there from disk, and
+// what it took there from each peer's window. The bufferlist interleaves
+// them a chunk at a time, in object order, and the plan is written from
+// both buffers where they are.
+TEST(OSDOfi, WritesFromSeveralArenaBuffersInPlace)
+{
+  if (!tcp_available()) {
+    GTEST_SKIP() << "tcp is not available";
+  }
+  auto a = arena(1);
+  OSDOfi ofi(g_ceph_context, nullptr);
+  ASSERT_EQ(0, ofi.init("tcp", loopback(), false, a.get()));
+  auto c = lend(WINDOW, ceph::ofi::Endpoint::remote_write);
+  ASSERT_TRUE(c.ep);
+  ASSERT_FALSE(c.token.empty()) << c.ep->last_error();
+  std::fill(c.mem.begin(), c.mem.end(), 0);
+
+  const uint64_t chunk = 4096, chunks = 256;
+  auto shard = [&](char seed) {
+    auto bp = a->alloc_shared_ptr(chunk * chunks);
+    for (uint64_t i = 0; i < bp.length(); i++) {
+      bp.c_str()[i] = static_cast<char>(seed + i * 7);
+    }
+    return bp;
+  };
+  ceph::buffer::list data;
+  std::string want;
+  {
+    auto s0 = shard(1), s1 = shard(50);
+    ASSERT_TRUE(s0.length() && s1.length());
+    for (uint64_t k = 0; k < chunks; k++) {
+      for (auto* sp : {&s0, &s1}) {
+	data.append(*sp, k * chunk, chunk);
+	want.append(sp->c_str() + k * chunk, chunk);
+      }
+    }
+  }
+  const uint64_t n = data.length();
+  ASSERT_EQ(2 * chunk * chunks, n);
+  ASSERT_EQ(2 * chunks, data.get_num_buffers());
+  bool started = false;
+  ASSERT_EQ(ssize_t(n), ofi.execute_plan(
+    "obj", c.token, data, ceph::osd::oob::linear_plan(1000, n),
+    std::chrono::seconds(5), &started));
+  EXPECT_TRUE(started);
+  c.ep->sync();
+  EXPECT_EQ(0, memcmp(c.mem.data() + 1000, want.data(), n));
+  // the writes gave their references back; the bufferlist holds the rest
+  EXPECT_EQ(2 * ceph::oob::Arena::round(chunk * chunks), a->stats().in_use);
+  data.clear();
+  EXPECT_EQ(0u, a->stats().in_use);
+
+  // one chunk of the heap among them: all of it goes through staging
+  {
+    auto s0 = shard(9);
+    ASSERT_TRUE(s0.length());
+    data.append(s0, 0, chunk);
+    data.append(std::string(chunk, 'h'));
+    data.append(s0, chunk, chunk);
+  }
+  std::fill(c.mem.begin(), c.mem.end(), 0);
+  ASSERT_EQ(ssize_t(3 * chunk), ofi.execute_plan(
+    "obj", c.token, data, ceph::osd::oob::linear_plan(0, 3 * chunk),
+    std::chrono::seconds(5), nullptr));
+  c.ep->sync();
+  std::string got(c.mem.data(), 3 * chunk);
+  EXPECT_EQ(std::string(chunk, 'h'), got.substr(chunk, chunk));
+  EXPECT_EQ(0, memcmp(got.data(), data.c_str(), 3 * chunk));
+  data.clear();
+  EXPECT_EQ(0u, a->stats().in_use);
+
+  ceph::JSONFormatter f;
+  f.open_object_section("s");
+  ofi.dump_stats(&f);
+  f.close_section();
+  std::ostringstream os;
+  f.flush(os);
+  EXPECT_NE(std::string::npos, os.str().find("\"plans_staged\":1,"))
+    << os.str();
+  EXPECT_NE(std::string::npos, os.str().find("\"bytes_staged\":" +
+					     std::to_string(n))) << os.str();
+}
+
 // The executor reads osd_oob_cutoff_policy when it opens its endpoint,
 // which judges a late cut-off by it from then on: a change at runtime
 // would apply only in part, so a running daemon refuses one. One stored

@@ -3,6 +3,7 @@
 
 #include "common/oob_arena.h"
 #include "common/Formatter.h"
+#include "common/deleter.h"
 
 #include <algorithm>
 #include <bit>
@@ -120,6 +121,16 @@ Arena::slice_t Arena::alloc_shared(uint64_t len)
     shared_[s.offset] = shared_t{s.len, 1};
   }
   return s;
+}
+
+ceph::buffer::ptr Arena::alloc_shared_ptr(uint64_t len)
+{
+  const auto s = alloc_shared(len);
+  if (!s) {
+    return {};
+  }
+  return ceph::buffer::ptr(ceph::buffer::claim_buffer(
+    len, ptr(s), make_deleter([this, s] { free(s); })));
 }
 
 bool Arena::hold(const char* p, uint64_t n, slice_t* s)

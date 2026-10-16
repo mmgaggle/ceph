@@ -11,6 +11,8 @@
 #include <set>
 #include <string>
 
+#include "include/buffer.h"
+
 namespace ceph { class Formatter; }
 
 namespace ceph::oob {
@@ -71,6 +73,10 @@ public:
   /// at p, and say which buffer that is; false when no shared buffer
   /// holds all of them
   bool hold(const char* p, uint64_t n, slice_t* s);
+  /// alloc_shared(len) as a buffer::ptr of len bytes, which gives the
+  /// caller's reference back when the last bufferlist that holds it lets
+  /// go; an empty ptr when no buffer is free
+  ceph::buffer::ptr alloc_shared_ptr(uint64_t len);
 
   /// len bytes, rounded up to whole blocks of MAX, in one run, taken for
   /// the arena's life; null when no such run is free, or when it would

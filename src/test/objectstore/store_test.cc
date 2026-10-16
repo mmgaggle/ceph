@@ -1573,6 +1573,130 @@ TEST_P(StoreTest, CompressionTest) {
   doCompressionTest();
 }
 
+// read_into() lands exactly what read() returns in the caller's memory,
+// and touches none of it past the bytes read: aligned and unaligned
+// ranges, a destination of several segments, holes, a short read at the
+// end, cache hits and, on BlueStore, compressed blobs. BlueStore reads
+// what is not cached straight into the caller's memory.
+TEST_P(StoreTest, ReadIntoCallerMemory) {
+  int r;
+  coll_t cid;
+  ghobject_t hoid(hobject_t(sobject_t("read_into", CEPH_NOSNAP)));
+  ghobject_t sparse(hobject_t(sobject_t("read_into_sparse", CEPH_NOSNAP)));
+  ghobject_t packed(hobject_t(sobject_t("read_into_compressed", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  const size_t size = (1 << 20) + 12345;
+  const uint32_t nocache = CEPH_OSD_OP_FLAG_FADVISE_NOCACHE;
+  {
+    std::string s(size, 0);
+    for (size_t i = 0; i < size; i++) {
+      s[i] = static_cast<char>(i * 31 + i / 4096);
+    }
+    bufferlist data, a, b;
+    data.append(s);
+    a.append(std::string(65536, 'a'));
+    b.append(std::string(65536, 'b'));
+    ObjectStore::Transaction t;
+    t.write(cid, hoid, 0, size, data, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    // data, a hole, data
+    t.write(cid, sparse, 0, 65536, a, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    t.write(cid, sparse, 524288, 65536, b, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  // aligned memory, filled with a guard pattern before each read
+  const size_t cap = 2 << 20;
+  void* raw = nullptr;
+  ASSERT_EQ(0, posix_memalign(&raw, 4096, cap));
+  std::unique_ptr<char, decltype(&::free)> mem(static_cast<char*>(raw), ::free);
+  auto check = [&](const ghobject_t& oid, uint64_t off, size_t len,
+                   std::vector<size_t> segs, uint32_t flags) {
+    memset(mem.get(), 0x5a, cap);
+    std::vector<iovec> iov;
+    size_t room = 0;
+    for (auto n : segs) {
+      iov.push_back({mem.get() + room, n});
+      room += n;
+    }
+    // read_into() first: read() can fill the cache
+    int ri = store->read_into(ch, oid, off, len, iov.data(), iov.size(), flags);
+    bufferlist want;
+    int rw = store->read(ch, oid, off, len, want, flags);
+    ASSERT_EQ(rw, ri) << oid << " " << off << "~" << len;
+    if (ri > 0) {
+      ASSERT_EQ(0, memcmp(mem.get(), want.c_str(), ri))
+        << oid << " " << off << "~" << len;
+    }
+    for (size_t i = ri > 0 ? ri : 0; i < room; i++) {
+      ASSERT_EQ(char(0x5a), mem.get()[i]) << "byte " << i << " was written";
+    }
+  };
+  check(hoid, 0, size, {cap}, nocache);         // the whole object
+  check(hoid, 4096, 65536, {cap}, nocache);     // aligned
+  check(hoid, 1000, 300000, {cap}, nocache);    // unaligned ends
+  check(hoid, 0, size, {4096 * 3 + 7, 65536, cap - 65536 - 4096 * 3 - 7},
+        nocache);                               // across segments
+  check(hoid, size - 100, 1000, {cap}, nocache);  // short at the end
+  check(sparse, 0, 640 * 1024, {cap}, nocache);   // the hole reads as zeros
+  {
+    // past the end: nothing; too little room: refused
+    iovec all{mem.get(), cap};
+    EXPECT_EQ(0, store->read_into(ch, hoid, size + 4096, 100, &all, 1));
+    iovec small{mem.get(), 10};
+    EXPECT_EQ(-EINVAL, store->read_into(ch, hoid, 0, 100, &small, 1));
+  }
+  // cache hits: the cache holds the object, read_into() copies from it
+  {
+    bufferlist warm;
+    ASSERT_EQ(int(size), store->read(ch, hoid, 0, size, warm,
+                                     CEPH_OSD_OP_FLAG_FADVISE_WILLNEED));
+    check(hoid, 0, size, {cap}, 0);
+    check(hoid, 1000, 300000, {cap}, 0);
+  }
+  if (string(GetParam()) == "bluestore") {
+    const PerfCounters* logger = store->get_perf_counters();
+    EXPECT_GT(logger->get(l_bluestore_read_into_direct_bytes), 0u);
+    EXPECT_GT(logger->get(l_bluestore_read_into_copied_bytes), 0u);
+    // a compressed blob is decompressed into the caller's memory
+    SetVal(g_conf(), "bluestore_compression_algorithm", "snappy");
+    SetVal(g_conf(), "bluestore_compression_mode", "force");
+    g_ceph_context->_conf.apply_changes(nullptr);
+    {
+      bufferlist data;
+      for (int i = 0; i < 64; i++) {
+        data.append(std::string(4096, char('A' + i % 26)));
+      }
+      const uint64_t before = logger->get(l_bluestore_compress_success_count);
+      ObjectStore::Transaction t;
+      t.write(cid, packed, 0, data.length(), data,
+              CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+      r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+      // the blob really is compressed (needs the compressor plugins)
+      ASSERT_GT(logger->get(l_bluestore_compress_success_count), before);
+    }
+    check(packed, 0, 64 * 4096, {cap}, nocache);
+    check(packed, 5000, 100000, {cap}, nocache);
+    SetVal(g_conf(), "bluestore_compression_mode", "none");
+    g_ceph_context->_conf.apply_changes(nullptr);
+  }
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, hoid);
+    t.remove(cid, sparse);
+    t.remove(cid, packed);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 TEST_P(StoreTest, SimpleObjectTest) {
   int r;
   coll_t cid;

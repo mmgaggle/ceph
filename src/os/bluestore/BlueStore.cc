@@ -6433,6 +6433,12 @@ void BlueStore::_init_logger()
   b.add_u64_counter(l_bluestore_reads_with_retries, "reads_with_retries",
                     "Read operations that required at least one retry due to failed checksum validation",
 		    "rd_r", PerfCountersBuilder::PRIO_USEFUL);
+  b.add_u64_counter(l_bluestore_read_into_direct_bytes, "read_into_direct_bytes",
+		    "Bytes read_into() read from the device straight into the caller's memory",
+		    nullptr, PerfCountersBuilder::PRIO_INTERESTING, unit_t(UNIT_BYTES));
+  b.add_u64_counter(l_bluestore_read_into_copied_bytes, "read_into_copied_bytes",
+		    "Bytes read_into() copied into the caller's memory: cache hits, compressed or unaligned extents",
+		    nullptr, PerfCountersBuilder::PRIO_INTERESTING, unit_t(UNIT_BYTES));
   b.add_time_avg(l_bluestore_read_lat, "read_lat",
 		 "Average read latency",
 		 "r_l", PerfCountersBuilder::PRIO_CRITICAL);
@@ -13300,6 +13306,378 @@ int BlueStore::_do_read(
     _set_spurious_read_errors_alert(s.str());
   }
   return r;
+}
+
+int BlueStore::read_into(
+  CollectionHandle &c_,
+  const ghobject_t& oid,
+  uint64_t offset,
+  size_t length,
+  const struct iovec* iov,
+  int iovcnt,
+  uint32_t op_flags)
+{
+  auto start = mono_clock::now();
+  Collection *c = static_cast<Collection *>(c_.get());
+  const coll_t &cid = c->get_cid();
+  dout(15) << __func__ << " " << cid << " " << oid
+	   << " 0x" << std::hex << offset << "~" << length << std::dec
+	   << dendl;
+  if (!c->exists)
+    return -ENOENT;
+
+  int r;
+  {
+    std::shared_lock l(c->lock);
+    OnodeRef o = c->get_onode(oid, false);
+    if (!o || !o->exists) {
+      r = -ENOENT;
+      goto out;
+    }
+    if (offset == length && offset == 0)
+      length = o->onode.size;
+    size_t room = 0;
+    for (int i = 0; i < iovcnt; i++) {
+      room += iov[i].iov_len;
+    }
+    if (room < length) {
+      r = -EINVAL;
+      goto out;
+    }
+    r = _do_read_into(c, o, offset, length, read_dest_t{iov, iovcnt},
+		      op_flags);
+    if (r == -EIO) {
+      logger->inc(l_bluestore_read_eio);
+    }
+  }
+
+ out:
+  if (r >= 0 && _debug_data_eio(oid)) {
+    r = -EIO;
+    derr << __func__ << " " << c->cid << " " << oid << " INJECT EIO" << dendl;
+  }
+  dout(10) << __func__ << " " << cid << " " << oid
+	   << " 0x" << std::hex << offset << "~" << length << std::dec
+	   << " = " << r << dendl;
+  log_latency(__func__,
+    l_bluestore_read_lat,
+    mono_clock::now() - start,
+    cct->_conf->bluestore_log_op_age);
+  return r;
+}
+
+char* BlueStore::read_dest_t::span(uint64_t pos, uint64_t n) const
+{
+  for (int i = 0; i < iovcnt; i++) {
+    if (pos < iov[i].iov_len) {
+      return n <= iov[i].iov_len - pos ?
+	static_cast<char*>(iov[i].iov_base) + pos : nullptr;
+    }
+    pos -= iov[i].iov_len;
+  }
+  return nullptr;
+}
+
+void BlueStore::read_dest_t::copy_in(uint64_t pos,
+				     const ceph::buffer::list& bl) const
+{
+  auto it = bl.cbegin();
+  for (int i = 0; i < iovcnt && it.get_remaining(); i++) {
+    if (pos >= iov[i].iov_len) {
+      pos -= iov[i].iov_len;
+      continue;
+    }
+    const unsigned n = std::min<uint64_t>(iov[i].iov_len - pos,
+					  it.get_remaining());
+    it.copy(n, static_cast<char*>(iov[i].iov_base) + pos);
+    pos = 0;
+  }
+}
+
+void BlueStore::read_dest_t::zero(uint64_t pos, uint64_t n) const
+{
+  for (int i = 0; i < iovcnt && n; i++) {
+    if (pos >= iov[i].iov_len) {
+      pos -= iov[i].iov_len;
+      continue;
+    }
+    const uint64_t k = std::min<uint64_t>(iov[i].iov_len - pos, n);
+    memset(static_cast<char*>(iov[i].iov_base) + pos, 0, k);
+    n -= k;
+    pos = 0;
+  }
+}
+
+char* BlueStore::_read_into_span(
+  const read_req_t& req,
+  uint64_t offset,
+  size_t length,
+  const read_dest_t& dst)
+{
+  if (req.regs.empty() || req.regs.front().front != 0) {
+    return nullptr;  // padded before the data: no room for it in dst
+  }
+  // the request must be one run of the object, from its first byte to
+  // its last: the regions follow each other in the object as in the
+  // blob, with no padding after them
+  const uint64_t first = req.regs.front().logical_offset;
+  uint64_t next = 0;
+  for (const auto& reg : req.regs) {
+    if (reg.front != next || reg.logical_offset != first + next) {
+      return nullptr;
+    }
+    next += reg.length;
+  }
+  if (next != req.r_len || first < offset ||
+      first + req.r_len > offset + length) {
+    return nullptr;
+  }
+  char* d = dst.span(first - offset, req.r_len);
+  if (!d || reinterpret_cast<uintptr_t>(d) % block_size ||
+      req.r_len % block_size) {
+    return nullptr;
+  }
+  return d;
+}
+
+int BlueStore::_prepare_read_into_ioc(
+  blobs2read_t& blobs2read,
+  vector<bufferlist>* compressed_blob_bls,
+  uint64_t offset,
+  size_t length,
+  const read_dest_t& dst,
+  IOContext* ioc,
+  uint64_t* direct_bytes)
+{
+  const bool can_direct = bdev->supports_read_into();
+  for (auto& p : blobs2read) {
+    const BlobRef& bptr = p.first;
+    regions2read_t& r2r = p.second;
+    dout(20) << __func__ << "  blob " << *bptr << " need "
+             << r2r << dendl;
+    if (bptr->get_blob().is_compressed()) {
+      // read the whole thing, and decompress it into dst later
+      if (compressed_blob_bls->empty()) {
+        compressed_blob_bls->reserve(blobs2read.size());
+      }
+      compressed_blob_bls->push_back(bufferlist());
+      bufferlist& bl = compressed_blob_bls->back();
+      auto r = bptr->get_blob().map(
+        0, bptr->get_blob().get_ondisk_size(),
+        [&](uint64_t offset, uint64_t length) {
+          return bdev->aio_read(offset, length, &bl, ioc);
+        });
+      if (r < 0) {
+        derr << __func__ << " bdev-read failed: " << cpp_strerror(r) << dendl;
+        if (r == -EIO) {
+          return r;
+        }
+        ceph_assert(r == 0);
+      }
+      continue;
+    }
+    for (auto& req : r2r) {
+      char* d = can_direct ? _read_into_span(req, offset, length, dst) : nullptr;
+      dout(20) << __func__ << "    region 0x" << std::hex
+               << req.regs.front().logical_offset
+               << ": 0x" << req.regs.front().blob_xoffset
+               << " reading 0x" << req.r_off
+               << "~" << req.r_len << std::dec
+               << (d ? " into the caller's memory" : "") << dendl;
+      uint64_t done = 0;
+      auto r = bptr->get_blob().map(
+        req.r_off, req.r_len,
+        [&](uint64_t offset, uint64_t length) {
+          int r = d ? bdev->aio_read_into(offset, length, d + done, ioc) :
+            bdev->aio_read(offset, length, &req.bl, ioc);
+          done += length;
+          return r < 0 ? r : 0;
+        });
+      if (r < 0) {
+        derr << __func__ << " bdev-read failed: " << cpp_strerror(r)
+             << dendl;
+        if (r == -EIO) {
+          return r;
+        }
+        ceph_assert(r == 0);
+      }
+      if (d) {
+        // the checksum check reads the data where it landed
+        req.direct = d;
+        req.bl.push_back(ceph::buffer::ptr_node::create(
+          ceph::buffer::create_static(req.r_len, d)));
+        *direct_bytes += req.r_len;
+      }
+      ceph_assert(req.bl.length() == req.r_len);
+    }
+  }
+  return 0;
+}
+
+int BlueStore::_do_read_into(
+  Collection *c,
+  OnodeRef& o,
+  uint64_t offset,
+  size_t length,
+  const read_dest_t& dst,
+  uint32_t op_flags,
+  uint64_t retry_count)
+{
+  FUNCTRACE(cct);
+  dout(20) << __func__ << " 0x" << std::hex << offset << "~" << length
+           << " size 0x" << o->onode.size << " (" << std::dec
+           << o->onode.size << ")" << dendl;
+  if (offset >= o->onode.size) {
+    return 0;
+  }
+  // as _do_read() decides
+  bool buffered = false;
+  if (op_flags & CEPH_OSD_OP_FLAG_FADVISE_WILLNEED) {
+    buffered = true;
+  } else if (cct->_conf->bluestore_default_buffered_read &&
+	     (op_flags & (CEPH_OSD_OP_FLAG_FADVISE_DONTNEED |
+			  CEPH_OSD_OP_FLAG_FADVISE_NOCACHE)) == 0) {
+    buffered = true;
+  }
+  if (offset + length > o->onode.size) {
+    length = o->onode.size - offset;
+  }
+  o->extent_map.fault_range(db, offset, length);
+  int read_cache_policy = 0;
+  if (op_flags & CEPH_OSD_OP_FLAG_SCRUB) {
+    read_cache_policy = BufferSpace::BYPASS_CLEAN_CACHE;
+  }
+
+  ready_regions_t ready_regions;  // the cache's, only
+  blobs2read_t blobs2read;
+  _read_cache(o, offset, length, read_cache_policy, ready_regions, blobs2read);
+
+  auto start = mono_clock::now();
+  vector<bufferlist> compressed_blob_bls;
+  IOContext ioc(cct, NULL, !cct->_conf->bluestore_fail_eio);
+  uint64_t direct = 0;
+  int r = _prepare_read_into_ioc(blobs2read, &compressed_blob_bls, offset,
+				 length, dst, &ioc, &direct);
+  if (r < 0) {
+    return r;
+  }
+  int64_t num_ios = blobs2read.size();
+  if (ioc.has_pending_aios()) {
+    num_ios = ioc.get_num_ios();
+    bdev->aio_submit(&ioc);
+    ioc.aio_wait();
+    r = ioc.get_return_value();
+    if (r < 0) {
+      ceph_assert(r == -EIO);
+      return -EIO;
+    }
+  }
+  log_latency_fn(__func__,
+    l_bluestore_read_wait_aio_lat,
+    mono_clock::now() - start,
+    cct->_conf->bluestore_log_op_age,
+    [&](auto lat) { return ", num_ios = " + stringify(num_ios); },
+    l_bluestore_slow_read_wait_aio_count);
+
+  // check, decompress and place what the device read. The cache keeps
+  // copies of what went into the caller's memory, never the memory.
+  const bool cache_it = buffered && !ioc.skip_cache();
+  interval_set<uint64_t> filled;  // positions in dst
+  uint64_t copied = 0;
+  bool csum_error = false;
+  auto pc = compressed_blob_bls.begin();
+  for (auto& [bptr, r2r] : blobs2read) {
+    if (csum_error) {
+      break;
+    }
+    if (bptr->get_blob().is_compressed()) {
+      ceph_assert(pc != compressed_blob_bls.end());
+      bufferlist& compressed_bl = *pc++;
+      const auto& reg0 = r2r.front().regs.front();
+      if (_verify_csum(o, &bptr->get_blob(), 0, compressed_bl,
+		       reg0.logical_offset) < 0) {
+        csum_error = true;
+        break;
+      }
+      bufferlist raw_bl;
+      r = _decompress(compressed_bl, &raw_bl);
+      if (r < 0) {
+        return r;
+      }
+      if (cache_it) {
+        bufferlist region_buffer;
+        region_buffer.substr_of(raw_bl, reg0.blob_xoffset, reg0.length);
+        o->bc.did_read(o->c->cache, reg0.logical_offset,
+		       std::move(region_buffer));
+      }
+      for (auto& req : r2r) {
+        for (auto& reg : req.regs) {
+          bufferlist piece;
+          piece.substr_of(raw_bl, reg.blob_xoffset, reg.length);
+          dst.copy_in(reg.logical_offset - offset, piece);
+          filled.union_insert(reg.logical_offset - offset, reg.length);
+          copied += reg.length;
+        }
+      }
+      continue;
+    }
+    for (auto& req : r2r) {
+      if (_verify_csum(o, &bptr->get_blob(), req.r_off, req.bl,
+		       r2r.front().regs.front().logical_offset) < 0) {
+        csum_error = true;
+        break;
+      }
+      for (const auto& reg : req.regs) {
+        bufferlist piece;
+        if (req.direct) {
+          if (cache_it) {
+            piece.append(req.direct + reg.front, reg.length);
+          }
+        } else {
+          piece.substr_of(req.bl, reg.front, reg.length);
+          dst.copy_in(reg.logical_offset - offset, piece);
+          copied += reg.length;
+        }
+        if (cache_it) {
+          o->bc.did_read(o->c->cache, reg.logical_offset, std::move(piece));
+        }
+        filled.union_insert(reg.logical_offset - offset, reg.length);
+      }
+    }
+  }
+  if (csum_error) {
+    // as _do_read(): retry spurious read errors
+    if (retry_count >= cct->_conf->bluestore_retry_disk_reads) {
+      return -EIO;
+    }
+    return _do_read_into(c, o, offset, length, dst, op_flags,
+			 retry_count + 1);
+  }
+  // the cache's regions
+  for (auto& [lofs, bl] : ready_regions) {
+    dst.copy_in(lofs - offset, bl);
+    filled.union_insert(lofs - offset, bl.length());
+    copied += bl.length();
+  }
+  // holes read as zeros
+  uint64_t pos = 0;
+  for (auto it = filled.begin(); it != filled.end(); ++it) {
+    if (it.get_start() > pos) {
+      dst.zero(pos, it.get_start() - pos);
+    }
+    pos = it.get_start() + it.get_len();
+  }
+  if (pos < length) {
+    dst.zero(pos, length - pos);
+  }
+  logger->inc(l_bluestore_read_into_direct_bytes, direct);
+  logger->inc(l_bluestore_read_into_copied_bytes, copied);
+  if (retry_count) {
+    logger->inc(l_bluestore_reads_with_retries);
+  }
+  dout(20) << __func__ << " 0x" << std::hex << offset << "~" << length
+	   << std::dec << " direct " << direct << " copied " << copied << dendl;
+  return length;
 }
 
 void inline BlueStore::_do_read_and_pad(

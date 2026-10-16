@@ -125,6 +125,8 @@ enum {
   l_bluestore_csum_lat,
   l_bluestore_read_eio,
   l_bluestore_reads_with_retries,
+  l_bluestore_read_into_direct_bytes,
+  l_bluestore_read_into_copied_bytes,
   l_bluestore_read_lat,
   //****************************************
 
@@ -3298,6 +3300,15 @@ public:
     ceph::buffer::list& bl,
     uint32_t op_flags = 0) override;
 
+  int read_into(
+    CollectionHandle &c,
+    const ghobject_t& oid,
+    uint64_t offset,
+    size_t len,
+    const struct iovec* iov,
+    int iovcnt,
+    uint32_t op_flags = 0) override;
+
 private:
 
   // --------------------------------------------------------
@@ -3333,6 +3344,9 @@ private:
     uint64_t r_len = 0;
     ceph::buffer::list bl;
     std::list<region_t> regs; // original read regions
+    /// read_into(): the caller's memory the device read this request
+    /// into, or null when it went into bl's own buffers
+    char* direct = nullptr;
 
     read_req_t(uint64_t off, uint64_t len) : r_off(off), r_len(len) {}
 
@@ -3371,6 +3385,45 @@ private:
     bool buffered,
     bool* csum_error,
     ceph::buffer::list& bl);
+
+  /// the caller's memory a read_into() lands in, positions counted from
+  /// the read's offset
+  struct read_dest_t {
+    const struct iovec* iov = nullptr;
+    int iovcnt = 0;
+    /// the n bytes at pos, when one segment holds them all; else null
+    char* span(uint64_t pos, uint64_t n) const;
+    /// copy bl to pos, across segments
+    void copy_in(uint64_t pos, const ceph::buffer::list& bl) const;
+    void zero(uint64_t pos, uint64_t n) const;
+  };
+
+  /// where the device can read req straight into dst: req is one
+  /// contiguous run of the read, with no padding, at an aligned place
+  /// of one segment; else null
+  char* _read_into_span(
+    const read_req_t& req,
+    uint64_t offset,
+    size_t length,
+    const read_dest_t& dst);
+
+  int _prepare_read_into_ioc(
+    blobs2read_t& blobs2read,
+    std::vector<ceph::buffer::list>* compressed_blob_bls,
+    uint64_t offset,
+    size_t length,
+    const read_dest_t& dst,
+    IOContext* ioc,
+    uint64_t* direct_bytes);
+
+  int _do_read_into(
+    Collection *c,
+    OnodeRef& o,
+    uint64_t offset,
+    size_t len,
+    const read_dest_t& dst,
+    uint32_t op_flags = 0,
+    uint64_t retry_count = 0);
 
   void _measure_runtime_frag(Collection *c, const blobs2read_t& blobs2read);
 

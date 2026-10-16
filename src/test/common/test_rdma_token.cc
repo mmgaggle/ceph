@@ -615,6 +615,41 @@ TEST(OobArena, BuddyBuffers)
   EXPECT_EQ(0u, a->stats().in_use);
 }
 
+TEST(OobArena, SharedBuffers)
+{
+  using ceph::oob::Arena;
+  std::string err;
+  auto a = Arena::create(Arena::MAX, &err);
+  ASSERT_TRUE(a) << err;
+  auto s = a->alloc_shared(3 * Arena::MIN);
+  ASSERT_TRUE(s);
+  EXPECT_EQ(4 * Arena::MIN, s.len);
+  EXPECT_EQ(s.len, a->stats().in_use);
+
+  // a second owner takes a reference by any bytes of the buffer
+  Arena::slice_t h;
+  EXPECT_TRUE(a->hold(a->ptr(s) + 100, 1000, &h));
+  EXPECT_EQ(s.offset, h.offset);
+  EXPECT_EQ(s.len, h.len);
+  // not by bytes that run past it, or outside the arena
+  EXPECT_FALSE(a->hold(a->ptr(s) + s.len - 10, 20, &h));
+  EXPECT_FALSE(a->hold(a->base() - 1, 1, &h));
+  // and not by a buffer that is not shared
+  auto plain = a->alloc(Arena::MIN);
+  ASSERT_TRUE(plain);
+  EXPECT_FALSE(a->hold(a->ptr(plain), 1, &h));
+  a->free(plain);
+
+  // the buffer goes back with the last reference, whatever len says
+  a->free(s.offset, 3 * Arena::MIN);
+  EXPECT_EQ(s.len, a->stats().in_use);
+  a->free(s.offset, 1);
+  EXPECT_EQ(0u, a->stats().in_use);
+  // and the whole arena joins again
+  auto all = a->alloc(Arena::MAX);
+  EXPECT_TRUE(all);
+}
+
 TEST(OobArena, Reserve)
 {
   using ceph::oob::Arena;

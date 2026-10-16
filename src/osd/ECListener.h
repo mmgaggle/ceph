@@ -30,6 +30,9 @@ class OSDOobExecutor;
 namespace ceph::osd::oob {
 struct xfer_job;
 }
+namespace ceph::oob {
+class Arena;
+}
 
 struct ECListener {
   virtual ~ECListener() = default;
@@ -56,6 +59,11 @@ struct ECListener {
   /// the executor that lends receive windows for gathers, when the
   /// primary gathers shard reads out of band; null otherwise
   virtual OSDOobExecutor* oob_gather_executor() {
+    return nullptr;
+  }
+  /// the memory that the OSD's transports write from without a copy
+  /// (osd_oob_direct_read); null when the OSD has none
+  virtual ceph::oob::Arena* oob_arena() {
     return nullptr;
   }
 

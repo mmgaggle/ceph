@@ -316,11 +316,15 @@ void PrimaryLogPG::OpContext::start_async_reads(PrimaryLogPG *pg)
       },
       std::move(ctx_pair));
   }
+  bool into_arena = false;
+#ifdef HAVE_OSD_OOB_DELIVERY
+  into_arena = pg->oob_async_reads_into_arena(this);
+#endif
   pg->pgbackend->objects_read_async(
     obc->obs.oi.soid,
     obc->obs.oi.size,
     in_native,
-    new OnReadComplete(pg, this), pg->get_pool().fast_read);
+    new OnReadComplete(pg, this), pg->get_pool().fast_read, into_arena);
 }
 void PrimaryLogPG::OpContext::finish_read(PrimaryLogPG *pg)
 {
@@ -9614,18 +9618,48 @@ std::optional<ceph::buffer::ptr> PrimaryLogPG::oob_direct_read_buffer(
     return std::nullopt;
   }
   // none free, or more than one buffer can hold: read as usual
-  const auto s = arena->alloc_shared(len);
-  if (!s) {
+  auto buf = arena->alloc_shared_ptr(len);
+  if (!buf.length()) {
     return std::nullopt;
   }
   if (mode == "nocache") {
     *op_flags |= CEPH_OSD_OP_FLAG_FADVISE_NOCACHE;
   }
   dout(20) << __func__ << " " << len << " bytes of op " << idx
-	   << " into arena buffer 0x" << std::hex << s.offset << "~" << s.len
-	   << std::dec << dendl;
-  return ceph::buffer::ptr(ceph::buffer::claim_buffer(
-    len, arena->ptr(s), make_deleter([arena, s] { arena->free(s); })));
+	   << " into arena buffer at 0x" << std::hex
+	   << (buf.c_str() - arena->base()) << std::dec << dendl;
+  return buf;
+}
+
+bool PrimaryLogPG::oob_async_reads_into_arena(const OpContext *ctx)
+{
+  // the EC primary reads its own shard, and takes the shards that peers
+  // push into its gather windows, straight into the arena, when the
+  // result goes out of band from there (osd_oob_direct_read)
+  if (cct->_conf.get_val<std::string>("osd_oob_direct_read") == "off" ||
+      !osd->oob_arena || !ctx->op ||
+      ctx->op->get_req()->get_type() != CEPH_MSG_OSD_OP) {
+    return false;
+  }
+  auto m = ctx->op->get_req<MOSDOp>();
+  if (!m->has_rdma_delivery()) {
+    return false;
+  }
+  for (const auto& d : m->get_rdma_deliveries()) {
+    if (d.empty()) {
+      continue;
+    }
+    if (OSDOobExecutor* e = osd->oob_executor_for(d.token);
+	e && e->stages_from_arena()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+ceph::oob::Arena* PrimaryLogPG::oob_arena()
+{
+  return osd->oob_arena.get();
 }
 
 std::vector<ceph::osd::oob::read_push> PrimaryLogPG::deliver_oob_prepare(

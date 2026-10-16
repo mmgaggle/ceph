@@ -98,6 +98,17 @@ class ECBackend : public ECCommon {
    */
   std::optional<ceph::osd::oob::sub_read_push> prepare_sub_read_push(
     const ECSubRead &op, ECSubReadReply *reply, utime_t received);
+  /**
+   * The buffer of the OSD's arena that handle_sub_read() reads op's
+   * extents into, back to back, so that a transport writes them from
+   * there with no copy (osd_oob_direct_read): for a push into the
+   * primary's gather window, and for the primary's own shard of a read
+   * whose result goes out of band (ReadOp::into_arena). An empty ptr
+   * when neither applies, when a read is not of whole chunks, or when no
+   * buffer is free. *flags gets FADVISE_NOCACHE under nocache.
+   */
+  ceph::buffer::ptr sub_read_arena_buffer(
+    pg_shard_t from, const ECSubRead &op, uint32_t *flags);
 
   void handle_sub_read_n_reply(
     pg_shard_t from,
@@ -222,7 +233,8 @@ class ECBackend : public ECCommon {
                                 std::pair<ceph::buffer::list*, Context*>>> &
       to_read,
       Context *on_complete,
-      bool fast_read = false
+      bool fast_read = false,
+      bool into_arena = false
     );
 
   bool ec_can_decode(const shard_id_set &available_shards) const;

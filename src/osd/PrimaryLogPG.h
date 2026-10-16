@@ -1363,6 +1363,10 @@ protected:
    */
   std::optional<ceph::buffer::ptr> oob_direct_read_buffer(
     OpContext *ctx, const OSDOp& osd_op, uint64_t len, uint32_t* op_flags);
+  /// whether an EC read that ctx starts reads into the arena, for a
+  /// result that goes out of band (osd_oob_direct_read): the primary's
+  /// own shard, and the shards that peers push into its gather windows
+  bool oob_async_reads_into_arena(const OpContext *ctx);
   /**
    * Run the pushes deliver_oob_prepare() returned, send the reply, with
    * rops and oob back in it, once every push is over, and close ctx. A
@@ -2114,6 +2118,7 @@ public:
   int oob_submit(std::unique_ptr<ceph::osd::oob::xfer_job>& j) override;
   bool oob_runs_inline(const OSDOobExecutor* e) const override;
   OSDOobExecutor* oob_gather_executor() override;
+  ceph::oob::Arena* oob_arena() override;
 #endif
   const pg_missing_const_i * maybe_get_shard_missing(
     pg_shard_t peer) const {

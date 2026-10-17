@@ -135,6 +135,14 @@ if(WITH_OOB_OFI)
     DESTINATION ${CMAKE_INSTALL_BINDIR})
   # built by make check too, so that a change that breaks it fails there
   add_dependencies(tests ceph_test_osd_oob_read)
+  # libceph_test_copycount: an LD_PRELOAD library that counts the bytes a
+  # process copies, for qa/standalone/osd/osd-oob-copies.sh. Its copy
+  # loops must stay loops, not calls to memcpy.
+  add_library(ceph_test_copycount SHARED copycount.c)
+  target_compile_options(ceph_test_copycount PRIVATE
+    -fno-builtin -fno-tree-loop-distribute-patterns)
+  target_link_libraries(ceph_test_copycount ${CMAKE_DL_LIBS} Threads::Threads)
+  add_dependencies(tests ceph_test_copycount)
 endif()
 
 # unittest_ecbackend_l (legacy EC)

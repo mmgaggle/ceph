@@ -1784,7 +1784,10 @@ options:
     block boundaries. With cached, BlueStore keeps a copy of what it read
     in its cache, as it does for any read. With nocache, it does not, so
     that a cold read is not copied at all. Replicated pools, and the
-    shard reads of erasure-coded pools that clients read directly.
+    shard reads of erasure-coded pools that clients read directly. An
+    erasure-coded PG reads this way only with the optimized EC code. A PG
+    of a pool that gets allow_ec_optimizations after its creation keeps
+    the legacy code, and copies, until its next interval change.
   default: 'off'
   enum_values:
   - 'off'

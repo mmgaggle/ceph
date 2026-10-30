@@ -440,6 +440,9 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
   respect_subvolume_snapshot_visibility = cct->_conf.get_val<bool>(
     "client_respect_subvolume_snapshot_visibility");
 
+  write_submit_unlocked = cct->_conf.get_val<bool>(
+    "client_write_submit_unlocked");
+
   fscrypt_as = cct->_conf.get_val<bool>(
     "client_fscrypt_as");
 
@@ -12600,9 +12603,9 @@ int Client::WriteEncMgr::read_modify_write(Context *_iofinish)
 
 #if defined(__linux__)
   if (!denc)
-    return do_write();
+    return do_write(true);
 #else
-    return do_write();
+    return do_write(true);
 #endif
 
 #if defined(__linux__)
@@ -12679,7 +12682,7 @@ done:
     }
   }
 
-  try_finish(r);
+  try_finish(r, true);
   return r;
 #endif
 }
@@ -12720,7 +12723,7 @@ void Client::WriteEncMgr::finish_read_start(int r)
     bl.swap(newbl);
   }
 
-  try_finish(r);
+  try_finish(r, false);
 }
 
 void Client::WriteEncMgr::finish_read_end(int r)
@@ -12738,10 +12741,10 @@ void Client::WriteEncMgr::finish_read_end(int r)
     }
   }
 
-  try_finish(r);
+  try_finish(r, false);
 }
 
-bool Client::WriteEncMgr::do_try_finish(int r)
+bool Client::WriteEncMgr::do_try_finish(int r, bool may_unlock)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
   ldout(cct, 10) << __func__ << dendl;
@@ -12766,7 +12769,7 @@ bool Client::WriteEncMgr::do_try_finish(int r)
 
   update_write_params();
 
-  r = do_write();
+  r = do_write(may_unlock);
   return true;
 }
 #endif
@@ -12778,8 +12781,9 @@ void Client::WriteEncMgr_Buffered::update_write_params()
   }
 }
 
-int Client::WriteEncMgr_Buffered::do_write()
+int Client::WriteEncMgr_Buffered::do_write(bool /*may_unlock*/)
 {
+  // ObjectCacher runs under client_lock, so the write is sent with it held.
   ldout(cct, 10) << __func__ << dendl;
   int r =  0;
 
@@ -12802,16 +12806,36 @@ int Client::WriteEncMgr_Buffered::do_write()
   return r;
 }
 
-int Client::WriteEncMgr_NotBuffered::do_write()
+int Client::WriteEncMgr_NotBuffered::do_write(bool may_unlock)
 {
   ldout(cct, 10) << __func__ << dendl;
   clnt->get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
-  clnt->filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
+  if (!may_unlock || !clnt->write_submit_unlocked) {
+    clnt->filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
+                             offset, size, *pbl, mtime.to_real_time(), 0,
+                             in->truncate_size, in->truncate_seq,
+                             iofinish, 0 /*op_flags*/,
+                             clnt->do_rados_fsync ? in->change_attr : 0);
+    return 0;
+  }
+
+  /*
+   * (see upstream patch for the full comment)
+   */
+  const inodeno_t ino = in->ino;
+  const file_layout_t layout = in->layout;
+  const SnapContext snapc = in->snaprealm->get_snap_context();
+  const uint64_t truncate_size = in->truncate_size;
+  const uint32_t truncate_seq = in->truncate_seq;
+  const uint64_t change_attr = clnt->do_rados_fsync ? in->change_attr : 0;
+
+  clnt->client_lock.unlock();
+  clnt->filer->write_trunc(ino, &layout, snapc,
                            offset, size, *pbl, mtime.to_real_time(), 0,
-                           in->truncate_size, in->truncate_seq,
-                           iofinish, 0 /*op_flags*/,
-                           clnt->do_rados_fsync ? in->change_attr : 0);
+                           truncate_size, truncate_seq,
+                           iofinish, 0 /*op_flags*/, change_attr);
+  clnt->client_lock.lock();
 
   return 0;
 }
@@ -19111,6 +19135,7 @@ std::vector<std::string> Client::get_tracked_keys() const noexcept
     "client_oc_target_dirty",
     "client_permissions",
     "client_respect_subvolume_snapshot_visibility",
+    "client_write_submit_unlocked",
     "fuse_default_permissions"
   });
   static_assert(std::is_sorted(begin(as_sv), end(as_sv)));
@@ -19172,6 +19197,10 @@ void Client::handle_conf_change(const ConfigProxy& conf,
   if (changed.count("client_respect_subvolume_snapshot_visibility")) {
     respect_subvolume_snapshot_visibility = cct->_conf.get_val<bool>(
       "client_respect_subvolume_snapshot_visibility");
+  }
+  if (changed.count("client_write_submit_unlocked")) {
+    write_submit_unlocked = cct->_conf.get_val<bool>(
+      "client_write_submit_unlocked");
   }
   if (changed.count("client_fscrypt_as")) {
     fscrypt_as = cct->_conf.get_val<bool>(

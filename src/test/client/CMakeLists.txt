@@ -9,6 +9,7 @@ if(${WITH_CEPHFS})
     syncio.cc
     fscrypt_conf.cc
     subs.cc
+    concurrent_write.cc
     )
   target_link_libraries(ceph_test_client
     client
@@ -28,6 +29,7 @@ if(${WITH_CEPHFS})
     nonblocking.cc
     fscrypt_conf.cc
     syncio.cc
+    concurrent_write.cc
     )
   target_link_libraries(ceph_test_client_fscrypt
     client

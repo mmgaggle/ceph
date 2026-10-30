@@ -1788,7 +1788,7 @@ private:
     std::unique_ptr<iofinish_method_ctx<WriteEncMgr> > finish_read_start_ctx;
     std::unique_ptr<iofinish_method_ctx<WriteEncMgr> > finish_read_end_ctx;
 
-    bool try_finish(int r) {
+    bool try_finish(int r, bool may_unlock) {
       if (is_finished) {
         return true;
       }
@@ -1797,7 +1797,7 @@ private:
         return false;
       }
 
-      is_finished = do_try_finish(r);
+      is_finished = do_try_finish(r, may_unlock);
 
       return is_finished;
     }
@@ -1805,7 +1805,13 @@ private:
     int read(uint64_t off, uint64_t len, bufferlist *bl, iofinish_method_ctx<WriteEncMgr> *ioctx);
 
   protected:
-    virtual int do_write() = 0;
+    /*
+     * Submit the write. Called with client_lock held, and returns with it
+     * held. may_unlock is true when the caller is the thread that issued
+     * the write and holds no lock besides client_lock, so the submit may
+     * drop client_lock while it sends the write.
+     */
+    virtual int do_write(bool may_unlock) = 0;
     virtual void update_write_params() = 0;
 
   public:
@@ -1843,7 +1849,7 @@ private:
     }
     void finish_read_start(int r);
     void finish_read_end(int r);
-    bool do_try_finish(int r);
+    bool do_try_finish(int r, bool may_unlock);
 
     int64_t get_ofs() { return offset; }
     uint64_t get_size() { return size; }
@@ -1859,7 +1865,7 @@ private:
                                                    w_mtime,bl, async) {}
 
     void update_write_params() override;
-    int do_write() override;
+    int do_write(bool may_unlock) override;
   };
 
   class WriteEncMgr_NotBuffered : public WriteEncMgr {
@@ -1872,7 +1878,7 @@ private:
                                                    w_mtime, bl, async) {}
 
     void update_write_params() override {}
-    int do_write() override;
+    int do_write(bool may_unlock) override;
   };
 
   class C_Write_Finisher : public Context {
@@ -2435,6 +2441,7 @@ private:
   bool client_permissions;
   bool fuse_default_permissions;
   bool respect_subvolume_snapshot_visibility;
+  bool write_submit_unlocked;
   bool do_rados_fsync;
 
   std::locale m_locale;

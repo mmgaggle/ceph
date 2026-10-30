@@ -626,6 +626,19 @@ options:
   services:
   - mds_client
   min: 0
+- name: client_write_submit_unlocked
+  type: bool
+  level: advanced
+  desc: Send uncached writes to the OSDs without holding the client lock
+  long_desc: When a write bypasses the object cacher, release the client lock
+    while the write is encoded and sent to the OSDs, so that other threads
+    using the same client do not wait behind it. Encrypted writes that need
+    a read-modify-write of a partial block are still sent with the lock held.
+  default: true
+  services:
+  - mds_client
+  flags:
+  - runtime
 - name: client_fscrypt_as
   type: bool
   level: advanced

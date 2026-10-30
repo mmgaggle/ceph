@@ -3434,7 +3434,8 @@ public:
     Op *o = new Op(oid, oloc, std::move(ops),
 		   get_read_flags(flags), fin, objver);
     o->snapid = snap;
-    o->outbl = &fin->bl;
+    // decode only the stat op output; extra ops precede it in the reply data
+    o->out_bl[i] = &fin->bl;
     return o;
   }
   ceph_tid_t stat(

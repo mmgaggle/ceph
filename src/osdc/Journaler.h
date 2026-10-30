@@ -327,6 +327,7 @@ private:
   std::list<Context*> waitfor_prezero;
 
   std::map<uint64_t, uint64_t> pending_safe; // flush_pos -> safe_pos
+  bool flush_deferred = false; // a flush waits for an in-flight write
   // when safe through given offset
   std::map<uint64_t, std::list<Context*> > waitfor_safe;
 

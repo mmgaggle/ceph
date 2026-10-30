@@ -2531,6 +2531,15 @@ options:
     MDS journal)
   default: 128
   with_legacy: true
+- name: journaler_max_inflight_flushes
+  type: uint
+  level: dev
+  desc: Journal writes allowed in flight before flush requests are coalesced
+  long_desc: When this many journal writes are already in flight, a flush
+    request leaves the buffered entries in place and they go out as a single
+    write when an in-flight write completes (group commit).  0 issues a write
+    for every flush request.
+  default: 0
 - name: journaler_write_head_interval
   type: int
   level: advanced

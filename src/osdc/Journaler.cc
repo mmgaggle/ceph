@@ -584,6 +584,11 @@ void Journaler::_finish_flush(int r, uint64_t start, ceph::real_time stamp)
   else
     safe_pos = min_next_safe_pos;
 
+  if (flush_deferred) {
+    flush_deferred = false;
+    _do_flush();
+  }
+
   ldout(cct, 10) << "_finish_flush safe from " << start
 		 << ", pending_safe " << pending_safe
 		 << ", (prezeroing/prezero)/write/flush/safe positions now "
@@ -661,6 +666,19 @@ void Journaler::_do_flush(unsigned amount)
     return;
   ceph_assert(write_pos > flush_pos);
   ceph_assert(!readonly);
+
+  // group commit: with enough writes already in flight, leave the buffered
+  // entries for _finish_flush() to send as one write
+  if (amount == 0) {
+    const auto max_inflight =
+      cct->_conf.get_val<uint64_t>("journaler_max_inflight_flushes");
+    if (max_inflight && pending_safe.size() >= max_inflight) {
+      ldout(cct, 20) << "_do_flush deferring, " << pending_safe.size()
+                     << " writes in flight" << dendl;
+      flush_deferred = true;
+      return;
+    }
+  }
 
   // flush
   uint64_t len = write_pos - flush_pos;

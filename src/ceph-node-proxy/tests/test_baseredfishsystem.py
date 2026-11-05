@@ -1,8 +1,13 @@
+import json
 from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError
 
 import pytest
 
-from ceph_node_proxy.baseredfishsystem import BaseRedfishSystem
+from ceph_node_proxy.baseredfishsystem import (
+    BaseRedfishSystem,
+    fill_drive_slot_and_firmware,
+)
 from ceph_node_proxy.redfish import ComponentUpdateSpec
 
 
@@ -229,14 +234,6 @@ class TestBaseRedfishSystemNotImplemented:
     @pytest.mark.parametrize(
         "method,args",
         [
-            ("device_led_on", ("disk1",)),
-            ("device_led_off", ("disk1",)),
-            ("chassis_led_on", ()),
-            ("chassis_led_off", ()),
-            ("get_device_led", ("disk1",)),
-            ("set_device_led", ("disk1", {"on": True})),
-            ("get_chassis_led", ()),
-            ("set_chassis_led", ({"state": "on"},)),
             ("shutdown_host", (False,)),
             ("powercycle", ()),
         ],
@@ -330,3 +327,215 @@ class TestFillMissingIdentityDuringUpdate:
         nic = system._sys["network"]["Self"]["ethernetinterfaces_nic1"]
         assert nic["name"] == "NIC.Slot.1"
         assert nic["description"] == "NIC.Slot.1"
+
+
+# A Drive resource as served by a generic Redfish service (e.g. IBM HAL)
+HAL_DRIVE = {
+    "@odata.id": "/redfish/v1/Chassis/ComputeModule-0/Drives/DriveSlot-2",
+    "Id": "DriveSlot-2",
+    "Description": "Enclosure0:Drive2",
+    "CapacityBytes": 3840755982336,
+    "Model": "101-FCM4",
+    "Protocol": "NVMe",
+    "SerialNumber": "FCM0002",
+    "Revision": "4.1.2",
+    "LocationIndicatorActive": True,
+    "PhysicalLocation": {
+        "PartLocation": {
+            "ServiceLabel": "Enclosure0:Drive2",
+            "LocationType": "Slot",
+            "LocationOrdinalValue": 2,
+        }
+    },
+    "Status": {"State": "Enabled", "Health": "OK"},
+}
+
+
+def storage_endpoints(drives):
+    """endpoints['systems'] with one system 'CAN01' whose Storage 'Enclosure0'
+    links the given drives."""
+    storage = MagicMock()
+    storage.get_members_data.return_value = {
+        "Enclosure0": {"Drives": [{"@odata.id": d["@odata.id"]} for d in drives]}
+    }
+    system_member = MagicMock()
+    system_member.__getitem__.side_effect = lambda key: {"Storage": storage}[key]
+    systems = MagicMock()
+    systems.get_members_names.return_value = ["CAN01"]
+    systems.__getitem__.side_effect = lambda key: {"CAN01": system_member}[key]
+    return systems
+
+
+class TestStorageSlotAndFirmware:
+    def test_update_storage_sets_slot_and_firmware(self, system, mock_endpoints):
+        mock_endpoints.__getitem__.side_effect = lambda key: {
+            "systems": storage_endpoints([HAL_DRIVE])
+        }[key]
+        with patch("ceph_node_proxy.baseredfishsystem.Endpoint") as mock_endpoint:
+            mock_endpoint.return_value.data = HAL_DRIVE
+            system._update_storage()
+        drive = system.get_storage()["CAN01"]["driveslot-2"]
+        assert drive["slot"] == 2
+        assert drive["firmware_version"] == "4.1.2"
+        assert drive["capacity_bytes"] == 3840755982336
+        assert drive["location_indicator_active"] is True
+        assert drive["redfish_endpoint"] == HAL_DRIVE["@odata.id"]
+
+    def test_unknown_values_are_not_used(self):
+        drive = {
+            "revision": "unknown",
+            "physical_location": "unknown",
+        }
+        fill_drive_slot_and_firmware(drive)
+        assert "firmware_version" not in drive
+        assert "slot" not in drive
+
+    def test_provider_values_are_kept(self):
+        drive = {
+            "revision": "4.1.2",
+            "firmware_version": "V6MA001",
+            "slot": "0",
+            "physical_location": {"partlocation": {"locationordinalvalue": 7}},
+        }
+        fill_drive_slot_and_firmware(drive)
+        assert drive["firmware_version"] == "V6MA001"
+        assert drive["slot"] == "0"
+
+
+class TestIdentifyLeds:
+    @pytest.fixture
+    def leds(self, system, mock_client, mock_endpoints):
+        system._sys["storage"] = {
+            "CAN01": {
+                "driveslot-2": {"redfish_endpoint": HAL_DRIVE["@odata.id"]},
+            },
+            "CAN02": {
+                "slot-17": {
+                    "redfish_endpoint": "/redfish/v1/Chassis/ComposableModule-1/Drives/Slot-17"
+                },
+            },
+        }
+        systems = MagicMock()
+        systems.get_members_names.return_value = ["CAN01"]
+        chassis = MagicMock()
+        chassis.get_members_endpoints.return_value = {
+            "Canister-1": "/redfish/v1/Chassis/Canister-1",
+            "ComputeModule-0": "/redfish/v1/Chassis/ComputeModule-0",
+        }
+        mock_endpoints.__getitem__.side_effect = lambda key: {
+            "systems": systems,
+            "chassis": chassis,
+        }[key]
+        return system
+
+    def test_drive_endpoint_found_in_any_system(self, leds):
+        assert leds.get_drive_endpoint("driveslot-2") == HAL_DRIVE["@odata.id"]
+        assert leds.get_drive_endpoint("slot-17").endswith("/Drives/Slot-17")
+        with pytest.raises(KeyError):
+            leds.get_drive_endpoint("nope")
+
+    @pytest.mark.parametrize(
+        "method,expected", [("device_led_on", True), ("device_led_off", False)]
+    )
+    def test_device_led_on_off(self, leds, mock_client, method, expected):
+        mock_client.query.return_value = ({}, "", 204)
+        assert getattr(leds, method)("driveslot-2") == 204
+        mock_client.query.assert_called_once_with(
+            data=json.dumps({"LocationIndicatorActive": expected}),
+            method="PATCH",
+            endpoint=HAL_DRIVE["@odata.id"],
+        )
+
+    def test_get_device_led(self, leds, mock_client):
+        mock_client.query.return_value = ({}, json.dumps(HAL_DRIVE), 200)
+        assert leds.get_device_led("driveslot-2") == {
+            "http_code": 200,
+            "LocationIndicatorActive": True,
+        }
+        mock_client.query.assert_called_once_with(
+            method="GET", endpoint=HAL_DRIVE["@odata.id"]
+        )
+
+    def test_get_device_led_not_reported(self, leds, mock_client):
+        mock_client.query.return_value = ({}, json.dumps({"Id": "Slot-17"}), 200)
+        assert leds.get_device_led("slot-17")["LocationIndicatorActive"] is None
+
+    def test_unknown_device(self, leds, mock_client):
+        with pytest.raises(KeyError):
+            leds.device_led_on("nope")
+        mock_client.query.assert_not_called()
+
+    def test_chassis_led_uses_the_system_chassis_link(self, leds, mock_client):
+        leds._system["CAN01"] = {
+            "Links": {"Chassis": [{"@odata.id": "/redfish/v1/Chassis/ComputeModule-0"}]}
+        }
+        mock_client.query.return_value = ({}, "", 204)
+        assert leds.chassis_led_on() == 204
+        assert mock_client.query.call_args.kwargs["endpoint"] == (
+            "/redfish/v1/Chassis/ComputeModule-0"
+        )
+
+    def test_chassis_led_falls_back_to_first_chassis(self, leds, mock_client):
+        mock_client.query.return_value = (
+            {},
+            json.dumps({"LocationIndicatorActive": False}),
+            200,
+        )
+        assert leds.get_chassis_led()["LocationIndicatorActive"] is False
+        assert mock_client.query.call_args.kwargs["endpoint"] == (
+            "/redfish/v1/Chassis/Canister-1"
+        )
+
+    def test_redfish_errors_are_raised(self, leds, mock_client):
+        mock_client.query.side_effect = HTTPError(
+            "/redfish/v1/Chassis/Canister-1", 405, "Method Not Allowed", None, None
+        )
+        with pytest.raises(HTTPError):
+            leds.chassis_led_off()
+
+
+class TestFirmwareFromSingletonUpdateService:
+    """UpdateService is a singleton: its FirmwareInventory members are not
+    reported per system and firmware stays flat, {fw_id: {...}}."""
+
+    INVENTORY = {
+        "Enclosure1": {
+            "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/Enclosure1",
+            "Id": "Enclosure1",
+            "Name": "Enclosure1",
+            "Description": "Firmware of Enclosure1",
+            "Version": "4.1.0",
+            "Updateable": False,
+            "Status": {"State": "Enabled", "Health": "OK"},
+        },
+        "Enclosure0-Drive1": {
+            "@odata.id": "/redfish/v1/UpdateService/FirmwareInventory/Enclosure0-Drive1",
+            "Id": "Enclosure0-Drive1",
+            "Name": "Enclosure0:Drive1",
+            "Version": "4.1.2",
+            "Status": {"State": "Enabled", "Health": "OK"},
+        },
+    }
+
+    def test_update_firmware(self, system, mock_endpoints):
+        inventory = MagicMock()
+        inventory.get_members_data.return_value = self.INVENTORY
+        update_service = MagicMock()
+        update_service.get_members_names.return_value = []
+        update_service.__getitem__.side_effect = lambda key: {
+            "FirmwareInventory": inventory
+        }[key]
+        mock_endpoints.__getitem__.side_effect = lambda key: {
+            "update_service": update_service
+        }[key]
+
+        system._update_firmware()
+
+        firmware = system.get_firmware()
+        assert set(firmware) == {"enclosure1", "enclosure0-drive1"}
+        assert firmware["enclosure1"]["version"] == "4.1.0"
+        assert firmware["enclosure1"]["name"] == "Enclosure1"
+        assert firmware["enclosure1"]["status"] == {"state": "Enabled", "health": "OK"}
+        assert firmware["enclosure0-drive1"]["version"] == "4.1.2"
+        assert firmware["enclosure0-drive1"]["description"] == "Enclosure0-Drive1"
+        assert system.get_system()["firmware"] == firmware

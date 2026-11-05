@@ -1,5 +1,6 @@
 import concurrent.futures
 import dataclasses
+import json
 from time import sleep
 from typing import Any, Callable, Dict, List, Optional
 
@@ -16,9 +17,27 @@ from ceph_node_proxy.util import (
     DEFAULTS,
     fill_missing_identity,
     get_logger,
+    is_unknown,
     normalize_dict,
     to_snake_case,
 )
+
+
+def fill_drive_slot_and_firmware(drive: Dict[str, Any]) -> None:
+    """Set 'slot' and 'firmware_version' from the standard Drive properties
+    (PhysicalLocation, Revision) when they are not known yet."""
+    if is_unknown(drive.get("firmware_version")) and not is_unknown(
+        drive.get("revision")
+    ):
+        drive["firmware_version"] = drive["revision"]
+    location = drive.get("physical_location")
+    part = location.get("partlocation") if isinstance(location, dict) else None
+    if (
+        is_unknown(drive.get("slot"))
+        and isinstance(part, dict)
+        and not is_unknown(part.get("locationordinalvalue"))
+    ):
+        drive["slot"] = part["locationordinalvalue"]
 
 
 class BaseRedfishSystem(BaseSystem):
@@ -306,6 +325,15 @@ class BaseRedfishSystem(BaseSystem):
             return spec
         return dataclasses.replace(spec, **overrides)
 
+    @staticmethod
+    def _store_members(
+        target: Dict[str, Any], members: Dict[str, Any], prefix: Optional[str]
+    ) -> None:
+        for member_id, data in members.items():
+            key = member_id if prefix is None else f"{prefix}_{member_id}"
+            fill_missing_identity(data, key)
+            target[key] = data
+
     def _run_update(self, component: str) -> None:
         self.log.debug(f"Updating {component}")
         specs = self.get_specs(component)
@@ -322,17 +350,19 @@ class BaseRedfishSystem(BaseSystem):
                     attribute=spec.attribute,
                 )
                 path_prefix = spec.path.split("/")[-1].lower() or component
-                for sys_id, members in result.items():
-                    if sys_id not in self._sys[component]:
-                        self._sys[component][sys_id] = {}
-                    for member_id, data in members.items():
-                        key = (
-                            member_id
-                            if use_single_key
-                            else f"{path_prefix}_{member_id}"
+                prefix = None if use_single_key else path_prefix
+                if self.endpoints[spec.collection].get_members_names():
+                    # {sys_id: {member_id: data}}
+                    for sys_id, members in result.items():
+                        self._store_members(
+                            self._sys[component].setdefault(sys_id, {}),
+                            members,
+                            prefix,
                         )
-                        fill_missing_identity(data, key)
-                        self._sys[component][sys_id][key] = data
+                else:
+                    # singleton collection (UpdateService): get_component_data()
+                    # returns the members themselves, {member_id: data}
+                    self._store_members(self._sys[component], result, prefix)
             except Exception as e:
                 self.log.debug(
                     "Skipping %s path %s (not available on this hardware): %s",
@@ -358,6 +388,7 @@ class BaseRedfishSystem(BaseSystem):
             "SerialNumber",
             "Status",
             "PhysicalLocation",
+            "Revision",
         ]
         result: Dict[str, Dict[str, Dict]] = dict()
         self.log.debug("Updating storage")
@@ -382,6 +413,7 @@ class BaseRedfishSystem(BaseSystem):
             result[member] = normalize_dict(result[member])
             for drive_id, drive_data in result[member].items():
                 fill_missing_identity(drive_data, drive_id)
+                fill_drive_slot_and_firmware(drive_data)
             self._sys["storage"] = result
 
     def _update_sn(self) -> None:
@@ -409,29 +441,67 @@ class BaseRedfishSystem(BaseSystem):
     def _update_firmware(self) -> None:
         self._run_update("firmware")
 
+    # Identify LEDs, through the standard LocationIndicatorActive property of
+    # the Drive and Chassis resources. Errors from the Redfish service
+    # (HTTPError) are raised to the caller.
+
+    def get_drive_endpoint(self, device: str) -> str:
+        """Redfish endpoint of a drive, from its key in the storage data."""
+        for drives in self._sys.get("storage", {}).values():
+            if device in drives:
+                return drives[device]["redfish_endpoint"]
+        raise KeyError(f"drive '{device}' not found")
+
+    def get_chassis_endpoint(self) -> str:
+        """Chassis containing the system: the first one the system links to,
+        else the first member of the Chassis collection."""
+        for member in self.endpoints["systems"].get_members_names():
+            links = self._system.get(member, {}).get("Links") or {}
+            for chassis in links.get("Chassis") or []:
+                if isinstance(chassis, dict) and chassis.get("@odata.id"):
+                    return chassis["@odata.id"]
+        members = self.endpoints["chassis"].get_members_endpoints()
+        if not members:
+            raise KeyError("no chassis found")
+        return list(members.values())[0]
+
+    def get_led_state(self, endpoint: str) -> Dict[str, Any]:
+        _, data, status = self.client.query(method="GET", endpoint=endpoint)
+        resource = json.loads(data) if data else {}
+        return {
+            "http_code": status,
+            "LocationIndicatorActive": resource.get("LocationIndicatorActive"),
+        }
+
+    def set_led_state(self, endpoint: str, data: Dict[str, Any]) -> int:
+        _, _, status = self.client.query(
+            data=json.dumps(data), method="PATCH", endpoint=endpoint
+        )
+        return status
+
     def device_led_on(self, device: str) -> int:
-        raise NotImplementedError()
+        return self.set_device_led(device, {"LocationIndicatorActive": True})
 
     def device_led_off(self, device: str) -> int:
-        raise NotImplementedError()
+        return self.set_device_led(device, {"LocationIndicatorActive": False})
 
     def chassis_led_on(self) -> int:
-        raise NotImplementedError()
+        return self.set_chassis_led({"LocationIndicatorActive": True})
 
     def chassis_led_off(self) -> int:
-        raise NotImplementedError()
+        return self.set_chassis_led({"LocationIndicatorActive": False})
 
     def get_device_led(self, device: str) -> Dict[str, Any]:
-        raise NotImplementedError()
+        return self.get_led_state(self.get_drive_endpoint(device))
 
-    def set_device_led(self, device: str, data: Dict[str, bool]) -> int:
-        raise NotImplementedError()
+    def set_device_led(self, device: str, data: Dict[str, Any]) -> int:
+        return self.set_led_state(self.get_drive_endpoint(device), data)
 
     def get_chassis_led(self) -> Dict[str, Any]:
-        raise NotImplementedError()
+        return self.get_led_state(self.get_chassis_endpoint())
 
-    def set_chassis_led(self, data: Dict[str, str]) -> int:
-        raise NotImplementedError()
+    def set_chassis_led(self, data: Dict[str, Any]) -> int:
+        return self.set_led_state(self.get_chassis_endpoint(), data)
 
     def shutdown_host(self, force: bool = False) -> int:
         raise NotImplementedError()

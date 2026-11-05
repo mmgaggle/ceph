@@ -194,8 +194,11 @@ class API(Server):
             raise cherrypy.HTTPError(400, msg)
 
         if led_type == "drive":
-            id_drive_required = not id_drive
-            if id_drive_required or id_drive not in self.backend.get_storage():
+            # storage is reported per system: {system_id: {drive_id: ...}}
+            storage = self.backend.get_storage()
+            if not id_drive or not any(
+                id_drive in drives for drives in storage.values()
+            ):
                 msg = "A valid device ID must be provided."
                 self.log.warning(msg)
                 raise cherrypy.HTTPError(400, msg)
@@ -238,6 +241,12 @@ class API(Server):
 
         except HTTPError as e:
             raise cherrypy.HTTPError(e.code, e.reason)
+        except NotImplementedError:
+            raise cherrypy.HTTPError(
+                501, f"{led_type} LED is not supported by this Redfish provider."
+            )
+        except KeyError as e:
+            raise cherrypy.HTTPError(404, str(e))
         return result
 
     @cherrypy.expose

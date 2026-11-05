@@ -47,7 +47,7 @@ class RedfishDellSystem(BaseRedfishSystem):
         return result
 
     def get_device_led(self, device: str) -> Dict[str, Any]:
-        endpoint = self._sys["storage"][device]["redfish_endpoint"]
+        endpoint = self.get_drive_endpoint(device)
         try:
             result = self.client.query(method="GET", endpoint=endpoint, timeout=10)
         except HTTPError as e:
@@ -70,7 +70,7 @@ class RedfishDellSystem(BaseRedfishSystem):
             _, _, status = self.client.query(
                 data=json.dumps(data),
                 method="PATCH",
-                endpoint=self._sys["storage"][device]["redfish_endpoint"],
+                endpoint=self.get_drive_endpoint(device),
             )
         except (HTTPError, KeyError) as e:
             self.log.error(

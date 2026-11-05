@@ -384,8 +384,9 @@ class NodeProxyEndpoint:
             payload['state'] = data['state']
 
             if led_type == 'drive':
-                if id_drive not in self.mgr.node_proxy_cache.data[hostname]['status']['storage'].keys():
-                    # TODO(guits): update unit test for this
+                # storage is reported per system: {system_id: {drive_id: ...}}
+                storage = self.mgr.node_proxy_cache.data[hostname]['status']['storage']
+                if not any(id_drive in drives for drives in storage.values()):
                     msg = f"'{id_drive}' not found."
                     self.mgr.log.debug(msg)
                     raise cherrypy.HTTPError(400, msg)
@@ -404,6 +405,7 @@ class NodeProxyEndpoint:
             response_json = json.loads(result)
         except HTTPError as e:
             self.mgr.log.debug(e)
+            raise cherrypy.HTTPError(e.code, e.reason)
         except URLError:
             raise cherrypy.HTTPError(502, f'Make sure the node-proxy agent is deployed and running on {hostname}')
 

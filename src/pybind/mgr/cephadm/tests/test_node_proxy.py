@@ -3,7 +3,7 @@ import json
 import pytest
 import socket
 from _pytest.monkeypatch import MonkeyPatch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from cherrypy.test import helper
 from cephadm.agent import NodeProxyEndpoint
 from unittest.mock import MagicMock, call, patch
@@ -213,6 +213,37 @@ class TestNodeProxyEndpoint(helper.CPWebCase):
             p.return_value = [], '{}', 200
             self.getPage("/host01/led/drive/123", method="GET", headers=self.keyring_headers())
             self.assertStatus('200 OK')
+
+    def test_set_drive_led(self):
+        # drives are reported per system: {'1': {'disk.bay.8:...': {...}}}
+        data = '{"state": "on", "keyring": "fake-secret01"}'
+        drive = 'disk.bay.8:enclosure.internal.0-1:nonraid.slot.2-1'
+        with patch('cephadm.agent.http_req') as p:
+            p.return_value = [], '204', 200
+            self.getPage(f"/host01/led/drive/{drive}", method="PATCH", body=data,
+                         headers=[('Content-Type', 'application/json'),
+                                  ('Content-Length', str(len(data)))])
+            self.assertStatus('200 OK')
+            self.assertEqual(p.call_args.kwargs['endpoint'], f'/led/drive/{drive}')
+
+    def test_set_drive_led_unknown_drive(self):
+        data = '{"state": "on", "keyring": "fake-secret01"}'
+        with patch('cephadm.agent.http_req') as p:
+            self.getPage("/host01/led/drive/nope", method="PATCH", body=data,
+                         headers=[('Content-Type', 'application/json'),
+                                  ('Content-Length', str(len(data)))])
+            self.assertStatus('400 Bad Request')
+            p.assert_not_called()
+
+    def test_set_chassis_led_node_proxy_error(self):
+        data = '{"state": "on", "keyring": "fake-secret01"}'
+        with patch('cephadm.agent.http_req') as p:
+            p.side_effect = HTTPError('https://host01:9456/led/chassis', 405,
+                                      'Method Not Allowed', None, None)
+            self.getPage("/host01/led/chassis", method="PATCH", body=data,
+                         headers=[('Content-Type', 'application/json'),
+                                  ('Content-Length', str(len(data)))])
+            self.assertStatus('405 Method Not Allowed')
 
     def test_get_missing_keyring(self):
         self.getPage("/host02/fullreport", method="GET")

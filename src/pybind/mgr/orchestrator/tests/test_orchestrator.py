@@ -312,6 +312,28 @@ def test_orch_device_ls():
         assert r.stderr == ''
 
 
+def test_hardware_status_storage_shows_drive_id():
+    # the drive ID is what 'orch hardware light drive' takes
+    data = {'host01': {'1': {'slot-17': {
+        'description': 'Enclosure1:Drive17', 'model': 'ST20000NM002D',
+        'capacity_bytes': 20000588955648, 'protocol': 'SAS',
+        'serial_number': 'ZL000017', 'slot': 17, 'firmware_version': 'ECH8',
+        'status': {'health': 'OK', 'state': 'Enabled'}}}}}
+    with mock.patch('orchestrator.OrchestratorCli.node_proxy_common',
+                    return_value=OrchResult(data)):
+        m = OrchestratorCli('orchestrator', 0, 0)
+        r = m._handle_command(None, {'prefix': 'orch hardware status',
+                                     'category': 'storage'})
+    assert r.retval == 0
+    header, row = [line for line in r.stdout.splitlines() if line.startswith('|')]
+    cells = dict(zip([c.strip() for c in header.split('|')[1:-1]],
+                     [c.strip() for c in row.split('|')[1:-1]]))
+    assert cells['ID'] == 'slot-17'
+    assert cells['NAME'] == 'Enclosure1:Drive17'
+    assert cells['SLOT'] == '17'
+    assert cells['STATUS'] == 'OK'
+
+
 def test_preview_table_osd_smoke():
     data = [
         {

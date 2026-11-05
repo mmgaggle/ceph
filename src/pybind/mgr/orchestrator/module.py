@@ -537,7 +537,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
             'firmware': ['HOST', 'COMPONENT', 'NAME', 'DATE', 'VERSION', 'STATUS'],
             'criticals': ['HOST', 'SYS_ID', 'COMPONENT', 'NAME', 'STATUS', 'STATE'],
             'memory': ['HOST', 'SYS_ID', 'NAME', 'STATUS', 'STATE'],
-            'storage': ['HOST', 'SYS_ID', 'NAME', 'MODEL', 'SIZE', 'PROTOCOL', 'SN', 'SLOT', 'FW', 'STATUS', 'STATE'],
+            'storage': ['HOST', 'SYS_ID', 'ID', 'NAME', 'MODEL', 'SIZE', 'PROTOCOL', 'SN', 'SLOT', 'FW', 'STATUS', 'STATE'],
             'processors': ['HOST', 'SYS_ID', 'NAME', 'MODEL', 'CORES', 'THREADS', 'STATUS', 'STATE'],
             'network': ['HOST', 'SYS_ID', 'NAME', 'SPEED', 'STATUS', 'STATE'],
             'power': ['HOST', 'CHASSIS_ID', 'ID', 'NAME', 'MODEL', 'MANUFACTURER', 'STATUS', 'STATE'],
@@ -656,7 +656,8 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
                             row.append(v['status'][field])
                         else:
                             row.append('')
-                    if category in ('power', 'fans', 'temperatures', 'processors'):
+                    # the ID is what 'orch hardware light' takes for a drive
+                    if category in ('storage', 'power', 'fans', 'temperatures', 'processors'):
                         table.add_row((host, sys_id,) + (k,) + tuple(row))
                     else:
                         table.add_row((host, sys_id,) + tuple(row))

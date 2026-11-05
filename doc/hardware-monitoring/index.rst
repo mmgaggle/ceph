@@ -132,12 +132,19 @@ ______________________
 .. prompt:: bash # auto
 
   # ceph orch hardware status node-10 --category storage
-  +---------+--------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
-  |   HOST  | SYS_ID |                          NAME                         |      MODEL       |      SIZE      | PROTOCOL |       SN       | SLOT | FW | STATUS |  STATE  |
-  +---------+--------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
-  | node-10 |   1    | Disk 8 in Backplane 1 of Storage Controller in Slot 2 | ST20000NM008D-3D | 20000588955136 |   SATA   |    ZVT99QLL    |  8   |    |   OK   | Enabled |
-  | node-10 |   1    | Disk 0 in Backplane 0 of Storage Controller in Slot 2 | MZ7L33T8HBNAAD3  | 3840755981824  |   SATA   | S6M5NE0T800539 |  0   |    |   OK   | Enabled |
-  +---------+--------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
+  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
+  |   HOST  | SYS_ID |                         ID                         |                          NAME                         |      MODEL       |      SIZE      | PROTOCOL |       SN       | SLOT | FW | STATUS |  STATE  |
+  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
+  | node-10 |   1    | disk.bay.8:enclosure.internal.0-1:nonraid.slot.2-1 | Disk 8 in Backplane 1 of Storage Controller in Slot 2 | ST20000NM008D-3D | 20000588955136 |   SATA   |    ZVT99QLL    |  8   |    |   OK   | Enabled |
+  | node-10 |   1    | disk.bay.0:enclosure.internal.0-1:nonraid.slot.2-1 | Disk 0 in Backplane 0 of Storage Controller in Slot 2 | MZ7L33T8HBNAAD3  | 3840755981824  |   SATA   | S6M5NE0T800539 |  0   |    |   OK   | Enabled |
+  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
+
+The ID of a drive is the device to pass to ``ceph orch hardware light``, for
+instance to turn on the identify LED of the first drive above:
+
+.. prompt:: bash # auto
+
+  # ceph orch hardware light drive on node-10 disk.bay.8:enclosure.internal.0-1:nonraid.slot.2-1
 
 
 Processors Report

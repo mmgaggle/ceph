@@ -1,6 +1,7 @@
 from typing import Dict
 from unittest import TestCase, mock
 import errno
+import math
 
 from prometheus.module import Metric, LabelValues, Number, HealthHistory, ThreadSafeLRUCacheDict, Module
 import json
@@ -736,6 +737,54 @@ class HardwareMetricsTest(TestCase):
         self.module._process_processors(self.status, self.hostname)
         for labels in self.module.metrics['hardware_cpu_cores'].value:
             self.assertEqual(len(labels), 5)
+
+    # --- values the Redfish service does not report ---
+
+    def test_unreported_values_export_nan(self):
+        """
+        node-proxy turns the fields a Redfish service does not provide into
+        'unknown': the series are kept with a NaN value, along with the
+        health, and the exposition stays valid.
+        """
+        status = {
+            'storage': {'1': {'driveslot-2': {
+                'capacity_bytes': 'unknown', 'model': 'FCM4', 'protocol': 'unknown',
+                'firmware_version': 'unknown', 'slot': 2, 'serial_number': 'FCM0002',
+                'status': {'health': 'Warning', 'state': 'Enabled'}}}},
+            'processors': {'1': {'cpu-1': {
+                'total_cores': 'unknown', 'total_threads': 'unknown',
+                'manufacturer': 'unknown', 'model': 'unknown', 'status': 'unknown'}}},
+            'memory': {'1': {'dimm1': {
+                'capacity_mi_b': 'unknown', 'memory_device_type': 'unknown',
+                'status': {'health': 'OK', 'state': 'Enabled'}}}},
+        }
+        self.module._process_storage(status, self.hostname)
+        self.module._process_processors(status, self.hostname)
+        self.module._process_memory(status, self.hostname)
+
+        for key in ('hardware_storage_capacity_bytes', 'hardware_cpu_cores',
+                    'hardware_memory_capacity_bytes'):
+            values = list(self.module.metrics[key].value.values())
+            self.assertEqual(len(values), 1, key)
+            self.assertTrue(math.isnan(values[0]), key)
+            self.assertIn(' NaN', self.module.metrics[key].str_expfmt())
+        health = self.module.metrics['hardware_status'].value
+        self.assertEqual(
+            health[(self.hostname, 'driveslot-2', 'storage', 'Enabled')], 1)
+        self.assertEqual(health[(self.hostname, 'dimm1', 'memory', 'Enabled')], 0)
+        self.module.metrics['hardware_status'].str_expfmt()
+
+    def test_missing_values_export_nan(self):
+        status = {'storage': {'1': {'slot-1': {'model': 'ST20000NM'}}}}
+        self.module._process_storage(status, self.hostname)
+        (value,) = self.module.metrics['hardware_storage_capacity_bytes'].value.values()
+        self.assertTrue(math.isnan(value))
+
+    def test_numeric_strings_are_exported(self):
+        status = {'storage': {'1': {'slot-1': {'capacity_bytes': '1000'}}}}
+        self.module._process_storage(status, self.hostname)
+        (value,) = self.module.metrics['hardware_storage_capacity_bytes'].value.values()
+        self.assertEqual(value, 1000.0)
 
 
 class RgwSyncMetricsTest(TestCase):

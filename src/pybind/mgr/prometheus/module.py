@@ -194,6 +194,20 @@ HW_CPU_LABELS = ('hostname', 'cpu', 'manufacturer', 'model', 'total_threads')
 HW_MEMORY_LABELS = ('hostname', 'dimm', 'type')
 MIB_TO_BYTES = 1048576
 
+
+def hw_value(value: Any) -> float:
+    """Numeric value of a node-proxy field, NaN when it is not reported.
+
+    node-proxy reports the fields a Redfish service does not provide as the
+    string 'unknown'. NaN keeps the series and its inventory labels while
+    exporting the string would fail the whole collection.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+
 HW_STATUS_LABELS = ('hostname', 'component', 'category', 'state')
 
 HW_TEMP_LABELS = ('hostname', 'sensor_name')
@@ -2280,7 +2294,7 @@ class Module(MgrModule, OrchestratorClientMixin):
     def _process_storage(self, status: Dict[str, Any], hostname: str) -> None:
         """Set storage capacity and health metrics per drive."""
         for device_id, device in self._hw_iter_components(status, 'storage'):
-            capacity = device.get('capacity_bytes', 0)
+            capacity = hw_value(device.get('capacity_bytes'))
             labels = (
                 hostname,
                 device_id,
@@ -2296,7 +2310,7 @@ class Module(MgrModule, OrchestratorClientMixin):
     def _process_processors(self, status: Dict[str, Any], hostname: str) -> None:
         """Set CPU cores count and health metrics per processor."""
         for cpu_id, cpu in self._hw_iter_components(status, 'processors'):
-            cores = cpu.get('total_cores', 0)
+            cores = hw_value(cpu.get('total_cores'))
             labels = (
                 hostname,
                 cpu_id,
@@ -2310,8 +2324,7 @@ class Module(MgrModule, OrchestratorClientMixin):
     def _process_memory(self, status: Dict[str, Any], hostname: str) -> None:
         """Set memory capacity (in bytes) and health metrics per DIMM."""
         for dimm_id, dimm in self._hw_iter_components(status, 'memory'):
-            capacity_mib = dimm.get('capacity_mi_b', 0)
-            capacity_bytes = capacity_mib * MIB_TO_BYTES
+            capacity_bytes = hw_value(dimm.get('capacity_mi_b')) * MIB_TO_BYTES
             labels = (
                 hostname,
                 dimm_id,

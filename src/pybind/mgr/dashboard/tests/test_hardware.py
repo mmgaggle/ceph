@@ -269,6 +269,21 @@ class CategoryModelTest(unittest.TestCase):
     def test_empty_is_unknown(self):
         self.assertIs(Category.from_raw(SensorComponent, {}).health, Health.UNKNOWN)
 
+    def test_drive_encryption(self):
+        condition = {'message_id': 'IBMEncryption.1.0.CredentialMissing',
+                     'message': 'The drive is locked and Vault has no credential for it.',
+                     'severity': 'Critical'}
+        drive = StorageComponent.from_raw('CS1CAN01', 'driveslot-5', {
+            'description': 'Enclosure0:Drive5', 'encryption_ability': 'SelfEncryptingDrive',
+            'encryption_status': 'Foreign', 'security_id_owned': True,
+            'conditions': [condition], 'status': {'health': 'Critical', 'state': 'Enabled'}})
+        self.assertEqual((drive.encryption_ability, drive.encryption_status,
+                          drive.security_id_owned), ('SelfEncryptingDrive', 'Foreign', True))
+        self.assertEqual(drive.conditions, [condition])
+        self.assertIs(drive.health, Health.CRITICAL)
+        plain = StorageComponent.from_raw('1', 'slot-17', {'status': {'health': 'OK'}})
+        self.assertIsNone(plain.encryption_status)
+
     def test_all_unknown_is_unknown(self):
         category = Category.from_raw(SensorComponent, {'1': {'f': {'status': {}}}})
         self.assertIs(category.health, Health.UNKNOWN)

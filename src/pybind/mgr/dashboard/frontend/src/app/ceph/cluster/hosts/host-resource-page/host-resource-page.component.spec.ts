@@ -289,6 +289,47 @@ describe('HostResourcePageComponent', () => {
       expect(sections[1].query(By.css('cd-table'))).toBeTruthy();
     });
 
+    it('should show the encryption of the drives and why one is locked', () => {
+      const fcm = (id: string, health: string, encryption_status: string, message?: string) => ({
+        ...drive(id, health),
+        encryption_status,
+        conditions: message ? [{ message, severity: health }] : []
+      });
+      load(
+        of({
+          ...report,
+          status: {
+            ...report.status,
+            storage: {
+              total: 4,
+              components: [
+                fcm('driveslot-5', 'OK', 'Unlocked'),
+                fcm('driveslot-6', 'Warning', 'Locked', 'HAL cannot read its credential.'),
+                fcm('driveslot-7', 'Critical', 'Foreign', 'Vault has no credential for it.'),
+                drive('slot-17', 'OK')
+              ]
+            }
+          }
+        })
+      );
+
+      expect(component.hardwareDrives().map((d) => [d.id, d.encryption, d.problems])).toEqual([
+        ['driveslot-5', 'Unlocked', '-'],
+        ['driveslot-6', 'Locked', 'HAL cannot read its credential.'],
+        ['driveslot-7', 'Locked, no key', 'Vault has no credential for it.'],
+        ['slot-17', '-', '-']
+      ]);
+      expect(component.hardwareDriveColumns().map((c) => c.prop)).toEqual([
+        'id',
+        'protocol',
+        'model',
+        'firmware_version',
+        'encryption',
+        'health',
+        'problems'
+      ]);
+    });
+
     it('should hide the hardware drives when the host reports none', () => {
       load(of({ ...report, status: { ...report.status, storage: { total: 0, components: [] } } }));
 

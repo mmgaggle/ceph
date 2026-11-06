@@ -128,6 +128,12 @@ class RawStorage(RawComponent, total=False):
     location_indicator_active: Union[bool, Unknown]
     redfish_endpoint: str
     physical_location: Union['RawPhysicalLocation', Unknown]
+    # self-encrypting drives: Redfish Drive EncryptionAbility,
+    # EncryptionStatus (Unencrypted, Unlocked, Locked, Foreign), SecurityIDOwned
+    encryption_ability: str
+    encryption_status: str
+    security_id_owned: Union[bool, Unknown]
+    conditions: List['RawCondition']
 
 
 class RawProcessor(RawComponent, total=False):
@@ -484,6 +490,10 @@ class StorageComponent(Component):
     capacity_bytes: Optional[IntOrUnknown] = None
     firmware_version: Optional[str] = None
     slot: Optional[Union[int, str]] = None
+    encryption_ability: Optional[str] = None
+    encryption_status: Optional[str] = None
+    security_id_owned: Optional[Union[bool, Unknown]] = None
+    conditions: Optional[List[RawCondition]] = None
 
 
 @dataclass

@@ -61,6 +61,24 @@ function temperatures(report: HardwareHostResponse | null, context: string): num
     .filter((reading): reading is number => typeof reading === 'number');
 }
 
+/* Redfish EncryptionStatus of a self-encrypting drive. */
+const ENCRYPTION_STATUS: Record<string, string> = {
+  Unencrypted: $localize`Not secured`,
+  Unlocked: $localize`Unlocked`,
+  Locked: $localize`Locked`,
+  Foreign: $localize`Locked, no key`
+};
+
+/* The messages of a component's conditions, "-" when there is none. */
+function problems(component: HardwareComponent): string {
+  return (
+    (component.conditions ?? [])
+      .map((condition) => condition.message)
+      .filter(Boolean)
+      .join(' ') || '-'
+  );
+}
+
 /* Redfish LinkStatus of an interface or port. */
 const LINK_STATUS: Record<string, string> = {
   LinkUp: $localize`Up`,
@@ -134,7 +152,9 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
   readonly hardwareDrives = computed(() =>
     (this.hardware()?.status.storage.components ?? []).map((drive) => ({
       ...drive,
-      uid: `${drive.chassis_id}/${drive.id}`
+      uid: `${drive.chassis_id}/${drive.id}`,
+      encryption: ENCRYPTION_STATUS[drive.encryption_status ?? ''] ?? '-',
+      problems: problems(drive)
     }))
   );
 
@@ -144,7 +164,9 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
     { name: $localize`Type`, prop: 'protocol', flexGrow: 2 },
     { name: $localize`Model`, prop: 'model', flexGrow: 2 },
     { name: $localize`Firmware`, prop: 'firmware_version', flexGrow: 1 },
-    { name: $localize`Health`, prop: 'health', flexGrow: 1, cellTemplate: this.driveHealthTpl() }
+    { name: $localize`Encryption`, prop: 'encryption', flexGrow: 1 },
+    { name: $localize`Health`, prop: 'health', flexGrow: 1, cellTemplate: this.driveHealthTpl() },
+    { name: $localize`Problems`, prop: 'problems', flexGrow: 3 }
   ]);
   readonly driveHealth = DRIVE_HEALTH;
 
@@ -166,11 +188,7 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
           ? [nic.sfp.type, receivePower(nic.transceiver)].filter(Boolean).join(' · ')
           : '-',
         errors: errors.some(known) ? errors.map((n) => (known(n) ? n : '-')).join(' / ') : '-',
-        problems:
-          (nic.conditions ?? [])
-            .map((condition) => condition.message)
-            .filter(Boolean)
-            .join(' ') || '-'
+        problems: problems(nic)
       };
     })
   );

@@ -47,6 +47,10 @@ export interface HardwareComponent {
   protocol?: string;
   model?: string;
   firmware_version?: string;
+  /* Self-encrypting drives: Unencrypted, Unlocked, Locked or Foreign */
+  encryption_ability?: string;
+  encryption_status?: string;
+  security_id_owned?: boolean | 'unknown';
   /* Network interfaces (network): ports, bonds and VLANs */
   speed_mbps?: number | 'unknown';
   link_status?: string;

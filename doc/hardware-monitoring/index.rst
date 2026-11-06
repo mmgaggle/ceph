@@ -253,6 +253,42 @@ _________________________________
   +---------+--------+-----------+------------+----------+-----------+
 
 
+Network Report
+______________
+
+Each network interface of a host: its ports, and the bonds and VLANs on top
+of them. ``node-proxy`` reads the standard Redfish ``EthernetInterface`` of
+each one and, when the Redfish service links it, its ``Port`` (link,
+transceiver, and the switch port it connects to, from LLDP), the port's
+``PortMetrics`` (counters and optics) and ``EnvironmentMetrics``:
+
+.. prompt:: bash # auto
+
+  # ceph orch hardware status node-10 --category network
+  +---------+----------+------------+-----------+----------+---------+-----------------------------+--------------+---------+---------+
+  |   HOST  |  SYS_ID  |    NAME    |    TYPE   |   LINK   |  SPEED  |         SWITCH PORT         | RX/TX ERRORS |  STATUS |  STATE  |
+  +---------+----------+------------+-----------+----------+---------+-----------------------------+--------------+---------+---------+
+  | node-10 | CS1CAN01 | ens51f0np0 |    port   |  LinkUp  |  100000 |  ceph-perf-top et-0/0/0:1   |     0/0      |    OK   | Enabled |
+  | node-10 | CS1CAN01 | ens51f1np1 |    port   | LinkDown | unknown | ceph-perf-bottom et-0/0/0:1 |     0/0      | Warning | Enabled |
+  | node-10 | CS1CAN01 |   bond0    |    bond   |  LinkUp  |  100000 |                             |              | Warning | Enabled |
+  | node-10 | CS1CAN01 |  vlan1305  | vlan 1305 |  LinkUp  |  100000 |                             |              |    OK   | Enabled |
+  +---------+----------+------------+-----------+----------+---------+-----------------------------+--------------+---------+---------+
+
+When the Redfish service says what is wrong (``Status.Conditions``), the
+``HARDWARE_*`` health warnings say it too:
+
+.. prompt:: bash # auto
+
+  # ceph health detail
+  [WRN] HARDWARE_NETWORK: 2 network members are not ok
+      [CS1CAN01]: ethernetinterfaces_ens51f1np1 is warning: Enabled: The connection is no longer active for network adapter 'Slot-51' port 'ens51f1np1' function '1'.
+      [CS1CAN01]: ethernetinterfaces_bond0 is warning: Enabled: Only 1 of the 2 member interfaces of team 'bond0' are active. Inactive: ens51f1np1 (no link).
+
+``--format json`` gives every detail: addresses, bond members, the LLDP
+neighbor, the transceiver and its receive power per lane, counters and
+conditions. In the dashboard, a host's page has a *Network ports* table.
+
+
 Diagnostic Data
 ---------------
 

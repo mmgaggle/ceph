@@ -207,3 +207,55 @@ class NodeProxy(CephService):
             raise RuntimeError(e)
 
         return result_json
+
+    # Diagnostic data (drive dumps) collected by the Redfish service of a
+    # host, through its node-proxy API (/diagnostics).
+
+    def _diagnostics_query(self,
+                           hostname: str,
+                           endpoint: str,
+                           method: str = 'GET',
+                           payload: Optional[Dict[str, Any]] = None,
+                           raw: bool = False,
+                           timeout: Optional[int] = None) -> Tuple[Any, Any, int]:
+        addr: str = self.mgr.inventory.get_addr(hostname)
+        try:
+            return http_req(hostname=addr,
+                            port='9456',
+                            headers=self.generate_auth_header(hostname),
+                            method=method,
+                            data=json.dumps(payload) if payload is not None else None,
+                            endpoint=endpoint,
+                            ssl_ctx=self.get_ssl_ctx(),
+                            timeout=timeout,
+                            raw=raw)
+        except HTTPError as e:
+            self.mgr.log.error(e)
+            raise
+        except URLError as e:
+            raise RuntimeError(e)
+
+    def diagnostics(self, hostname: str) -> List[Dict[str, Any]]:
+        _, result, _ = self._diagnostics_query(hostname, '/diagnostics')
+        entries: List[Dict[str, Any]] = json.loads(result)
+        return entries
+
+    def collect_diagnostics(self, hostname: str, device: str) -> Dict[str, Any]:
+        _, result, _ = self._diagnostics_query(hostname, '/diagnostics', 'POST',
+                                               {'drive': device})
+        task: Dict[str, Any] = json.loads(result)
+        return task
+
+    def diagnostics_task(self, hostname: str, task_id: str) -> Dict[str, Any]:
+        _, result, _ = self._diagnostics_query(hostname, f'/diagnostics/tasks/{task_id}')
+        task: Dict[str, Any] = json.loads(result)
+        return task
+
+    def download_diagnostics(self, hostname: str, entry_id: str) -> Tuple[str, bytes]:
+        headers, content, _ = self._diagnostics_query(
+            hostname, f'/diagnostics/{entry_id}', raw=True, timeout=180)
+        filename = headers.get_filename() if hasattr(headers, 'get_filename') else None
+        return filename or f'{entry_id}.bin', content
+
+    def delete_diagnostics(self, hostname: str, entry_id: str) -> None:
+        self._diagnostics_query(hostname, f'/diagnostics/{entry_id}', 'DELETE')

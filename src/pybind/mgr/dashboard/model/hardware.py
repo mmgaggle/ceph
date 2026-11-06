@@ -149,6 +149,67 @@ class RawNetwork(RawComponent, total=False):
     name: str
     description: str
     speed_mbps: IntOrUnknown
+    # from the interface's standard Redfish resources (node-proxy network.py)
+    link_status: str
+    interface_type: str
+    team_mode: str
+    mac_address: str
+    mtu_size: IntOrUnknown
+    vlan_id: IntOrUnknown
+    addresses: List[str]
+    related_interfaces: List[str]
+    affiliated_interfaces: List[str]
+    conditions: List['RawCondition']
+    port_link_status: str
+    current_speed_gbps: FloatOrUnknown
+    max_speed_gbps: FloatOrUnknown
+    link_transitions: IntOrUnknown
+    port_medium: str
+    location: str
+    lldp: 'RawLldpNeighbor'
+    sfp: 'RawSfp'
+    rx_bytes: IntOrUnknown
+    tx_bytes: IntOrUnknown
+    rx_errors: IntOrUnknown
+    tx_errors: IntOrUnknown
+    rx_fcs_errors: IntOrUnknown
+    rx_discards: IntOrUnknown
+    tx_discards: IntOrUnknown
+    transceiver: 'RawTransceiver'
+    transceiver_temperature_c: FloatOrUnknown
+
+
+class RawCondition(TypedDict, total=False):
+    message_id: str
+    message: str
+    severity: str
+    timestamp: str
+
+
+class RawLldpNeighbor(TypedDict, total=False):
+    system_name: str
+    chassis_id: str
+    port_id: str
+    management_address: str
+    system_description: str
+
+
+class RawSfp(TypedDict, total=False):
+    type: str
+    manufacturer: str
+    part_number: str
+    serial_number: str
+    medium_type: str
+    fiber_connection_type: str
+    health: str
+
+
+class RawTransceiver(TypedDict, total=False):
+    supply_voltage: FloatOrUnknown
+    wavelength_nm: str
+    rx_power_mw: List[float]
+    tx_power_mw: List[float]
+    tx_bias_ma: List[float]
 
 
 class RawPower(RawComponent, total=False):
@@ -443,10 +504,37 @@ class MemoryComponent(Component):
 
 
 @dataclass
-class NetworkComponent(Component):
+class NetworkComponent(Component):  # pylint: disable=too-many-instance-attributes
     name: Optional[str] = None
     description: Optional[str] = None
     speed_mbps: Optional[IntOrUnknown] = None
+    link_status: Optional[str] = None
+    interface_type: Optional[str] = None
+    team_mode: Optional[str] = None
+    mac_address: Optional[str] = None
+    mtu_size: Optional[IntOrUnknown] = None
+    vlan_id: Optional[IntOrUnknown] = None
+    addresses: Optional[List[str]] = None
+    related_interfaces: Optional[List[str]] = None
+    affiliated_interfaces: Optional[List[str]] = None
+    conditions: Optional[List[RawCondition]] = None
+    port_link_status: Optional[str] = None
+    current_speed_gbps: Optional[FloatOrUnknown] = None
+    max_speed_gbps: Optional[FloatOrUnknown] = None
+    link_transitions: Optional[IntOrUnknown] = None
+    port_medium: Optional[str] = None
+    location: Optional[str] = None
+    lldp: Optional[RawLldpNeighbor] = None
+    sfp: Optional[RawSfp] = None
+    rx_bytes: Optional[IntOrUnknown] = None
+    tx_bytes: Optional[IntOrUnknown] = None
+    rx_errors: Optional[IntOrUnknown] = None
+    tx_errors: Optional[IntOrUnknown] = None
+    rx_fcs_errors: Optional[IntOrUnknown] = None
+    rx_discards: Optional[IntOrUnknown] = None
+    tx_discards: Optional[IntOrUnknown] = None
+    transceiver: Optional[RawTransceiver] = None
+    transceiver_temperature_c: Optional[FloatOrUnknown] = None
 
 
 @dataclass

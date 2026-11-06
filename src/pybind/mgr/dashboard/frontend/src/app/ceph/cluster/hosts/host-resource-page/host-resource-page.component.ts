@@ -25,6 +25,7 @@ import {
   ACTIVE_TASK_STATES,
   DiagnosticsEntry,
   DiagnosticsTask,
+  HardwareComponent,
   HardwareHealth,
   HardwareHostResponse
 } from '~/app/shared/enum/hardware.enum';
@@ -58,6 +59,50 @@ function temperatures(report: HardwareHostResponse | null, context: string): num
     .filter((sensor) => sensor.physical_context === context)
     .map((sensor) => sensor.reading)
     .filter((reading): reading is number => typeof reading === 'number');
+}
+
+/* Redfish LinkStatus of an interface or port. */
+const LINK_STATUS: Record<string, string> = {
+  LinkUp: $localize`Up`,
+  LinkDown: $localize`Down`,
+  NoLink: $localize`No link`
+};
+
+/* Link speed: 100000 -> "100 Gb/s", 100 -> "100 Mb/s"; "-" when unknown or down. */
+export function linkSpeed(mbps: unknown): string {
+  if (typeof mbps !== 'number' || mbps <= 0) {
+    return '-';
+  }
+  return mbps >= 1000 ? `${+(mbps / 1000).toFixed(1)} Gb/s` : `${mbps} Mb/s`;
+}
+
+/* Optical power received on the lanes whose laser is on: "-0.5, -0.6 dBm". */
+export function receivePower(transceiver: HardwareComponent['transceiver']): string {
+  const received = transceiver?.rx_power_mw ?? [];
+  const bias = transceiver?.tx_bias_ma ?? [];
+  const dbm = received
+    .filter((power, lane) => typeof power === 'number' && power > 0 && (bias[lane] ?? 1) > 0)
+    .map((power) => (10 * Math.log10(power)).toFixed(1));
+  return dbm.length ? `${dbm.join(', ')} dBm` : '';
+}
+
+const known = <T>(value: T | 'unknown' | undefined): value is T =>
+  value !== undefined && value !== null && value !== 'unknown';
+
+/* Port, bond or VLAN, with what it stacks on or carries. */
+function interfaceKind(nic: HardwareComponent): string {
+  const related = (nic.related_interfaces ?? []).join(', ');
+  const affiliated = (nic.affiliated_interfaces ?? []).join(', ');
+  if (known(nic.vlan_id)) {
+    return related ? $localize`VLAN ${nic.vlan_id} on ${related}` : $localize`VLAN ${nic.vlan_id}`;
+  }
+  if (known(nic.team_mode) && nic.team_mode !== 'None') {
+    return related ? $localize`Bond of ${related}` : $localize`Bond`;
+  }
+  if (nic.interface_type === 'Physical') {
+    return affiliated ? $localize`Port in ${affiliated}` : $localize`Port`;
+  }
+  return '-';
 }
 
 /* Hottest sensor with this PhysicalContext, e.g. "52°C". */
@@ -102,6 +147,44 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
     { name: $localize`Health`, prop: 'health', flexGrow: 1, cellTemplate: this.driveHealthTpl() }
   ]);
   readonly driveHealth = DRIVE_HEALTH;
+
+  /* Network ports, bonds and VLANs, with the switch port each port connects to (LLDP). */
+  readonly hardwareNetwork = computed(() =>
+    (this.hardware()?.status.network?.components ?? []).map((nic) => {
+      const errors = [nic.rx_errors, nic.tx_errors];
+      return {
+        ...nic,
+        uid: `${nic.chassis_id}/${nic.id}`,
+        interfaceName: known(nic.name) ? nic.name : nic.id,
+        kind: interfaceKind(nic),
+        link: LINK_STATUS[nic.link_status ?? ''] ?? '-',
+        speed: linkSpeed(nic.speed_mbps),
+        neighbor: nic.lldp?.system_name
+          ? `${nic.lldp.system_name} ${nic.lldp.port_id ?? ''}`.trim()
+          : '-',
+        optics: nic.sfp
+          ? [nic.sfp.type, receivePower(nic.transceiver)].filter(Boolean).join(' · ')
+          : '-',
+        errors: errors.some(known) ? errors.map((n) => (known(n) ? n : '-')).join(' / ') : '-',
+        problems:
+          (nic.conditions ?? [])
+            .map((condition) => condition.message)
+            .filter(Boolean)
+            .join(' ') || '-'
+      };
+    })
+  );
+  readonly hardwareNetworkColumns = computed<CdTableColumn[]>(() => [
+    { name: $localize`Interface`, prop: 'interfaceName', flexGrow: 2 },
+    { name: $localize`Type`, prop: 'kind', flexGrow: 2 },
+    { name: $localize`Link`, prop: 'link', flexGrow: 1 },
+    { name: $localize`Speed`, prop: 'speed', flexGrow: 1 },
+    { name: $localize`Switch port`, prop: 'neighbor', flexGrow: 2 },
+    { name: $localize`Transceiver`, prop: 'optics', flexGrow: 2 },
+    { name: $localize`Errors (RX / TX)`, prop: 'errors', flexGrow: 1 },
+    { name: $localize`Health`, prop: 'health', flexGrow: 1, cellTemplate: this.driveHealthTpl() },
+    { name: $localize`Problems`, prop: 'problems', flexGrow: 4 }
+  ]);
 
   private readonly notificationService = inject(NotificationService);
   private readonly modalService = inject(ModalCdsService);

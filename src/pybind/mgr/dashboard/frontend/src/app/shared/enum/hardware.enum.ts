@@ -47,6 +47,31 @@ export interface HardwareComponent {
   protocol?: string;
   model?: string;
   firmware_version?: string;
+  /* Network interfaces (network): ports, bonds and VLANs */
+  speed_mbps?: number | 'unknown';
+  link_status?: string;
+  interface_type?: string;
+  team_mode?: string;
+  mtu_size?: number | 'unknown';
+  vlan_id?: number | 'unknown';
+  related_interfaces?: string[];
+  affiliated_interfaces?: string[];
+  conditions?: HardwareCondition[];
+  location?: string;
+  lldp?: { system_name?: string; port_id?: string; chassis_id?: string };
+  sfp?: { type?: string; manufacturer?: string; part_number?: string; health?: string };
+  rx_errors?: number | 'unknown';
+  tx_errors?: number | 'unknown';
+  transceiver?: { rx_power_mw?: number[]; tx_power_mw?: number[]; tx_bias_ma?: number[] };
+  transceiver_temperature_c?: number | 'unknown';
+}
+
+/* What is wrong with a component, as its Redfish Status.Conditions say. */
+export interface HardwareCondition {
+  message_id?: string;
+  message?: string;
+  severity?: string;
+  timestamp?: string;
 }
 
 /* GET /api/hardware/hosts/{hostname}, with the fields the dashboard uses. */

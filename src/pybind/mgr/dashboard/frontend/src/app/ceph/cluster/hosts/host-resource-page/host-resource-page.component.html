@@ -62,6 +62,32 @@
         </section>
       }
 
+      @if (hardwareNetwork().length) {
+        <section class="host-resource-section cds-mt-6">
+          <h2
+            class="host-resource-section__title cds--type-heading-03"
+            i18n
+          >
+            Network ports
+          </h2>
+          <p
+            class="host-resource-section__description cds--type-body-compact-01"
+            i18n
+          >
+            Network interfaces as reported by the server's hardware: its ports, bonds and VLANs, and
+            the switch port each port connects to (LLDP).
+          </p>
+          <cd-table
+            [data]="hardwareNetwork()"
+            [columns]="hardwareNetworkColumns()"
+            columnMode="flex"
+            identifier="uid"
+            [autoReload]="false"
+          >
+          </cd-table>
+        </section>
+      }
+
       @if (diagnostics().length || activeCollections().length) {
         <section class="host-resource-section cds-mt-6">
           <h2

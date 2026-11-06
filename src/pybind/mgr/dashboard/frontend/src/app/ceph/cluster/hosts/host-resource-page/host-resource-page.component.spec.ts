@@ -295,6 +295,111 @@ describe('HostResourcePageComponent', () => {
       expect(text()).not.toContain('Hardware drives');
     });
 
+    describe('network ports', () => {
+      const dropped =
+        "The connection is no longer active for network adapter 'Slot-51' port 'ens51f1np1' " +
+        "function '1'.";
+      const nic = (fields: object) => ({ chassis_id: 'CS1CAN01', health: 'OK', ...fields });
+      // as IBM HAL reports a CS1 canister: an 802.3ad bond of two 100G ports, a VLAN on it
+      const network = {
+        total: 5,
+        components: [
+          nic({
+            id: 'ethernetinterfaces_ens51f0np0',
+            name: 'ens51f0np0',
+            interface_type: 'Physical',
+            link_status: 'LinkUp',
+            speed_mbps: 100000,
+            affiliated_interfaces: ['bond0'],
+            lldp: { system_name: 'ceph-perf-top', port_id: 'et-0/0/0:1' },
+            sfp: { type: 'QSFP28' },
+            // lanes 3 and 4 are dark
+            transceiver: { rx_power_mw: [0.8924, 0.884, 0, 0], tx_bias_ma: [7.0, 6.9, 0, 0] },
+            rx_errors: 0,
+            tx_errors: 0,
+            conditions: []
+          }),
+          nic({
+            id: 'ethernetinterfaces_ens51f1np1',
+            name: 'ens51f1np1',
+            health: 'Warning',
+            interface_type: 'Physical',
+            link_status: 'LinkDown',
+            speed_mbps: 'unknown',
+            affiliated_interfaces: ['bond0'],
+            rx_errors: 0,
+            tx_errors: 3,
+            conditions: [{ message_id: 'NetworkDevice.1.0.ConnectionDropped', message: dropped }]
+          }),
+          nic({
+            id: 'ethernetinterfaces_bond0',
+            name: 'bond0',
+            interface_type: 'Virtual',
+            team_mode: 'IEEE802_3ad',
+            related_interfaces: ['ens51f0np0', 'ens51f1np1'],
+            link_status: 'LinkUp',
+            speed_mbps: 100000
+          }),
+          nic({
+            id: 'ethernetinterfaces_vlan1305',
+            name: 'vlan1305',
+            interface_type: 'Virtual',
+            team_mode: 'None',
+            vlan_id: 1305,
+            related_interfaces: ['bond0'],
+            link_status: 'LinkUp',
+            speed_mbps: 100000
+          }),
+          // a BMC that reports none of the details
+          nic({ id: 'NIC.Integrated.1-1-1', name: 'unknown', speed_mbps: 1000 })
+        ]
+      };
+
+      it('should list the network ports below the hardware drives', () => {
+        load(of({ ...report, status: { ...report.status, network } }));
+
+        expect(
+          component
+            .hardwareNetwork()
+            .map((r) => [
+              r.interfaceName,
+              r.kind,
+              r.link,
+              r.speed,
+              r.neighbor,
+              r.optics,
+              r.errors,
+              r.problems
+            ])
+        ).toEqual([
+          [
+            'ens51f0np0',
+            'Port in bond0',
+            'Up',
+            '100 Gb/s',
+            'ceph-perf-top et-0/0/0:1',
+            'QSFP28 · -0.5, -0.5 dBm',
+            '0 / 0',
+            '-'
+          ],
+          ['ens51f1np1', 'Port in bond0', 'Down', '-', '-', '-', '0 / 3', dropped],
+          ['bond0', 'Bond of ens51f0np0, ens51f1np1', 'Up', '100 Gb/s', '-', '-', '-', '-'],
+          ['vlan1305', 'VLAN 1305 on bond0', 'Up', '100 Gb/s', '-', '-', '-', '-'],
+          ['NIC.Integrated.1-1-1', '-', '-', '1 Gb/s', '-', '-', '-', '-']
+        ]);
+        expect(component.hardwareNetwork()[1].uid).toBe('CS1CAN01/ethernetinterfaces_ens51f1np1');
+        const sections = fixture.debugElement.queryAll(By.css('section.host-resource-section'));
+        expect(sections[2].nativeElement.textContent).toContain('Network ports');
+        expect(sections[2].query(By.css('cd-table'))).toBeTruthy();
+      });
+
+      it('should hide the network ports when the host reports none', () => {
+        load(of(report));
+
+        expect(text()).not.toContain('Network ports');
+      });
+    });
+
     it('should not fetch hardware on the other tabs', () => {
       const route = TestBed.inject(ActivatedRoute);
       route.snapshot.data = { section: 'daemons' };

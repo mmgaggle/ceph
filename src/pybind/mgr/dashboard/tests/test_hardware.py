@@ -340,6 +340,40 @@ class HardwareHostResponseTest(unittest.TestCase):
             'id': 'd-0', 'chassis_id': '1', 'health': Health.OK, 'state': '',
             'model': 'SSD', 'slot': None}])
 
+    def test_network_port_details(self):
+        # a bond member port as node-proxy reports it from IBM HAL's
+        # EthernetInterface, Port and PortMetrics resources
+        condition = {'message_id': 'NetworkDevice.1.0.ConnectionDropped',
+                     'message': "The connection is no longer active for network adapter "
+                                "'Slot-51' port 'ens51f1np1' function '1'.",
+                     'severity': 'Warning', 'timestamp': '2026-11-06T00:00:00Z'}
+        port = {
+            'name': 'ens51f1np1', 'description': 'Port 2 of ConnectX-6 Dx in PCIe slot 51',
+            'speed_mbps': 'unknown', 'link_status': 'LinkDown', 'interface_type': 'Physical',
+            'mtu_size': 9000, 'affiliated_interfaces': ['bond0'], 'related_interfaces': [],
+            'conditions': [condition], 'link_transitions': 8, 'location': 'PCIe slot 51 port 2',
+            'lldp': {'system_name': 'ceph-perf-bottom', 'port_id': 'et-0/0/0:1'},
+            'sfp': {'type': 'QSFP28', 'part_number': '1W2WUA', 'health': 'OK'},
+            'rx_errors': 0, 'tx_errors': 3,
+            'transceiver': {'rx_power_mw': [0.97, 0.92], 'tx_bias_ma': [7.0, 6.9]},
+            'transceiver_temperature_c': 68.04,
+            'status': {'health': 'Warning', 'state': 'Enabled', 'conditions': [condition]},
+        }
+        raw = {'host': 'host1', 'sn': 'ABC123', 'status': {
+            'network': {'CS1CAN01': {'ethernetinterfaces_ens51f1np1': port}}}}
+        network = HardwareHostResponse.from_raw(raw).to_dict()['status']['network']
+        self.assertEqual(network['warning'], 1)
+        component = network['components'][0]
+        self.assertEqual((component['id'], component['health'], component['link_status']),
+                         ('ethernetinterfaces_ens51f1np1', Health.WARNING, 'LinkDown'))
+        self.assertEqual(component['lldp']['system_name'], 'ceph-perf-bottom')
+        self.assertEqual(component['sfp']['type'], 'QSFP28')
+        self.assertEqual(component['transceiver']['rx_power_mw'], [0.97, 0.92])
+        self.assertEqual(component['conditions'], [condition])
+        self.assertEqual(component['affiliated_interfaces'], ['bond0'])
+        # not reported: left out
+        self.assertNotIn('team_mode', component)
+
 
 class HostCompressionTest(unittest.TestCase):
     GIB = 1024 ** 3

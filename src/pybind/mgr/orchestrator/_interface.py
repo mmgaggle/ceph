@@ -361,6 +361,43 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def hardware_diagnostics_ls(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, List[Dict[str, Any]]]]:
+        """
+        List the diagnostic data (drive dumps) the hardware of the hosts keeps.
+
+        :param hostname: a host, or every host reporting node-proxy data
+        :return: {hostname: [entry, ...]}
+        """
+        raise NotImplementedError()
+
+    def hardware_diagnostics_collect(self, hostname: str, device: str) -> OrchResult[Dict[str, Any]]:
+        """
+        Start collecting the diagnostic data of a drive.
+
+        :param hostname: the host of the drive
+        :param device: the drive ID, as 'orch hardware status --category storage' shows it
+        :return: the collection task
+        """
+        raise NotImplementedError()
+
+    def hardware_diagnostics_task(self, hostname: str, task_id: str) -> OrchResult[Dict[str, Any]]:
+        """
+        Progress of a diagnostic data collection.
+        """
+        raise NotImplementedError()
+
+    def hardware_diagnostics_get(self, hostname: str, entry_id: str) -> OrchResult[Tuple[str, bytes]]:
+        """
+        Download diagnostic data: (file name, content).
+        """
+        raise NotImplementedError()
+
+    def hardware_diagnostics_rm(self, hostname: str, entry_id: str) -> OrchResult[str]:
+        """
+        Delete diagnostic data kept by the hardware of a host.
+        """
+        raise NotImplementedError()
+
     def node_proxy_list_hosts(self) -> OrchResult[List[str]]:
         """Return hostnames that have reported node-proxy data."""
         raise NotImplementedError()

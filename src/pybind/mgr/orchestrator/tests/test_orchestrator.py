@@ -854,3 +854,36 @@ class TestCertStoreCertKeySet:
             None,
             False,
         )
+
+
+DUMP = b'=== CPU Code Version ===\n\nRelease version: A5.3\r\n\xff\x00\n'
+
+
+@mock.patch("orchestrator.OrchestratorCli.hardware_diagnostics_get",
+            return_value=OrchResult(('S5.drive_dump', DUMP)))
+def test_hardware_diagnostics_get(_get):
+    m = OrchestratorCli('orchestrator', 0, 0)
+    cmd = {'prefix': 'orch hardware diagnostics get', 'hostname': 'host1', 'entry_id': 'S5'}
+    r = m._handle_command(None, cmd)
+    assert r.retval == 0
+    assert r.stdout == DUMP.decode('utf-8', 'replace')
+    # --base64: the exact bytes, whatever the command output transport does
+    r = m._handle_command(None, dict(cmd, base64=True))
+    assert r.retval == 0
+    import base64
+    assert base64.b64decode(r.stdout) == DUMP
+    _get.assert_called_with('host1', 'S5')
+
+
+@mock.patch("orchestrator.OrchestratorCli.hardware_diagnostics_ls",
+            return_value=OrchResult({'host1': [{'id': 'S5_1', 'drive': 'driveslot-5',
+                                                'created': '2026-11-06T03:56:06+00:00',
+                                                'size': 1248896, 'name': 'Dump'}]}))
+def test_hardware_diagnostics_ls(_ls):
+    m = OrchestratorCli('orchestrator', 0, 0)
+    r = m._handle_command(None, {'prefix': 'orch hardware diagnostics ls'})
+    assert r.retval == 0
+    assert r.stdout.splitlines()[1].split() == [
+        'host1', 'S5_1', 'driveslot-5', '2026-11-06T03:56:06+00:00', '1219k', 'Dump']
+    r = m._handle_command(None, {'prefix': 'orch hardware diagnostics ls', 'format': 'json'})
+    assert json.loads(r.stdout)['host1'][0]['id'] == 'S5_1'

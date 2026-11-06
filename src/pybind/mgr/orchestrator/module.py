@@ -1,5 +1,6 @@
 import enum
 import errno
+from base64 import b64encode
 import json
 import os
 import shutil
@@ -706,6 +707,71 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
     def _hardware_shutdown(self, hostname: str, force: Optional[bool] = False, yes_i_really_mean_it: bool = False) -> HandleCommandResult:
         """Shutdown a host"""
         completion = self.hardware_shutdown(hostname, force, yes_i_really_mean_it=yes_i_really_mean_it)
+        raise_if_exception(completion)
+        return HandleCommandResult(stdout=completion.result_str())
+
+    @OrchestratorCLICommand.Read('orch hardware diagnostics ls')
+    def _hardware_diagnostics_ls(self, hostname: Optional[str] = None,
+                                 format: Format = Format.plain) -> HandleCommandResult:
+        """List the diagnostic data (drive dumps) kept by the hardware of the hosts"""
+        completion = self.hardware_diagnostics_ls(hostname)
+        data = raise_if_exception(completion)
+        if format != Format.plain:
+            return HandleCommandResult(stdout=to_format(data, format, many=False, cls=None))
+        table = PrettyTable(['HOST', 'ID', 'DRIVE', 'CREATED', 'SIZE', 'NAME'], border=False)
+        table.align = 'l'
+        table.left_padding_width = 0
+        table.right_padding_width = 2
+        for host, entries in sorted(data.items()):
+            for entry in entries:
+                table.add_row([host, entry.get('id'), entry.get('drive') or '-',
+                               entry.get('created') or '-',
+                               format_bytes(entry.get('size') or 0, 5),
+                               entry.get('name') or '-'])
+        return HandleCommandResult(stdout=table.get_string())
+
+    @OrchestratorCLICommand.Write('orch hardware diagnostics collect')
+    def _hardware_diagnostics_collect(self, hostname: str, device: str) -> HandleCommandResult:
+        """Collect the diagnostic data (a dump) of a drive"""
+        completion = self.hardware_diagnostics_collect(hostname, device)
+        task = raise_if_exception(completion)
+        return HandleCommandResult(
+            stdout=f"Collecting the diagnostic data of {device} on {hostname}: task {task.get('id')}\n"
+                   f"Follow it with 'ceph orch hardware diagnostics status {hostname} {task.get('id')}'")
+
+    @OrchestratorCLICommand.Read('orch hardware diagnostics status')
+    def _hardware_diagnostics_status(self, hostname: str, task_id: str,
+                                     format: Format = Format.plain) -> HandleCommandResult:
+        """Show the progress of a diagnostic data collection"""
+        completion = self.hardware_diagnostics_task(hostname, task_id)
+        task = raise_if_exception(completion)
+        if format != Format.plain:
+            return HandleCommandResult(stdout=to_format(task, format, many=False, cls=None))
+        lines = [f"{task.get('name')}: {task.get('state')} ({task.get('status')}), "
+                 f"{task.get('percent_complete')}%"]
+        lines += [f'  {m}' for m in task.get('messages') or []]
+        if task.get('entries'):
+            lines.append(f"entries: {', '.join(task['entries'])}")
+        return HandleCommandResult(stdout='\n'.join(lines))
+
+    @OrchestratorCLICommand.Read('orch hardware diagnostics get')
+    def _hardware_diagnostics_get(self, hostname: str, entry_id: str,
+                                  base64: bool = False) -> HandleCommandResult:
+        """
+        Print diagnostic data. The text is for reading: command output is not
+        byte exact. For the exact file, use --base64 and decode it
+        ('... --base64 | base64 -d > file'), or the dashboard.
+        """
+        completion = self.hardware_diagnostics_get(hostname, entry_id)
+        _, content = raise_if_exception(completion)
+        if base64:
+            return HandleCommandResult(stdout=b64encode(content).decode('ascii'))
+        return HandleCommandResult(stdout=content.decode('utf-8', 'replace'))
+
+    @OrchestratorCLICommand.Write('orch hardware diagnostics rm')
+    def _hardware_diagnostics_rm(self, hostname: str, entry_id: str) -> HandleCommandResult:
+        """Delete diagnostic data kept by the hardware of a host"""
+        completion = self.hardware_diagnostics_rm(hostname, entry_id)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
 

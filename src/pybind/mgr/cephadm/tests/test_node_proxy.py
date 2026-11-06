@@ -196,6 +196,31 @@ class TestNodeProxyEndpoint(helper.CPWebCase):
             mgr.set_health_warning.reset_mock()
         assert [c.kwargs['count'] for c in calls] == [2, 1]
 
+    def test_data_alert_says_what_is_wrong(self):
+        # the BMC's Redfish Status.Conditions of a member, in the health detail
+        mgr = TestNodeProxyEndpoint.mgr
+        patch = json.loads(json.dumps(node_proxy_data.full_set_with_critical))
+        patch['status']['network'] = {'CS1CAN01': {'ethernetinterfaces_bond0': {
+            'name': 'bond0', 'status': {'health': 'Warning', 'state': 'Enabled'},
+            'conditions': [{'message_id': 'IBMNetwork.1.0.TeamDegraded',
+                            'message': "Only 1 of the 2 member interfaces of team 'bond0' "
+                                       "are active. Inactive: ens51f1np1 (no link).",
+                            'severity': 'Warning'}]}}}
+        saved = mgr.node_proxy_cache.data
+        mgr.node_proxy_cache.data = {}
+        mgr.set_health_warning.reset_mock()
+        try:
+            self.post_data('host01', patch)
+            calls = {c.args[0]: c.kwargs for c in mgr.set_health_warning.mock_calls}
+        finally:
+            mgr.node_proxy_cache.data = saved
+            mgr.set_health_warning.reset_mock()
+        assert calls['HARDWARE_NETWORK']['detail'] == [
+            "[CS1CAN01]: ethernetinterfaces_bond0 is warning: Enabled: Only 1 of the 2 member "
+            "interfaces of team 'bond0' are active. Inactive: ens51f1np1 (no link)."]
+        # members without conditions are reported as before
+        assert calls['HARDWARE_MEMORY']['detail'] == ['[1]: dimm.socket.a1 is critical: Enabled']
+
     def test_led_GET_no_hostname(self):
         self.getPage("/led", method="GET", headers=self.keyring_headers())
         self.assertStatus('501 Not Implemented')

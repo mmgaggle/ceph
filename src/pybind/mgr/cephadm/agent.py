@@ -234,7 +234,11 @@ class NodeProxyEndpoint:
                         'sys_id': sys_id,
                         'member': member,
                         'status': _status,
-                        'state': state
+                        'state': state,
+                        # what is wrong, when the BMC says (Redfish Status.Conditions)
+                        'message': ' '.join(
+                            c['message'] for c in member_data.get('conditions') or []
+                            if isinstance(c, dict) and isinstance(c.get('message'), str)),
                     })
 
         return nok_members
@@ -287,7 +291,9 @@ class NodeProxyEndpoint:
                     alert_name,
                     summary=f'{count} {component} member{"s" if count > 1 else ""} {"are" if count > 1 else "is"} not ok',
                     count=count,
-                    detail=[f"[{member['sys_id']}]: {member['member']} is {member['status']}: {member['state']}" for member in nok_members],
+                    detail=[f"[{member['sys_id']}]: {member['member']} is {member['status']}: {member['state']}"
+                            + (f": {member['message']}" if member.get('message') else '')
+                            for member in nok_members],
                 )
 
     @cherrypy.expose

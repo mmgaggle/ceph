@@ -147,6 +147,55 @@ class TestNodeProxyEndpoint(helper.CPWebCase):
 
         assert TestNodeProxyEndpoint.mgr.set_health_warning.mock_calls == calls
 
+    def post_data(self, host, patch):
+        data_str = json.dumps({"cephx": {"name": f"node-proxy.{host}",
+                                         "secret": f"fake-secret{host[-2:]}"},
+                               "patch": patch})
+        self.getPage("/data", method="POST", body=data_str,
+                     headers=[('Content-Type', 'application/json'),
+                              ('Content-Length', str(len(data_str)))])
+        self.assertStatus('200 OK')
+
+    def test_data_alert_lists_all_hosts(self):
+        # host02 reported a drive in Warning earlier: host01's report must
+        # not drop it from the health check
+        mgr = TestNodeProxyEndpoint.mgr
+        host02 = json.loads(json.dumps(node_proxy_data.full_set['host02']))
+        host02['status']['storage']['1']['disk.bay.8:enclosure.internal.0-1:nonraid.slot.2-1'][
+            'status']['health'] = 'Warning'
+        saved = mgr.node_proxy_cache.data
+        mgr.node_proxy_cache.data = {'host01': node_proxy_data.full_set['host01'],
+                                     'host02': host02}
+        mgr.set_health_warning.reset_mock()
+        try:
+            self.post_data('host01', node_proxy_data.full_set_with_critical)
+            calls = mgr.set_health_warning.mock_calls
+        finally:
+            mgr.node_proxy_cache.data = saved
+            mgr.set_health_warning.reset_mock()
+        assert calls[0] == call(
+            'HARDWARE_STORAGE',
+            count=3,
+            detail=['[1]: disk.bay.0:enclosure.internal.0-1:raid.integrated.1-1 is critical: Enabled',
+                    '[1]: disk.bay.9:enclosure.internal.0-1 is critical: Enabled',
+                    '[1]: disk.bay.8:enclosure.internal.0-1:nonraid.slot.2-1 is warning: Enabled'],
+            summary='3 storage members are not ok')
+
+    def test_data_alert_shared_member_once(self):
+        # hosts sharing an enclosure report its members alike
+        mgr = TestNodeProxyEndpoint.mgr
+        saved = mgr.node_proxy_cache.data
+        mgr.node_proxy_cache.data = {'host01': node_proxy_data.full_set['host01'],
+                                     'host02': node_proxy_data.full_set_with_critical}
+        mgr.set_health_warning.reset_mock()
+        try:
+            self.post_data('host01', node_proxy_data.full_set_with_critical)
+            calls = mgr.set_health_warning.mock_calls
+        finally:
+            mgr.node_proxy_cache.data = saved
+            mgr.set_health_warning.reset_mock()
+        assert [c.kwargs['count'] for c in calls] == [2, 1]
+
     def test_led_GET_no_hostname(self):
         self.getPage("/led", method="GET", headers=self.keyring_headers())
         self.assertStatus('501 Not Implemented')

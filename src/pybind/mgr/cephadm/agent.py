@@ -262,10 +262,24 @@ class NodeProxyEndpoint:
         :rtype: None
         """
 
+        # The health checks are cluster wide: list the members this host
+        # reports with the ones the other hosts reported last, or each host's
+        # report would replace the others' members.
+        host = data['cephx']['name'][11:]
+        reports = dict(self.mgr.node_proxy_cache.data)
+        reports[host] = data['patch']
         for component in data['patch']['status'].keys():
             alert_name = f'HARDWARE_{component.upper()}'
             self.mgr.remove_health_warning(alert_name)
-            nok_members = self.get_nok_members(data['patch']['status'][component])
+            nok_members: List[Dict[str, str]] = []
+            for report in reports.values():
+                status = report.get('status') if isinstance(report, dict) else None
+                if not isinstance(status, dict):
+                    continue
+                for member in self.get_nok_members(status.get(component) or {}):
+                    # hosts sharing an enclosure report its members alike
+                    if member not in nok_members:
+                        nok_members.append(member)
 
             if nok_members:
                 count = len(nok_members)

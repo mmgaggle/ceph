@@ -132,12 +132,12 @@ ______________________
 .. prompt:: bash # auto
 
   # ceph orch hardware status node-10 --category storage
-  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
-  |   HOST  | SYS_ID |                         ID                         |                          NAME                         |      MODEL       |      SIZE      | PROTOCOL |       SN       | SLOT | FW | STATUS |  STATE  |
-  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
-  | node-10 |   1    | disk.bay.8:enclosure.internal.0-1:nonraid.slot.2-1 | Disk 8 in Backplane 1 of Storage Controller in Slot 2 | ST20000NM008D-3D | 20000588955136 |   SATA   |    ZVT99QLL    |  8   |    |   OK   | Enabled |
-  | node-10 |   1    | disk.bay.0:enclosure.internal.0-1:nonraid.slot.2-1 | Disk 0 in Backplane 0 of Storage Controller in Slot 2 | MZ7L33T8HBNAAD3  | 3840755981824  |   SATA   | S6M5NE0T800539 |  0   |    |   OK   | Enabled |
-  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+--------+---------+
+  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+------------+--------+---------+
+  |   HOST  | SYS_ID |                         ID                         |                          NAME                         |      MODEL       |      SIZE      | PROTOCOL |       SN       | SLOT | FW | ENCRYPTION | STATUS |  STATE  |
+  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+------------+--------+---------+
+  | node-10 |   1    | disk.bay.8:enclosure.internal.0-1:nonraid.slot.2-1 | Disk 8 in Backplane 1 of Storage Controller in Slot 2 | ST20000NM008D-3D | 20000588955136 |   SATA   |    ZVT99QLL    |  8   |    |            |   OK   | Enabled |
+  | node-10 |   1    | disk.bay.0:enclosure.internal.0-1:nonraid.slot.2-1 | Disk 0 in Backplane 0 of Storage Controller in Slot 2 | MZ7L33T8HBNAAD3  | 3840755981824  |   SATA   | S6M5NE0T800539 |  0   |    |            |   OK   | Enabled |
+  +---------+--------+----------------------------------------------------+-------------------------------------------------------+------------------+----------------+----------+----------------+------+----+------------+--------+---------+
 
 The ID of a drive is the device to pass to ``ceph orch hardware light``, for
 instance to turn on the identify LED of the first drive above:
@@ -287,6 +287,41 @@ When the Redfish service says what is wrong (``Status.Conditions``), the
 ``--format json`` gives every detail: addresses, bond members, the LLDP
 neighbor, the transceiver and its receive power per lane, counters and
 conditions. In the dashboard, a host's page has a *Network ports* table.
+
+
+Drive Encryption
+________________
+
+Self-encrypting drives report their encryption with the standard Redfish
+``Drive`` properties ``EncryptionAbility``, ``EncryptionStatus`` and
+``SecurityIDOwned``. The ``ENCRYPTION`` column of the storage report shows
+``EncryptionStatus``:
+
+* ``Unencrypted``: the drive is not secured;
+* ``Unlocked``: it is secured and readable;
+* ``Locked``: it is secured and locked, and the hardware can unlock it;
+* ``Foreign``: it is locked, and the hardware cannot unlock it on its own.
+
+.. prompt:: bash # auto
+
+  # ceph orch hardware status node-10 --category storage
+  +---------+----------+-------------+-------------------+-------+----------------+----------+----------+------+----------+------------+---------+---------+
+  |   HOST  |  SYS_ID  |      ID     |        NAME       | MODEL |      SIZE      | PROTOCOL |    SN    | SLOT |    FW    | ENCRYPTION |  STATUS |  STATE  |
+  +---------+----------+-------------+-------------------+-------+----------------+----------+----------+------+----------+------------+---------+---------+
+  | node-10 | CS1CAN01 | driveslot-5 | Enclosure0:Drive5 |  FCM5 | 19200000000000 |   NVMe   | FCM00005 |  5   | 000A5305 |  Unlocked  |    OK   | Enabled |
+  | node-10 | CS1CAN01 | driveslot-6 | Enclosure0:Drive6 |  FCM5 | 19200000000000 |   NVMe   | FCM00006 |  6   | 000A5305 |   Locked   | Warning | Enabled |
+  +---------+----------+-------------+-------------------+-------+----------------+----------+----------+------+----------+------------+---------+---------+
+
+The drives' conditions say why one stays locked, in ``HARDWARE_STORAGE``:
+
+.. prompt:: bash # auto
+
+  # ceph health detail
+  [WRN] HARDWARE_STORAGE: 1 storage member is not ok
+      [CS1CAN01]: driveslot-6 is warning: Enabled: The drive is locked and HAL cannot read its credential from Vault: https://vault.example.com:8200: ConnectionError. HAL unlocks it once Vault answers.
+
+The dashboard's *Hardware drives* table has *Encryption* and *Problems*
+columns.
 
 
 Diagnostic Data

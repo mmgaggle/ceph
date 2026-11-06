@@ -5,7 +5,7 @@ from time import sleep
 from typing import Any, Callable, Dict, List, Optional
 
 from ceph_node_proxy.basesystem import BaseSystem
-from ceph_node_proxy.network import interface_details
+from ceph_node_proxy.network import conditions, interface_details
 from ceph_node_proxy.redfish import (
     ComponentUpdateSpec,
     Endpoint,
@@ -410,6 +410,10 @@ class BaseRedfishSystem(BaseSystem):
             "Status",
             "PhysicalLocation",
             "Revision",
+            # self-encrypting drives (Drive v1.22)
+            "EncryptionAbility",
+            "EncryptionStatus",
+            "SecurityIDOwned",
         ]
         result: Dict[str, Dict[str, Dict]] = dict()
         self.log.debug("Updating storage")
@@ -430,6 +434,9 @@ class BaseRedfishSystem(BaseSystem):
                     for field in fields:
                         result[member][drive_id][to_snake_case(field)] = data.get(field)
                         result[member][drive_id]["entity"] = entity
+                    # what is wrong, e.g. why a drive stays locked: the
+                    # health warnings and the dashboard show the messages
+                    result[member][drive_id]["conditions"] = conditions(data)
             # do not normalize the first level of the dictionary
             result[member] = normalize_dict(result[member])
             for drive_id, drive_data in result[member].items():

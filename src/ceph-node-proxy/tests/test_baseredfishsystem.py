@@ -381,6 +381,49 @@ class TestStorageSlotAndFirmware:
         assert drive["location_indicator_active"] is True
         assert drive["redfish_endpoint"] == HAL_DRIVE["@odata.id"]
 
+    def test_update_storage_reads_encryption(self, system, mock_endpoints):
+        locked = dict(
+            HAL_DRIVE,
+            EncryptionAbility="SelfEncryptingDrive",
+            EncryptionStatus="Locked",
+            SecurityIDOwned=True,
+            Status={
+                "State": "Enabled",
+                "Health": "Warning",
+                "Conditions": [
+                    {
+                        "MessageId": "IBMEncryption.1.0.KeyManagerUnreachable",
+                        "Message": "The drive is locked and HAL cannot read its "
+                        "credential from Vault: connection refused.",
+                        "Severity": "Warning",
+                    }
+                ],
+            },
+        )
+        mock_endpoints.__getitem__.side_effect = lambda key: {
+            "systems": storage_endpoints([locked])
+        }[key]
+        with patch("ceph_node_proxy.baseredfishsystem.Endpoint") as mock_endpoint:
+            mock_endpoint.return_value.data = locked
+            system._update_storage()
+        drive = system.get_storage()["CAN01"]["driveslot-2"]
+        assert drive["encryption_ability"] == "SelfEncryptingDrive"
+        assert drive["encryption_status"] == "Locked"
+        assert drive["security_id_owned"] is True
+        assert drive["conditions"][0]["message"].startswith("The drive is locked")
+        assert drive["conditions"][0]["severity"] == "Warning"
+
+    def test_drive_without_encryption(self, system, mock_endpoints):
+        mock_endpoints.__getitem__.side_effect = lambda key: {
+            "systems": storage_endpoints([HAL_DRIVE])
+        }[key]
+        with patch("ceph_node_proxy.baseredfishsystem.Endpoint") as mock_endpoint:
+            mock_endpoint.return_value.data = HAL_DRIVE
+            system._update_storage()
+        drive = system.get_storage()["CAN01"]["driveslot-2"]
+        assert drive["encryption_status"] == "unknown"
+        assert drive["conditions"] == []
+
     def test_unknown_values_are_not_used(self):
         drive = {
             "revision": "unknown",

@@ -149,7 +149,10 @@ def http_req(
     ssl_verify: bool = False,
     timeout: Optional[int] = None,
     ssl_ctx: Optional[Any] = None,
+    raw: bool = False,
 ) -> Tuple[Any, Any, Any]:
+    """Returns (headers, body, status); the body is bytes when raw is set,
+    else decoded text."""
     if not ssl_ctx:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         if not ssl_verify:
@@ -171,6 +174,8 @@ def http_req(
             response_str = response.read()
             response_headers = response.headers
             response_code = response.code
+        if raw:
+            return response_headers, response_str, response_code
         return response_headers, response_str.decode(), response_code
     except (HTTPError, URLError) as e:
         log.error(e)

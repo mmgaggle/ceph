@@ -230,6 +230,26 @@ class HardwareManager(ResourceManager):
     def common(self, category: str, hostname: Optional[List[str]] = None) -> str:
         return self.api.node_proxy_common(category, hostname=hostname)
 
+    @wait_api_result
+    def diagnostics(self, hostname: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+        return self.api.hardware_diagnostics_ls(hostname)
+
+    @wait_api_result
+    def collect_diagnostics(self, hostname: str, device: str) -> Dict[str, Any]:
+        return self.api.hardware_diagnostics_collect(hostname, device)
+
+    @wait_api_result
+    def diagnostics_task(self, hostname: str, task_id: str) -> Dict[str, Any]:
+        return self.api.hardware_diagnostics_task(hostname, task_id)
+
+    @wait_api_result
+    def download_diagnostics(self, hostname: str, entry_id: str) -> Tuple[str, bytes]:
+        return self.api.hardware_diagnostics_get(hostname, entry_id)
+
+    @wait_api_result
+    def delete_diagnostics(self, hostname: str, entry_id: str) -> str:
+        return self.api.hardware_diagnostics_rm(hostname, entry_id)
+
 
 class CertStoreManager(ResourceManager):
 

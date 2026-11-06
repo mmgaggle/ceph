@@ -61,3 +61,36 @@ export interface HardwareHostResponse {
   /* null when the host has no FCM drives */
   compression: CompressionStats | null;
 }
+
+/* Diagnostic data (a drive dump) kept by a host's hardware: GET /api/hardware/diagnostics */
+export interface DiagnosticsEntry {
+  hostname: string;
+  id: string;
+  name: string | null;
+  /* ISO 8601 */
+  created: string | null;
+  message: string | null;
+  /* bytes */
+  size: number | null;
+  /* drive id, as in the storage components; null when unknown */
+  drive: string | null;
+  diagnostic_data_type: string | null;
+}
+
+/* A diagnostic data collection: POST /api/hardware/diagnostics, GET .../diagnostics/task */
+export interface DiagnosticsTask {
+  hostname: string;
+  id: string;
+  name: string | null;
+  /* Redfish TaskState: New, Running, Completed, Exception... */
+  state: string | null;
+  /* Redfish TaskStatus: OK, Warning or Critical */
+  status: string | null;
+  percent_complete: number | null;
+  messages: string[];
+  /* ids of the entries collected */
+  entries: string[];
+}
+
+/* Redfish TaskStates of a task that has not ended yet */
+export const ACTIVE_TASK_STATES = ['New', 'Starting', 'Running', 'Pending', 'Stopping'];

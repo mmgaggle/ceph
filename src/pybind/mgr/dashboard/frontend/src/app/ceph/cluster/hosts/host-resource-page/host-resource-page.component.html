@@ -44,9 +44,67 @@
             [columns]="hardwareDriveColumns()"
             columnMode="flex"
             identifier="uid"
-            [toolHeader]="false"
             [autoReload]="false"
+            selectionType="single"
+            (updateSelection)="updateDriveSelection($event)"
           >
+            <div class="table-actions">
+              <cd-table-actions
+                [permission]="permissions.hosts"
+                [selection]="driveSelection"
+                class="btn-group"
+                id="hardware-drive-actions"
+                [tableActions]="driveActions"
+              >
+              </cd-table-actions>
+            </div>
+          </cd-table>
+        </section>
+      }
+
+      @if (diagnostics().length || activeCollections().length) {
+        <section class="host-resource-section cds-mt-6">
+          <h2
+            class="host-resource-section__title cds--type-heading-03"
+            i18n
+          >
+            Diagnostic data
+          </h2>
+          <p
+            class="host-resource-section__description cds--type-body-compact-01"
+            i18n
+          >
+            Drive dumps collected by the server's hardware and kept on the host, for support.
+          </p>
+          @for (collection of activeCollections(); track collection.drive) {
+            <cd-alert-panel
+              type="info"
+              class="cds-mb-3"
+              i18n
+            >
+              Collecting the diagnostic data of {{ collection.drive }}:
+              {{ collection.task.percent_complete ?? 0 }}%
+            </cd-alert-panel>
+          }
+          <cd-table
+            [data]="diagnosticsRows()"
+            [columns]="diagnosticsColumns"
+            columnMode="flex"
+            identifier="id"
+            [autoReload]="false"
+            selectionType="single"
+            (updateSelection)="updateDiagnosticsSelection($event)"
+          >
+            <div class="table-actions">
+              <cd-table-actions
+                [permission]="permissions.hosts"
+                [selection]="diagnosticsSelection"
+                class="btn-group"
+                id="diagnostic-data-actions"
+                [tableActions]="diagnosticsActions"
+              >
+              </cd-table-actions>
+            </div>
           </cd-table>
         </section>
       }

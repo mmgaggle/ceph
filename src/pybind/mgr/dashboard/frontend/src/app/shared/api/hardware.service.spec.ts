@@ -1,4 +1,4 @@
-import { provideHttpClient } from '@angular/common/http';
+import { HttpHeaders, HttpResponse, provideHttpClient } from '@angular/common/http';
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { TestBed } from '@angular/core/testing';
 import { of, throwError } from 'rxjs';
@@ -6,7 +6,7 @@ import { take } from 'rxjs/operators';
 
 import { AuthStorageService } from '../services/auth-storage.service';
 import { CompressionStats } from '../enum/hardware.enum';
-import { HardwareService } from './hardware.service';
+import { attachmentFilename, HardwareService } from './hardware.service';
 import { MgrModuleService } from './mgr-module.service';
 
 const COMPRESSION_STATS: CompressionStats = {
@@ -116,6 +116,65 @@ describe('HardwareService', () => {
       await expect(service.isHardwareMonitoringEnabled$.pipe(take(1)).toPromise()).resolves.toBe(
         false
       );
+    });
+  });
+  describe('diagnostic data', () => {
+    const EXPERIMENTAL = 'application/vnd.ceph.api.v0.1+json';
+
+    it('should list the diagnostic data of a host', () => {
+      const service = createService();
+      service.listDiagnostics('node-1').subscribe();
+      const req = httpTesting.expectOne('api/hardware/diagnostics?hostname=node-1');
+      expect(req.request.method).toBe('GET');
+      expect(req.request.headers.get('Accept')).toBe(EXPERIMENTAL);
+      req.flush([]);
+    });
+
+    it('should start a collection from a drive', () => {
+      const service = createService();
+      service.collectDiagnostics('node-1', 'driveslot-5').subscribe();
+      const req = httpTesting.expectOne('api/hardware/diagnostics');
+      expect(req.request.method).toBe('POST');
+      expect(req.request.body).toEqual({ hostname: 'node-1', device: 'driveslot-5' });
+      expect(req.request.headers.get('Accept')).toBe(EXPERIMENTAL);
+      req.flush({ id: '7', state: 'New' });
+    });
+
+    it('should follow a collection', () => {
+      const service = createService();
+      service.getDiagnosticsTask('node-1', '7').subscribe();
+      const req = httpTesting.expectOne('api/hardware/diagnostics/task?hostname=node-1&task_id=7');
+      expect(req.request.method).toBe('GET');
+      req.flush({ id: '7', state: 'Running' });
+    });
+
+    it('should download the data as a blob', () => {
+      const service = createService();
+      service.downloadDiagnostics('node-1', 'S5_1').subscribe();
+      const req = httpTesting.expectOne(
+        'api/hardware/diagnostics/download?hostname=node-1&entry_id=S5_1'
+      );
+      expect(req.request.responseType).toBe('blob');
+      req.flush(new Blob(['dump']));
+    });
+
+    it('should delete an entry', () => {
+      const service = createService();
+      service.deleteDiagnostics('node-1', 'S5_1').subscribe();
+      const req = httpTesting.expectOne('api/hardware/diagnostics/S5_1?hostname=node-1');
+      expect(req.request.method).toBe('DELETE');
+      req.flush(null);
+    });
+
+    it('should take the file name from Content-Disposition', () => {
+      const response = (disposition?: string) =>
+        new HttpResponse({
+          headers: disposition ? new HttpHeaders({ 'Content-Disposition': disposition }) : undefined
+        });
+      expect(attachmentFilename(response('attachment; filename="node-1-S5.drive_dump"'), 'x')).toBe(
+        'node-1-S5.drive_dump'
+      );
+      expect(attachmentFilename(response(), 'fallback.bin')).toBe('fallback.bin');
     });
   });
 });

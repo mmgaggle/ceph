@@ -6,7 +6,8 @@ from urllib.parse import urlencode
 from orchestrator import HardwareNoReport, OrchestratorError
 
 from ..controllers._version import APIVersion
-from ..controllers.hardware import HardwareCompression, HardwareHosts
+from ..controllers.hardware import HardwareCompression, HardwareDiagnostics, \
+    HardwareHosts
 from ..exceptions import DashboardException
 from ..model.hardware import Category, Component, HardwareHostResponse, \
     HardwareStatus, Health, MemoryComponent, NetworkComponent, PowerComponent, \
@@ -719,6 +720,84 @@ class HardwareCompressionControllerTest(ControllerTestCase):
         self._get(self.URL, version=APIVersion.EXPERIMENTAL)
         self.assertStatus(200)
         self.assertEqual(self.json_body(), {'fcm_drive_count': 0})
+
+
+class HardwareDiagnosticsControllerTest(ControllerTestCase):
+    URL = '/api/hardware/diagnostics'
+    ENTRY = {'id': 'S5_20261106035606', 'name': 'Diagnostic data of Enclosure0:Drive5',
+             'created': '2026-11-06T03:56:06+00:00', 'message': 'Dump of Enclosure0:Drive5',
+             'size': 4, 'drive': 'driveslot-5', 'diagnostic_data_type': 'Device',
+             'redfish_endpoint': '/redfish/v1/Chassis/C/LogServices/D/Entries/S5'}
+
+    @classmethod
+    def setup_server(cls):
+        cls.setup_controllers([HardwareDiagnostics])
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_list(self, instance):
+        instance.return_value.hardware.diagnostics.return_value = {
+            'host2': [], 'host1': [self.ENTRY]}
+        self._get(self.URL, version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        entry = dict(self.ENTRY, hostname='host1')
+        del entry['redfish_endpoint']  # Redfish URIs stay behind the API
+        self.assertEqual(self.json_body(), [entry])
+        instance.return_value.hardware.diagnostics.assert_called_once_with(None)
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_list_one_host(self, instance):
+        instance.return_value.hardware.diagnostics.return_value = {'host1': []}
+        self._get(f'{self.URL}?hostname=host1', version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        instance.return_value.hardware.diagnostics.assert_called_once_with('host1')
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_collect(self, instance):
+        instance.return_value.hardware.collect_diagnostics.return_value = {
+            'id': '7', 'state': 'New'}
+        self._post(self.URL, {'hostname': 'host1', 'device': 'driveslot-5'},
+                   version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(202)
+        self.assertEqual(self.json_body(), {'id': '7', 'state': 'New', 'hostname': 'host1'})
+        instance.return_value.hardware.collect_diagnostics.assert_called_once_with(
+            'host1', 'driveslot-5')
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_collect_refused(self, instance):
+        instance.return_value.hardware.collect_diagnostics.side_effect = OrchestratorError(
+            "'slot-99' not found on host1")
+        self._post(self.URL, {'hostname': 'host1', 'device': 'slot-99'},
+                   version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(400)
+        self.assertIn('not found on host1', self.json_body()['detail'])
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_task(self, instance):
+        instance.return_value.hardware.diagnostics_task.return_value = {
+            'id': '7', 'state': 'Completed', 'entries': ['S5_20261106035606']}
+        self._get(f'{self.URL}/task?hostname=host1&task_id=7',
+                  version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        self.assertEqual(self.json_body()['entries'], ['S5_20261106035606'])
+        instance.return_value.hardware.diagnostics_task.assert_called_once_with('host1', '7')
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_download_keeps_the_bytes(self, instance):
+        content = b'\xff\xfe dump \x00\x01'  # not UTF-8
+        instance.return_value.hardware.download_diagnostics.return_value = (
+            'S5.drive_dump', content)
+        self._get(f'{self.URL}/download?hostname=host1&entry_id=S5', version=None)
+        self.assertStatus(200)
+        self.assertHeader('Content-Type', 'application/octet-stream')
+        self.assertHeader('Content-Disposition',
+                          'attachment; filename="host1-S5.drive_dump"')
+        self.assertEqual(self.body, content)
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_delete(self, instance):
+        self._delete(f'{self.URL}/S5?hostname=host1', version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(204)
+        instance.return_value.hardware.delete_diagnostics.assert_called_once_with('host1', 'S5')
 
 
 class HardwareHostDetailControllerTest(ControllerTestCase):

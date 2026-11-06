@@ -1,23 +1,29 @@
 import { beforeEach, describe, expect, it, jest } from '@jest/globals';
-import { HttpParams } from '@angular/common/http';
+import { HttpHeaders, HttpParams, HttpResponse } from '@angular/common/http';
 import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { By } from '@angular/platform-browser';
 import { ActivatedRoute, convertToParamMap, ParamMap } from '@angular/router';
 import { RouterTestingModule } from '@angular/router/testing';
+import { saveAs } from 'file-saver';
 import { BehaviorSubject, of, throwError } from 'rxjs';
 
 import { HardwareService } from '~/app/shared/api/hardware.service';
 import { HostService } from '~/app/shared/api/host.service';
-import { HardwareHostResponse } from '~/app/shared/enum/hardware.enum';
+import { DiagnosticsEntry, HardwareHostResponse } from '~/app/shared/enum/hardware.enum';
 import { ICON_TYPE } from '~/app/shared/enum/icons.enum';
+import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
 import { Permissions } from '~/app/shared/models/permissions';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import { FormatterService } from '~/app/shared/services/formatter.service';
+import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
+import { NotificationService } from '~/app/shared/services/notification.service';
 import { OrchestratorService } from '~/app/shared/api/orchestrator.service';
 import { SharedModule } from '~/app/shared/shared.module';
 import { configureTestBed } from '~/testing/unit-test-helper';
-import { HostResourcePageComponent } from './host-resource-page.component';
+import { DIAGNOSTICS_POLL_MS, HostResourcePageComponent } from './host-resource-page.component';
+
+jest.mock('file-saver', () => ({ saveAs: jest.fn() }));
 
 describe('HostResourcePageComponent', () => {
   let component: HostResourcePageComponent;
@@ -41,7 +47,12 @@ describe('HostResourcePageComponent', () => {
   const hardwareEnabled$ = new BehaviorSubject(false);
   const hardwareServiceSpy = {
     isHardwareMonitoringEnabled$: hardwareEnabled$,
-    getHost: jest.fn()
+    getHost: jest.fn(),
+    listDiagnostics: jest.fn(),
+    collectDiagnostics: jest.fn(),
+    getDiagnosticsTask: jest.fn(),
+    downloadDiagnostics: jest.fn(),
+    deleteDiagnostics: jest.fn()
   };
   const parentParamMap$ = new BehaviorSubject<ParamMap>(convertToParamMap({ hostname: 'node-1' }));
 
@@ -89,6 +100,11 @@ describe('HostResourcePageComponent', () => {
     hostServiceSpy.getRawCapacityBytes.mockClear();
     hardwareEnabled$.next(false);
     hardwareServiceSpy.getHost.mockReset();
+    hardwareServiceSpy.listDiagnostics.mockReset().mockReturnValue(of([]));
+    hardwareServiceSpy.collectDiagnostics.mockReset();
+    hardwareServiceSpy.getDiagnosticsTask.mockReset();
+    hardwareServiceSpy.downloadDiagnostics.mockReset();
+    hardwareServiceSpy.deleteDiagnostics.mockReset();
   });
 
   const getField = (label: string) => {
@@ -289,6 +305,168 @@ describe('HostResourcePageComponent', () => {
       }
 
       expect(hardwareServiceSpy.getHost).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Diagnostic data', () => {
+    const report = {
+      hostname: 'node-1',
+      status: {
+        storage: {
+          total: 1,
+          components: [{ id: 'driveslot-5', chassis_id: 'C', health: 'OK' }]
+        },
+        temperatures: { total: 0, components: [] }
+      },
+      firmware: {},
+      compression: null
+    } as unknown as HardwareHostResponse;
+    const entry: DiagnosticsEntry = {
+      hostname: 'node-1',
+      id: 'S5_20261106035606',
+      name: 'Diagnostic data of Enclosure0:Drive5',
+      created: '2026-11-06T03:56:06+00:00',
+      message: 'Dump of Enclosure0:Drive5',
+      size: 1248895,
+      drive: 'driveslot-5',
+      diagnostic_data_type: 'Device'
+    };
+    const task = (state: string, extra: object = {}) => ({
+      hostname: 'node-1',
+      id: '7',
+      name: 'Diagnostic data of Enclosure0:Drive5',
+      state,
+      status: state === 'Exception' ? 'Critical' : 'OK',
+      percent_complete: state === 'Completed' ? 100 : 45,
+      messages: [],
+      entries: [],
+      ...extra
+    });
+    const select = (row: object) => {
+      const selection = new CdTableSelection();
+      selection.selected = [row];
+      return selection;
+    };
+    const load = () => {
+      hostServiceSpy.list.mockReturnValue(of([{ hostname: 'node-1' }]));
+      hardwareServiceSpy.getHost.mockReturnValue(of(report));
+      hardwareEnabled$.next(true);
+      fixture.detectChanges();
+    };
+    const text = () => fixture.nativeElement.textContent;
+    let notify: jest.SpiedFunction<NotificationService['show']>;
+
+    beforeEach(() => {
+      notify = jest.spyOn(TestBed.inject(NotificationService), 'show').mockReturnValue(0);
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('should list the diagnostic data kept by the hardware', () => {
+      hardwareServiceSpy.listDiagnostics.mockReturnValue(of([entry]));
+      load();
+
+      expect(hardwareServiceSpy.listDiagnostics).toHaveBeenCalledWith('node-1');
+      expect(text()).toContain('Diagnostic data');
+      expect(component.diagnosticsRows()[0].sizeText).toBe('1.2 MiB');
+    });
+
+    it('should show no diagnostic data section without data', () => {
+      load();
+
+      expect(text()).not.toContain('Diagnostic data');
+    });
+
+    it('should not report hardware without diagnostic data support', () => {
+      const error = { status: 400, preventDefault: jest.fn() };
+      hardwareServiceSpy.listDiagnostics.mockReturnValue(throwError(error));
+      load();
+
+      expect(error.preventDefault).toHaveBeenCalled();
+      expect(component.diagnostics()).toEqual([]);
+    });
+
+    it('should collect the data of the selected drive and follow the collection', () => {
+      jest.useFakeTimers();
+      load();
+      hardwareServiceSpy.collectDiagnostics.mockReturnValue(of(task('New')));
+      hardwareServiceSpy.getDiagnosticsTask.mockReturnValue(of(task('Running')));
+
+      component.updateDriveSelection(select({ id: 'driveslot-5' }));
+      component.driveActions[0].click();
+      expect(hardwareServiceSpy.collectDiagnostics).toHaveBeenCalledWith('node-1', 'driveslot-5');
+      jest.advanceTimersByTime(DIAGNOSTICS_POLL_MS);
+      fixture.detectChanges();
+
+      expect(text()).toContain('Collecting the diagnostic data of driveslot-5: 45%');
+      // one collection per drive at a time
+      expect(component.driveActions[0].disable(select({ id: 'driveslot-5' }))).toBeTruthy();
+
+      hardwareServiceSpy.getDiagnosticsTask.mockReturnValue(of(task('Completed')));
+      hardwareServiceSpy.listDiagnostics.mockReturnValue(of([entry]));
+      jest.advanceTimersByTime(DIAGNOSTICS_POLL_MS);
+      fixture.detectChanges();
+
+      expect(component.activeCollections()).toEqual([]);
+      expect(component.diagnostics()).toEqual([entry]);
+      expect(notify).toHaveBeenLastCalledWith(
+        expect.anything(),
+        'Diagnostic data of driveslot-5 collected'
+      );
+    });
+
+    it('should report a failed collection', () => {
+      load();
+      hardwareServiceSpy.collectDiagnostics.mockReturnValue(
+        of(task('Exception', { messages: ['Enclosure0:Drive5: reading the dump failed'] }))
+      );
+
+      component.updateDriveSelection(select({ id: 'driveslot-5' }));
+      component.collectDiagnostics();
+
+      expect(notify).toHaveBeenLastCalledWith(
+        expect.anything(),
+        'Failed to collect the diagnostic data of driveslot-5',
+        'Enclosure0:Drive5: reading the dump failed'
+      );
+      expect(component.activeCollections()).toEqual([]);
+    });
+
+    it('should download the selected data', () => {
+      load();
+      hardwareServiceSpy.downloadDiagnostics.mockReturnValue(
+        of(
+          new HttpResponse({
+            body: new Blob(['dump']),
+            headers: new HttpHeaders({
+              'Content-Disposition': 'attachment; filename="node-1-S5.drive_dump"'
+            })
+          })
+        )
+      );
+
+      component.updateDiagnosticsSelection(select(entry));
+      component.downloadDiagnostics();
+
+      expect(hardwareServiceSpy.downloadDiagnostics).toHaveBeenCalledWith('node-1', entry.id);
+      expect(saveAs).toHaveBeenCalledWith(expect.any(Blob), 'node-1-S5.drive_dump');
+    });
+
+    it('should delete the selected data after confirmation', () => {
+      load();
+      const show = jest.spyOn(TestBed.inject(ModalCdsService), 'show').mockReturnValue(undefined);
+      hardwareServiceSpy.deleteDiagnostics.mockReturnValue(of(undefined));
+
+      component.updateDiagnosticsSelection(select(entry));
+      component.deleteDiagnostics();
+      const options = show.mock.calls[0][1] as { submitActionObservable: () => any };
+      hardwareServiceSpy.listDiagnostics.mockClear();
+      options.submitActionObservable().subscribe();
+
+      expect(hardwareServiceSpy.deleteDiagnostics).toHaveBeenCalledWith('node-1', entry.id);
+      expect(hardwareServiceSpy.listDiagnostics).toHaveBeenCalled();
     });
   });
 

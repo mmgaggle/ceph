@@ -221,6 +221,31 @@ class TestNodeProxyEndpoint(helper.CPWebCase):
         # members without conditions are reported as before
         assert calls['HARDWARE_MEMORY']['detail'] == ['[1]: dimm.socket.a1 is critical: Enabled']
 
+    def test_data_alert_says_why_a_drive_is_locked(self):
+        # a self-encrypting drive the hardware cannot unlock: the drive's
+        # conditions explain the HARDWARE_STORAGE warning
+        mgr = TestNodeProxyEndpoint.mgr
+        patch = json.loads(json.dumps(node_proxy_data.full_set_with_critical))
+        patch['status']['storage'] = {'CS1CAN01': {'driveslot-5': {
+            'description': 'Enclosure0:Drive5', 'encryption_status': 'Locked',
+            'status': {'health': 'Warning', 'state': 'Enabled'},
+            'conditions': [{'message_id': 'IBMEncryption.1.0.KeyManagerUnreachable',
+                            'message': 'The drive is locked and HAL cannot read its '
+                                       'credential from Vault.',
+                            'severity': 'Warning'}]}}}
+        saved = mgr.node_proxy_cache.data
+        mgr.node_proxy_cache.data = {}
+        mgr.set_health_warning.reset_mock()
+        try:
+            self.post_data('host01', patch)
+            calls = {c.args[0]: c.kwargs for c in mgr.set_health_warning.mock_calls}
+        finally:
+            mgr.node_proxy_cache.data = saved
+            mgr.set_health_warning.reset_mock()
+        assert calls['HARDWARE_STORAGE']['detail'] == [
+            '[CS1CAN01]: driveslot-5 is warning: Enabled: The drive is locked and HAL cannot '
+            'read its credential from Vault.']
+
     def test_led_GET_no_hostname(self):
         self.getPage("/led", method="GET", headers=self.keyring_headers())
         self.assertStatus('501 Not Implemented')

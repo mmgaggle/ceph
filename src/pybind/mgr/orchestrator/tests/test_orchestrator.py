@@ -334,6 +334,48 @@ def test_hardware_status_storage_shows_drive_id():
     assert cells['STATUS'] == 'OK'
 
 
+def test_hardware_status_network():
+    # ports, a bond and a VLAN as node-proxy reports them from IBM HAL, and an
+    # interface from a BMC without the port details
+    data = {'host01': {'CS1CAN01': {
+        'ethernetinterfaces_ens51f0np0': {
+            'name': 'ens51f0np0', 'interface_type': 'Physical', 'team_mode': 'unknown',
+            'vlan_id': 'unknown', 'link_status': 'LinkUp', 'speed_mbps': 100000,
+            'lldp': {'system_name': 'ceph-perf-top', 'port_id': 'et-0/0/0:1'},
+            'rx_errors': 0, 'tx_errors': 3,
+            'status': {'health': 'OK', 'state': 'Enabled'}},
+        'ethernetinterfaces_bond0': {
+            'name': 'bond0', 'interface_type': 'Virtual', 'team_mode': 'IEEE802_3ad',
+            'vlan_id': 'unknown', 'link_status': 'LinkUp', 'speed_mbps': 200000,
+            'status': {'health': 'Warning', 'state': 'Enabled'}},
+        'ethernetinterfaces_vlan1305': {
+            'name': 'vlan1305', 'interface_type': 'Virtual', 'team_mode': 'None',
+            'vlan_id': 1305, 'link_status': 'LinkUp', 'speed_mbps': 200000,
+            'status': {'health': 'Warning', 'state': 'Enabled'}},
+        'ethernetinterfaces_nic1': {
+            'name': 'NIC.Slot.1', 'speed_mbps': 25000,
+            'status': {'health': 'OK', 'state': 'Enabled'}}}}}
+    with mock.patch('orchestrator.OrchestratorCli.node_proxy_common',
+                    return_value=OrchResult(data)):
+        m = OrchestratorCli('orchestrator', 0, 0)
+        r = m._handle_command(None, {'prefix': 'orch hardware status',
+                                     'category': 'network'})
+    assert r.retval == 0
+    header, *rows = [line for line in r.stdout.splitlines() if line.startswith('|')]
+    names = [c.strip() for c in header.split('|')[1:-1]]
+    cells = [dict(zip(names, [c.strip() for c in row.split('|')[1:-1]])) for row in rows]
+    assert names == ['HOST', 'SYS_ID', 'NAME', 'TYPE', 'LINK', 'SPEED', 'SWITCH PORT',
+                     'RX/TX ERRORS', 'STATUS', 'STATE']
+    assert cells[0] == {'HOST': 'host01', 'SYS_ID': 'CS1CAN01', 'NAME': 'ens51f0np0',
+                        'TYPE': 'port', 'LINK': 'LinkUp', 'SPEED': '100000',
+                        'SWITCH PORT': 'ceph-perf-top et-0/0/0:1', 'RX/TX ERRORS': '0/3',
+                        'STATUS': 'OK', 'STATE': 'Enabled'}
+    assert [(c['NAME'], c['TYPE'], c['STATUS']) for c in cells[1:]] == [
+        ('bond0', 'bond', 'Warning'), ('vlan1305', 'vlan 1305', 'Warning'),
+        ('NIC.Slot.1', '', 'OK')]
+    assert (cells[3]['LINK'], cells[3]['SWITCH PORT'], cells[3]['RX/TX ERRORS']) == ('', '', '')
+
+
 def test_preview_table_osd_smoke():
     data = [
         {

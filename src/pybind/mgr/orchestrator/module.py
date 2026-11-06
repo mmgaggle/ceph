@@ -540,7 +540,8 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
             'memory': ['HOST', 'SYS_ID', 'NAME', 'STATUS', 'STATE'],
             'storage': ['HOST', 'SYS_ID', 'ID', 'NAME', 'MODEL', 'SIZE', 'PROTOCOL', 'SN', 'SLOT', 'FW', 'STATUS', 'STATE'],
             'processors': ['HOST', 'SYS_ID', 'NAME', 'MODEL', 'CORES', 'THREADS', 'STATUS', 'STATE'],
-            'network': ['HOST', 'SYS_ID', 'NAME', 'SPEED', 'STATUS', 'STATE'],
+            'network': ['HOST', 'SYS_ID', 'NAME', 'TYPE', 'LINK', 'SPEED', 'SWITCH PORT',
+                        'RX/TX ERRORS', 'STATUS', 'STATE'],
             'power': ['HOST', 'CHASSIS_ID', 'ID', 'NAME', 'MODEL', 'MANUFACTURER', 'STATUS', 'STATE'],
             'fans': ['HOST', 'CHASSIS_ID', 'ID', 'NAME', 'READING', 'UNITS', 'STATUS', 'STATE'],
             'temperatures': ['HOST', 'CHASSIS_ID', 'ID', 'NAME', 'READING', 'UNITS', 'STATUS', 'STATE'],
@@ -649,6 +650,9 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
                 continue
             for sys_id, details in host_data.items():
                 for k, v in details.items():
+                    if category == 'network':
+                        table.add_row((host, sys_id) + self._network_row(v))
+                        continue
                     row = []
                     for field in fields:
                         if field in v:
@@ -664,6 +668,36 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
                         table.add_row((host, sys_id,) + tuple(row))
 
         return table.get_string()
+
+    @staticmethod
+    def _network_row(nic: Dict[str, Any]) -> Tuple[Any, ...]:
+        """
+        NAME, TYPE, LINK, SPEED, SWITCH PORT, RX/TX ERRORS, STATUS and STATE of a
+        network interface. TYPE, LINK, the switch port (LLDP) and the errors come
+        from the interface's standard Redfish port resources, when the BMC has them.
+        """
+        def known(value: Any) -> bool:
+            return value is not None and value != 'unknown'
+
+        raw_status, raw_lldp = nic.get('status'), nic.get('lldp')
+        status: Dict[str, Any] = raw_status if isinstance(raw_status, dict) else {}
+        lldp: Dict[str, Any] = raw_lldp if isinstance(raw_lldp, dict) else {}
+        if known(nic.get('vlan_id')):
+            kind = f"vlan {nic['vlan_id']}"
+        elif known(nic.get('team_mode')) and nic['team_mode'] != 'None':
+            kind = 'bond'
+        elif nic.get('interface_type') == 'Physical':
+            kind = 'port'
+        else:
+            kind = ''
+        neighbor = ' '.join(str(lldp[k]) for k in ('system_name', 'port_id') if known(lldp.get(k)))
+        errors = [nic.get('rx_errors'), nic.get('tx_errors')]
+        return (nic.get('name', ''), kind,
+                nic.get('link_status', '') if known(nic.get('link_status')) else '',
+                nic.get('speed_mbps', ''), neighbor,
+                '/'.join(str(e) if known(e) else '-' for e in errors)
+                if any(known(e) for e in errors) else '',
+                status.get('health', ''), status.get('state', ''))
 
     class HardwareLightType(enum.Enum):
         chassis = 'chassis'

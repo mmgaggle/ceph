@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 
 from ceph_node_proxy.redfish_client import RedFishClient
@@ -15,6 +15,9 @@ class ComponentUpdateSpec:
     path: str
     fields: List[str]
     attribute: Optional[str] = None
+    # name of a method of the system that adds details to a member, given
+    # the member's Redfish resource (BaseRedfishSystem.network_details)
+    enrich: Optional[str] = None
 
 
 class EndpointMgr:
@@ -244,6 +247,7 @@ def build_data(
     fields: List[str],
     log: Any,
     attribute: Optional[str] = None,
+    enrich: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Dict]]:
     result: Dict[str, Dict[str, Optional[Dict]]] = dict()
 
@@ -259,8 +263,14 @@ def build_data(
             out["reading"] = d["ReadingCelsius"]
             if out.get("reading_units") is None:
                 out["reading_units"] = "Cel"
+        if enrich is not None:
+            try:
+                out.update(enrich(d))
+            except Exception as e:
+                log.error(f"Can't add the details of {m_id}: {type(e).__name__}: {e}")
         return out
 
+    data_items: Any
     try:
         if attribute is not None:
             data_items = data[attribute]
@@ -294,6 +304,7 @@ def get_component_data(
     fields: List[str],
     log: Any,
     attribute: Optional[str] = None,
+    enrich: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build component data from Redfish endpoints. Returns dict sys_id -> member_id -> data."""
     members: List[str] = endpoints[collection].get_members_names()
@@ -301,7 +312,9 @@ def get_component_data(
     if not members:
         ep = _resolve_path(endpoints[collection], path)
         data = ep.get_members_data()
-        result = build_data(data=data, fields=fields, log=log, attribute=attribute)
+        result = build_data(
+            data=data, fields=fields, log=log, attribute=attribute, enrich=enrich
+        )
     else:
         for member in members:
             try:
@@ -311,7 +324,11 @@ def get_component_data(
                 else:
                     data = ep.get_data()
                 result[member] = build_data(
-                    data=data, fields=fields, log=log, attribute=attribute
+                    data=data,
+                    fields=fields,
+                    log=log,
+                    attribute=attribute,
+                    enrich=enrich,
                 )
             except HTTPError as e:
                 log.error(f"Error while updating {path}: {e}")

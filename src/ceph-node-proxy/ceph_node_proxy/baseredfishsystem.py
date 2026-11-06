@@ -5,6 +5,7 @@ from time import sleep
 from typing import Any, Callable, Dict, List, Optional
 
 from ceph_node_proxy.basesystem import BaseSystem
+from ceph_node_proxy.network import interface_details
 from ceph_node_proxy.redfish import (
     ComponentUpdateSpec,
     Endpoint,
@@ -88,7 +89,13 @@ class BaseRedfishSystem(BaseSystem):
 
     COMPONENT_SPECS: Dict[str, List[ComponentUpdateSpec]] = {
         "network": [
-            ComponentUpdateSpec("systems", "EthernetInterfaces", NETWORK_FIELDS, None),
+            ComponentUpdateSpec(
+                "systems",
+                "EthernetInterfaces",
+                NETWORK_FIELDS,
+                None,
+                enrich="network_details",
+            ),
             ComponentUpdateSpec("systems", "NetworkInterfaces", NETWORK_FIELDS, None),
         ],
         "processors": [
@@ -348,6 +355,7 @@ class BaseRedfishSystem(BaseSystem):
                     spec.fields,
                     self.log,
                     attribute=spec.attribute,
+                    enrich=getattr(self, spec.enrich) if spec.enrich else None,
                 )
                 path_prefix = spec.path.split("/")[-1].lower() or component
                 prefix = None if use_single_key else path_prefix
@@ -373,6 +381,19 @@ class BaseRedfishSystem(BaseSystem):
 
     def _update_network(self) -> None:
         self._run_update("network")
+
+    def _fetch(self, path: str) -> Dict[str, Any]:
+        """A linked Redfish resource, {} when it cannot be read."""
+        try:
+            return self._get_path(path)
+        except (RuntimeError, ValueError) as e:
+            self.log.debug(f"Can't read {path}: {e}")
+            return {}
+
+    def network_details(self, interface: Dict[str, Any]) -> Dict[str, Any]:
+        """Link, neighbor, transceiver, counters and conditions of a network
+        interface, from its port and the port's metrics (ceph_node_proxy.network)."""
+        return interface_details(interface, self._fetch)
 
     def _update_processors(self) -> None:
         self._run_update("processors")

@@ -538,7 +538,7 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
             'firmware': ['HOST', 'COMPONENT', 'NAME', 'DATE', 'VERSION', 'STATUS'],
             'criticals': ['HOST', 'SYS_ID', 'COMPONENT', 'NAME', 'STATUS', 'STATE'],
             'memory': ['HOST', 'SYS_ID', 'NAME', 'STATUS', 'STATE'],
-            'storage': ['HOST', 'SYS_ID', 'ID', 'NAME', 'MODEL', 'SIZE', 'PROTOCOL', 'SN', 'SLOT', 'FW', 'STATUS', 'STATE'],
+            'storage': ['HOST', 'SYS_ID', 'ID', 'NAME', 'MODEL', 'SIZE', 'PROTOCOL', 'SN', 'SLOT', 'FW', 'ENCRYPTION', 'STATUS', 'STATE'],
             'processors': ['HOST', 'SYS_ID', 'NAME', 'MODEL', 'CORES', 'THREADS', 'STATUS', 'STATE'],
             'network': ['HOST', 'SYS_ID', 'NAME', 'TYPE', 'LINK', 'SPEED', 'SWITCH PORT',
                         'RX/TX ERRORS', 'STATUS', 'STATE'],
@@ -630,7 +630,8 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
             return json.dumps(data)
         mapping = {
             'memory': ('description', 'health', 'state'),
-            'storage': ('description', 'model', 'capacity_bytes', 'protocol', 'serial_number', 'slot', 'firmware_version', 'health', 'state'),
+            'storage': ('description', 'model', 'capacity_bytes', 'protocol', 'serial_number', 'slot', 'firmware_version',
+                        'encryption_status', 'health', 'state'),
             'processors': ('model', 'total_cores', 'total_threads', 'health', 'state'),
             'network': ('name', 'speed_mbps', 'health', 'state'),
             'power': ('name', 'model', 'manufacturer', 'health', 'state'),
@@ -655,7 +656,11 @@ class OrchestratorCli(OrchestratorClientMixin, MgrModule):
                         continue
                     row = []
                     for field in fields:
-                        if field in v:
+                        if field == 'encryption_status':
+                            # Unencrypted, Unlocked, Locked or Foreign: blank
+                            # for drives that do not report it
+                            row.append(v.get(field) if v.get(field) not in (None, 'unknown') else '')
+                        elif field in v:
                             row.append(v[field])
                         elif field in v.get('status', {}):
                             row.append(v['status'][field])

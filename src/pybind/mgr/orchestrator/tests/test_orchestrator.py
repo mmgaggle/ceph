@@ -332,6 +332,33 @@ def test_hardware_status_storage_shows_drive_id():
     assert cells['NAME'] == 'Enclosure1:Drive17'
     assert cells['SLOT'] == '17'
     assert cells['STATUS'] == 'OK'
+    # a drive that does not report encryption: blank, not 'unknown'
+    assert cells['ENCRYPTION'] == ''
+
+
+def test_hardware_status_storage_encryption():
+    data = {'host01': {'CS1CAN01': {
+        'driveslot-5': {'description': 'Enclosure0:Drive5', 'model': 'FCM5',
+                        'encryption_status': 'Locked',
+                        'status': {'health': 'Warning', 'state': 'Enabled'}},
+        'driveslot-6': {'description': 'Enclosure0:Drive6', 'model': 'FCM5',
+                        'encryption_status': 'Unlocked',
+                        'status': {'health': 'OK', 'state': 'Enabled'}},
+        'slot-17': {'description': 'Enclosure1:Drive17', 'encryption_status': 'unknown',
+                    'status': {'health': 'OK', 'state': 'Enabled'}}}}}
+    with mock.patch('orchestrator.OrchestratorCli.node_proxy_common',
+                    return_value=OrchResult(data)):
+        m = OrchestratorCli('orchestrator', 0, 0)
+        r = m._handle_command(None, {'prefix': 'orch hardware status',
+                                     'category': 'storage'})
+    lines = [line for line in r.stdout.splitlines() if line.startswith('|')]
+    header = [c.strip() for c in lines[0].split('|')[1:-1]]
+    rows = {cells[2]: dict(zip(header, cells)) for cells in
+            ([c.strip() for c in line.split('|')[1:-1]] for line in lines[1:])}
+    assert rows['driveslot-5']['ENCRYPTION'] == 'Locked'
+    assert rows['driveslot-5']['STATUS'] == 'Warning'
+    assert rows['driveslot-6']['ENCRYPTION'] == 'Unlocked'
+    assert rows['slot-17']['ENCRYPTION'] == ''
 
 
 def test_hardware_status_network():

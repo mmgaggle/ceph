@@ -1,5 +1,5 @@
 from time import sleep
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from ceph_node_proxy.baseredfishsystem import BaseRedfishSystem
 from ceph_node_proxy.basesystem import BaseSystem
@@ -135,6 +135,21 @@ class NodeBackend(BaseSystem):
 
     def chassis_led_off(self) -> int:
         return self.redfish.chassis_led_off()
+
+    def get_diagnostics(self) -> List[Dict[str, Any]]:
+        return self.redfish.get_diagnostics()
+
+    def collect_diagnostics(self, device: str) -> Dict[str, Any]:
+        return self.redfish.collect_diagnostics(device)
+
+    def get_diagnostics_task(self, task_id: str) -> Dict[str, Any]:
+        return self.redfish.get_diagnostics_task(task_id)
+
+    def download_diagnostics(self, entry_id: str) -> Dict[str, Any]:
+        return self.redfish.download_diagnostics(entry_id)
+
+    def delete_diagnostics(self, entry_id: str) -> int:
+        return self.redfish.delete_diagnostics(entry_id)
 
     def shutdown_host(self, force: bool = False) -> int:
         return self.redfish.shutdown_host(force=force)

@@ -126,7 +126,8 @@ class RedFishClient(BaseClient):
         method: Optional[str] = None,
         endpoint: str = "",
         timeout: int = 10,
-    ) -> Tuple[HTTPMessage, str, int]:
+        raw: bool = False,
+    ) -> Tuple[HTTPMessage, Any, int]:
         def req_headers() -> Dict[str, str]:
             h = headers.copy() if headers else {}
             if self.token:
@@ -135,7 +136,7 @@ class RedFishClient(BaseClient):
                 h["Content-Type"] = "application/json"
             return h
 
-        def do_req(h: Dict[str, str]) -> Tuple[HTTPMessage, str, int]:
+        def do_req(h: Dict[str, str]) -> Tuple[HTTPMessage, Any, int]:
             return http_req(
                 hostname=self.host,
                 port=self.port,
@@ -144,6 +145,7 @@ class RedFishClient(BaseClient):
                 method=method,
                 data=data,
                 timeout=timeout,
+                raw=raw,
             )
 
         try:

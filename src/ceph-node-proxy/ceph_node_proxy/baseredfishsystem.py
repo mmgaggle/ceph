@@ -503,6 +503,158 @@ class BaseRedfishSystem(BaseSystem):
     def set_chassis_led(self, data: Dict[str, Any]) -> int:
         return self.set_led_state(self.get_chassis_endpoint(), data)
 
+    # Diagnostic data (drive dumps), through the standard
+    # LogService.CollectDiagnosticData action with DiagnosticDataType
+    # "Device" (LogService v1.8) of the chassis holding the drive. A
+    # collection runs as a Redfish task; each result is a LogEntry whose
+    # AdditionalDataURI downloads the data.
+
+    def _try_get_path(self, path: str) -> Dict[str, Any]:
+        try:
+            return self._get_path(path) if path else {}
+        except RuntimeError:
+            return {}
+
+    def _drive_chassis(self, drive_endpoint: str) -> str:
+        drive = self._try_get_path(drive_endpoint)
+        chassis = (drive.get("Links") or {}).get("Chassis")
+        if isinstance(chassis, list) and chassis:
+            chassis = chassis[0]
+        if isinstance(chassis, dict) and chassis.get("@odata.id"):
+            return str(chassis["@odata.id"])
+        if "/Drives/" in drive_endpoint:  # .../Chassis/<id>/Drives/<drive>
+            return drive_endpoint.split("/Drives/")[0]
+        raise KeyError(f"no chassis found for {drive_endpoint}")
+
+    def _diagnostic_services(self, chassis_endpoint: str) -> List[Dict[str, Any]]:
+        """Log services of a chassis that collect the diagnostic data of
+        its devices."""
+        chassis = self._try_get_path(chassis_endpoint)
+        link = (chassis.get("LogServices") or {}).get("@odata.id")
+        services: List[Dict[str, Any]] = []
+        for member in self._try_get_path(link).get("Members", []) if link else []:
+            service = self._try_get_path(member.get("@odata.id", ""))
+            action = (service.get("Actions") or {}).get(
+                "#LogService.CollectDiagnosticData"
+            )
+            if not action:
+                continue
+            allowed = action.get("DiagnosticDataType@Redfish.AllowableValues")
+            if allowed is not None and "Device" not in allowed:
+                continue
+            services.append(service)
+        return services
+
+    def _drives_by_endpoint(self) -> Dict[str, str]:
+        return {
+            str(drive.get("redfish_endpoint", "")).rstrip("/"): drive_id
+            for drives in self._sys.get("storage", {}).values()
+            for drive_id, drive in drives.items()
+        }
+
+    def get_diagnostics(self) -> List[Dict[str, Any]]:
+        """Diagnostic data kept by the Redfish service, oldest first."""
+        drives = self._drives_by_endpoint()
+        result: List[Dict[str, Any]] = []
+        chassis = self.endpoints["chassis"].get_members_endpoints().values()
+        for chassis_endpoint in chassis:
+            for service in self._diagnostic_services(chassis_endpoint):
+                entries = (service.get("Entries") or {}).get("@odata.id", "")
+                for entry in self._try_get_path(entries).get("Members", []):
+                    if "Id" not in entry:  # not expanded
+                        entry = self._try_get_path(entry.get("@odata.id", ""))
+                    if not entry.get("AdditionalDataURI"):
+                        continue
+                    origin = (
+                        (entry.get("Links") or {}).get("OriginOfCondition") or {}
+                    ).get("@odata.id")
+                    result.append(
+                        {
+                            "id": entry.get("Id"),
+                            "name": entry.get("Name"),
+                            "created": entry.get("Created"),
+                            "message": entry.get("Message"),
+                            "size": entry.get("AdditionalDataSizeBytes"),
+                            "diagnostic_data_type": entry.get("DiagnosticDataType"),
+                            "drive": drives.get(str(origin or "").rstrip("/")),
+                            "drive_endpoint": origin,
+                            "redfish_endpoint": entry.get("@odata.id"),
+                            "download_endpoint": entry.get("AdditionalDataURI"),
+                            "service": service.get("@odata.id"),
+                        }
+                    )
+        return sorted(result, key=lambda e: (str(e["created"]), str(e["id"])))
+
+    def _diagnostics_entry(self, entry_id: str) -> Dict[str, Any]:
+        for entry in self.get_diagnostics():
+            if entry["id"] == entry_id:
+                return entry
+        raise KeyError(f"diagnostic data '{entry_id}' not found")
+
+    @staticmethod
+    def _task_summary(task: Dict[str, Any]) -> Dict[str, Any]:
+        headers = (task.get("Payload") or {}).get("HttpHeaders") or []
+        entries = [
+            h.split(":", 1)[1].strip()
+            for h in headers
+            if isinstance(h, str) and h.lower().startswith("location:")
+        ]
+        return {
+            "id": task.get("Id"),
+            "name": task.get("Name"),
+            "state": task.get("TaskState"),
+            "status": task.get("TaskStatus"),
+            "percent_complete": task.get("PercentComplete"),
+            "start_time": task.get("StartTime"),
+            "end_time": task.get("EndTime"),
+            "messages": [m.get("Message") for m in task.get("Messages") or []],
+            "entries": [e.rstrip("/").split("/")[-1] for e in entries],
+        }
+
+    def collect_diagnostics(self, device: str) -> Dict[str, Any]:
+        """Start collecting the diagnostic data of a drive; returns the task."""
+        drive_endpoint = self.get_drive_endpoint(device)
+        services = self._diagnostic_services(self._drive_chassis(drive_endpoint))
+        if not services:
+            raise NotImplementedError()
+        action = services[0]["Actions"]["#LogService.CollectDiagnosticData"]
+        body = {
+            "DiagnosticDataType": "Device",
+            "TargetDevice": {"@odata.id": drive_endpoint},
+        }
+        headers, data, _ = self.client.query(
+            data=json.dumps(body), method="POST", endpoint=action["target"]
+        )
+        task = json.loads(data) if data else {}
+        location = headers.get("Location") or task.get("@odata.id") or ""
+        if not task.get("Id"):
+            task["Id"] = location.rstrip("/").split("/")[-1]
+        return self._task_summary(task)
+
+    def get_diagnostics_task(self, task_id: str) -> Dict[str, Any]:
+        _, data, _ = self.client.query(
+            method="GET",
+            endpoint=f"{RedFishClient.PREFIX}TaskService/Tasks/{task_id}",
+        )
+        return self._task_summary(json.loads(data) if data else {})
+
+    def download_diagnostics(self, entry_id: str) -> Dict[str, Any]:
+        """The data of an entry: {'filename': ..., 'content': bytes}"""
+        entry = self._diagnostics_entry(entry_id)
+        headers, data, _ = self.client.query(
+            method="GET", endpoint=entry["download_endpoint"], timeout=120, raw=True
+        )
+        get_filename = getattr(headers, "get_filename", None)
+        filename = get_filename() if callable(get_filename) else None
+        return {"filename": filename or f"{entry_id}.bin", "content": data}
+
+    def delete_diagnostics(self, entry_id: str) -> int:
+        entry = self._diagnostics_entry(entry_id)
+        _, _, status = self.client.query(
+            method="DELETE", endpoint=entry["redfish_endpoint"]
+        )
+        return int(status)
+
     def shutdown_host(self, force: bool = False) -> int:
         raise NotImplementedError()
 

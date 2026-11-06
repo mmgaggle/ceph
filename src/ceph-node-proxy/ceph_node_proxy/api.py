@@ -1,3 +1,4 @@
+import json
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.error import HTTPError
@@ -146,6 +147,75 @@ class API(Server):
             vpath[0] = "_led"
         # /<endpoint>
         return self
+
+    # Diagnostic data (drive dumps):
+    #   GET    /diagnostics               the entries kept by the Redfish service
+    #   POST   /diagnostics {"drive": id} collect a drive's data, returns the task
+    #   GET    /diagnostics/tasks/{id}    progress of a collection
+    #   GET    /diagnostics/{entry}       download (application/octet-stream)
+    #   DELETE /diagnostics/{entry}
+    # One handler takes the whole subtree: CherryPy passes the rest of the
+    # path as arguments (_cp_dispatch is never called for a single segment).
+
+    def _diagnostics_call(self, func: Any, *args: Any) -> Any:
+        try:
+            return func(*args)
+        except HTTPError as e:
+            raise cherrypy.HTTPError(e.code, e.reason)
+        except NotImplementedError:
+            raise cherrypy.HTTPError(
+                501, "Diagnostic data is not supported by this Redfish provider."
+            )
+        except KeyError as e:
+            raise cherrypy.HTTPError(404, str(e))
+
+    @staticmethod
+    def _json(data: Any) -> bytes:
+        cherrypy.response.headers["Content-Type"] = "application/json"
+        return json.dumps(data).encode("utf-8")
+
+    @cherrypy.expose
+    @cherrypy.tools.allow(methods=["GET", "POST", "DELETE"])
+    @cherrypy.tools.json_in(force=False)
+    @cherrypy.tools.auth_basic(on=True)
+    def diagnostics(self, *path: str, **kw: Any) -> bytes:
+        method = cherrypy.request.method
+        if not path and method == "GET":
+            return self._json(self._diagnostics_call(self.backend.get_diagnostics))
+        if not path and method == "POST":
+            return self._collect_diagnostics()
+        if len(path) == 2 and path[0] == "tasks" and method == "GET":
+            return self._json(
+                self._diagnostics_call(self.backend.get_diagnostics_task, path[1])
+            )
+        if len(path) == 1 and method in ("GET", "DELETE"):
+            return self._diagnostics_entry(path[0], method)
+        raise cherrypy.HTTPError(404)
+
+    def _collect_diagnostics(self) -> bytes:
+        data: Dict[str, Any] = getattr(cherrypy.request, "json", None) or {}
+        drive = data.get("drive")
+        storage = self.backend.get_storage()
+        if not drive or not any(drive in drives for drives in storage.values()):
+            msg = "A valid drive ID must be provided."
+            self.log.warning(msg)
+            raise cherrypy.HTTPError(400, msg)
+        task = self._diagnostics_call(self.backend.collect_diagnostics, drive)
+        cherrypy.response.status = 202
+        return self._json(task)
+
+    def _diagnostics_entry(self, entry_id: str, method: str) -> bytes:
+        response = cherrypy.response
+        if method == "DELETE":
+            self._diagnostics_call(self.backend.delete_diagnostics, entry_id)
+            response.status = 204
+            return b""
+        data = self._diagnostics_call(self.backend.download_diagnostics, entry_id)
+        filename = str(data["filename"]).replace('"', "")
+        response.headers["Content-Type"] = "application/octet-stream"
+        response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        content: bytes = data["content"]
+        return content
 
     @cherrypy.expose
     @cherrypy.tools.allow(methods=["POST"])

@@ -5,7 +5,8 @@ from urllib.parse import urlencode
 
 from orchestrator import HardwareNoReport, OrchestratorError
 
-from ..controllers.hardware import HardwareHosts
+from ..controllers._version import APIVersion
+from ..controllers.hardware import HardwareCompression, HardwareHosts
 from ..exceptions import DashboardException
 from ..model.hardware import Category, Component, HardwareHostResponse, \
     HardwareStatus, Health, MemoryComponent, NetworkComponent, PowerComponent, \
@@ -702,6 +703,22 @@ class HardwareHostsControllerTest(ControllerTestCase):
         mock_instance.return_value.available.return_value = False
         self._get(f'{self.URL}?offset=0&limit=10')
         self.assertStatus(503)
+
+
+class HardwareCompressionControllerTest(ControllerTestCase):
+    URL = '/api/hardware/compression'
+
+    @classmethod
+    def setup_server(cls):
+        cls.setup_controllers([HardwareCompression])
+
+    @mock.patch('dashboard.controllers.hardware.HardwareService.get_compression')
+    def test_experimental_version(self, mock_compression):
+        # the frontend asks for the experimental API version
+        mock_compression.return_value = {'fcm_drive_count': 0}
+        self._get(self.URL, version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        self.assertEqual(self.json_body(), {'fcm_drive_count': 0})
 
 
 class HardwareHostDetailControllerTest(ControllerTestCase):

@@ -8283,7 +8283,7 @@ paths:
             application/json:
               schema:
                 type: object
-            application/vnd.ceph.api.v1.0+json:
+            application/vnd.ceph.api.v0.1+json:
               schema:
                 type: object
           description: OK

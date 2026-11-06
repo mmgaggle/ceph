@@ -69,6 +69,7 @@ class Hardware(RESTController):
 @APIDoc("Hardware compression API", "Hardware")
 class HardwareCompression(RESTController):
 
+    @RESTController.MethodMap(version=APIVersion.EXPERIMENTAL)
     @EndpointDoc("Retrieve cluster-wide FCM hardware compression statistics")
     def list(self):
         return HardwareService.get_compression()

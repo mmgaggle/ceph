@@ -253,6 +253,46 @@ _________________________________
   +---------+--------+-----------+------------+----------+-----------+
 
 
+Diagnostic Data
+---------------
+
+Some hardware collects diagnostic data of a drive, such as a drive dump, for
+its support team. ``node-proxy`` uses the standard Redfish
+``LogService.CollectDiagnosticData`` action, with ``DiagnosticDataType``
+``Device`` and the drive as ``TargetDevice``, on the log service of the
+drive's chassis. The data stays with the hardware until it is deleted.
+
+Collect the diagnostic data of a drive, with the drive ID that ``ceph orch
+hardware status <host> --category storage`` shows, and follow the
+collection:
+
+.. prompt:: bash # auto
+
+  # ceph orch hardware diagnostics collect node-10 driveslot-5
+  Collecting the diagnostic data of driveslot-5 on node-10: task 1
+  Follow it with 'ceph orch hardware diagnostics status node-10 1'
+  # ceph orch hardware diagnostics status node-10 1
+  Diagnostic data of Enclosure0:Drive5: Completed (OK), 100%
+  entries: 03NK797YS344D57S009_20261106035606
+
+List the diagnostic data of all hosts, or of one, then save or delete it:
+
+.. prompt:: bash # auto
+
+  # ceph orch hardware diagnostics ls
+  HOST     ID                                  DRIVE        CREATED                    SIZE   NAME
+  node-10  03NK797YS344D57S009_20261106035606  driveslot-5  2026-11-06T03:56:06+00:00  1219k  Diagnostic data of Enclosure0:Drive5
+  # ceph orch hardware diagnostics get node-10 03NK797YS344D57S009_20261106035606 --base64 | base64 -d > drive.dump
+  # ceph orch hardware diagnostics rm node-10 03NK797YS344D57S009_20261106035606
+
+Without ``--base64``, ``get`` prints the data as text, for reading: command
+output is not byte exact, so use ``--base64`` (or the dashboard) to save
+the data as collected.
+
+In the dashboard, a host's page offers the same: *Collect diagnostic data*
+in its *Hardware drives* table, and a *Diagnostic data* table to download
+or delete the data.
+
 For Developers
 ==============
 

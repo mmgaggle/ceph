@@ -1901,7 +1901,10 @@ class NodeProxyCache:
         return any([self._get_health_value(status) == health_value for status in statuses])
 
     def _is_error_status(self, statuses: ValuesView) -> bool:
-        return self._has_health_value(statuses, 'error')
+        # node-proxy reports the Redfish health of a member: OK, Warning or
+        # Critical
+        return any(self._has_health_value(statuses, health)
+                   for health in ('warning', 'critical', 'error'))
 
     def _is_unknown_status(self, statuses: ValuesView) -> bool:
         return self._has_health_value(statuses, 'unknown') and not self._is_error_status(statuses)

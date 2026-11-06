@@ -539,3 +539,20 @@ def test_node_proxy_cache_list_hosts_skips_incomplete_reports():
         'host04': {'host': 'host04', 'status': {}},
     }
     assert cache.list_hosts() == ['host01', 'host02']
+
+
+def test_node_proxy_cache_summary_redfish_health():
+    # node-proxy reports the Redfish health: Warning and Critical are errors
+    host02 = json.loads(json.dumps(node_proxy_data.full_set['host02']))
+    host02['status']['storage']['1']['disk.bay.8:enclosure.internal.0-1:nonraid.slot.2-1'][
+        'status']['health'] = 'Warning'
+    cache = NodeProxyCache(MagicMock())
+    cache.data = {'host01': node_proxy_data.full_set_with_critical,
+                  'host02': host02,
+                  'host03': node_proxy_data.full_set['host01']}
+    summary = cache.summary()
+    assert summary['host01']['status']['storage'] == 'error'
+    assert summary['host01']['status']['memory'] == 'error'
+    assert summary['host01']['status']['processors'] == 'ok'
+    assert summary['host02']['status']['storage'] == 'error'
+    assert summary['host03']['status']['storage'] == 'ok'

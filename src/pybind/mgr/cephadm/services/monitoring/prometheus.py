@@ -7,6 +7,7 @@ import requests
 from mgr_module import HandleCommandResult
 from ..service_registry import register_cephadm_service
 from cephadm.services.service_registry import service_registry
+from cephadm.services.node_proxy import NodeProxy
 from cephadm.tlsobject_types import TLSCredentials
 from orchestrator import DaemonDescription
 from ceph.deployment.service_spec import ServiceSpec, PrometheusSpec
@@ -130,6 +131,12 @@ class PrometheusService(CephadmService):
             else:
                 logger.error("dashboard module not found")
 
+        service_discovery_cfg = self.get_service_discovery_cfg(security_enabled, mgmt_gw_enabled)
+        # node-proxy serves the hardware metrics over TLS, always with credentials
+        node_proxy_user, node_proxy_password = (
+            NodeProxy.metrics_credentials(self.mgr)
+            if 'node-proxy' in service_discovery_cfg else ('', ''))
+
         # generate the prometheus configuration
         context = {
             'alertmanager_url_prefix': '/alertmanager' if mgmt_gw_enabled else '/',
@@ -138,7 +145,9 @@ class PrometheusService(CephadmService):
             'alertmanager_web_password': alertmanager_password,
             'service_discovery_username': self.mgr.http_server.service_discovery.username,
             'service_discovery_password': self.mgr.http_server.service_discovery.password,
-            'service_discovery_cfg': self.get_service_discovery_cfg(security_enabled, mgmt_gw_enabled),
+            'service_discovery_cfg': service_discovery_cfg,
+            'node_proxy_metrics_user': node_proxy_user,
+            'node_proxy_metrics_password': node_proxy_password,
             'external_prometheus_targets': targets,
             'remote_write_url': remote_write_url,
             'remote_write_allowed_metrics': remote_write_allowed_metrics,
@@ -157,6 +166,9 @@ class PrometheusService(CephadmService):
         files = {
             'prometheus.yml': self.mgr.template.render('services/prometheus/prometheus.yml.j2', context)
         }
+        if 'node-proxy' in service_discovery_cfg:
+            # to verify node-proxy's certificate, with or without the secure stack
+            files['root_cert.pem'] = self.mgr.cert_mgr.get_root_ca()
 
         # check if the prometheus.yml already exists in the config-key store,
         # if not we need to set the initial config-key with the default template content.
@@ -239,6 +251,10 @@ class PrometheusService(CephadmService):
         for svc in prometheus_svc_deps:
             configured = bool(mgr.cache.get_daemons_by_service(svc)) or bool(mgr.cache.get_daemons_by_type(svc))
             deps.append(f'{svc}_configured:{configured}')
+
+        if mgr.cache.get_daemons_by_type('node-proxy'):
+            node_proxy_user, node_proxy_password = NodeProxy.metrics_credentials(mgr)
+            deps.append(f'node-proxy-cred:{utils.config_hash(node_proxy_user + node_proxy_password)}')
 
         if not mgmt_gw_enabled:
             # Ceph mgrs are dependency because when mgmt-gateway is not enabled the service-discovery depends on mgrs ips

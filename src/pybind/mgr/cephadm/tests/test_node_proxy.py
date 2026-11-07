@@ -625,12 +625,16 @@ def test_node_proxy_get_dependencies():
     mgr.http_server.agent.server_port = 7150
     mgr.cert_mgr.get_root_ca.return_value = 'ROOT-CA'
     mgr.hw_monitoring_vendor = 'generic'
+    store = {NodeProxy.METRICS_USER_KEY: 'prometheus', NodeProxy.METRICS_PASS_KEY: 'pw'}
+    mgr.get_store.side_effect = store.get
 
+    from cephadm import utils
     assert NodeProxy.get_dependencies(mgr) == sorted([
         '10.0.0.1',
         '7150',
         'ROOT-CA',
         'generic',
+        f'metrics-cred:{utils.config_hash("prometheuspw")}',
     ])
 
 
@@ -720,3 +724,16 @@ def test_mgr_authenticates_with_the_cephx_identity() -> None:
     # no keyring yet: the out-of-band credentials, as before
     header = service.generate_auth_header('host02')['Authorization']
     assert base64.b64decode(header[6:]).decode() == 'oob2:pw2'
+
+
+def test_metrics_credentials_are_made_once() -> None:
+    from cephadm.services.node_proxy import NodeProxy
+
+    store = {}
+    mgr = MagicMock()
+    mgr.get_store.side_effect = store.get
+    mgr.set_store.side_effect = store.__setitem__
+    user, password = NodeProxy.metrics_credentials(mgr)
+    assert user == 'prometheus' and len(password) >= 32
+    assert NodeProxy.metrics_credentials(mgr) == (user, password)
+    assert store == {NodeProxy.METRICS_USER_KEY: user, NodeProxy.METRICS_PASS_KEY: password}

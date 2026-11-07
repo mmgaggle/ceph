@@ -1,5 +1,6 @@
 import json
 import re
+import secrets
 import ssl
 import base64
 
@@ -8,6 +9,7 @@ from typing import List, Any, Dict, Tuple, Optional, MutableMapping, TYPE_CHECKI
 
 from .service_registry import register_cephadm_service
 from .cephadmservice import CephadmDaemonDeploySpec, CephService, DaemonDeployContext
+from .. import utils
 from ceph.deployment.service_spec import ServiceSpec, PlacementSpec
 from ceph.utils import http_req
 from orchestrator import OrchestratorError
@@ -19,6 +21,26 @@ if TYPE_CHECKING:
 @register_cephadm_service
 class NodeProxy(CephService):
     TYPE = 'node-proxy'
+    PORT = 9456
+    METRICS_USER_KEY = 'node_proxy/metrics_username'
+    METRICS_PASS_KEY = 'node_proxy/metrics_password'
+
+    @property
+    def needs_monitoring(self) -> bool:
+        # Prometheus scrapes the hardware metrics from each node-proxy
+        return True
+
+    @classmethod
+    def metrics_credentials(cls, mgr: "CephadmOrchestrator") -> Tuple[str, str]:
+        """Prometheus's credentials for node-proxy's /metrics, made once for
+        the cluster. They open /metrics and nothing else."""
+        user = mgr.get_store(cls.METRICS_USER_KEY)
+        password = mgr.get_store(cls.METRICS_PASS_KEY)
+        if not user or not password:
+            user, password = 'prometheus', secrets.token_urlsafe(32)
+            mgr.set_store(cls.METRICS_USER_KEY, user)
+            mgr.set_store(cls.METRICS_PASS_KEY, password)
+        return user, password
 
     def prepare_create(
             self,
@@ -54,7 +76,9 @@ class NodeProxy(CephService):
             root_cert = mgr.cert_mgr.get_root_ca()
         except Exception:
             pass
-        return sorted([mgr.get_mgr_ip(), server_port, root_cert, mgr.hw_monitoring_vendor])
+        metrics_user, metrics_password = cls.metrics_credentials(mgr)
+        return sorted([mgr.get_mgr_ip(), server_port, root_cert, mgr.hw_monitoring_vendor,
+                       f'metrics-cred:{utils.config_hash(metrics_user + metrics_password)}'])
 
     def generate_config(
             self,
@@ -71,6 +95,7 @@ class NodeProxy(CephService):
                 'Cannot deploy node-proxy daemons until cephadm endpoint has finished generating certs')
 
         tls_pair = self.get_certificates(daemon_spec)
+        metrics_user, metrics_password = self.metrics_credentials(self.mgr)
         cfg = {
             'target_ip': self.mgr.get_mgr_ip(),
             'target_port': self.agent_endpoint.server_port,
@@ -80,6 +105,7 @@ class NodeProxy(CephService):
             'listener.crt': tls_pair.cert,
             'listener.key': tls_pair.key,
             'system': {'vendor': self.mgr.hw_monitoring_vendor},
+            'metrics': {'username': metrics_user, 'password': metrics_password},
         }
         config = {'node-proxy.json': json.dumps(cfg)}
 
@@ -135,7 +161,7 @@ class NodeProxy(CephService):
 
         try:
             headers, result, status = http_req(hostname=addr,
-                                               port='9456',
+                                               port=str(self.PORT),
                                                headers=header,
                                                method=method,
                                                data=json.dumps(payload),
@@ -177,7 +203,7 @@ class NodeProxy(CephService):
 
         try:
             headers, result, status = http_req(hostname=addr,
-                                               port='9456',
+                                               port=str(self.PORT),
                                                headers=header,
                                                data=json.dumps(payload),
                                                endpoint=endpoint,
@@ -200,7 +226,7 @@ class NodeProxy(CephService):
 
         try:
             headers, result, status = http_req(hostname=addr,
-                                               port='9456',
+                                               port=str(self.PORT),
                                                headers=header,
                                                data="{}",
                                                endpoint=endpoint,
@@ -227,7 +253,7 @@ class NodeProxy(CephService):
         addr: str = self.mgr.inventory.get_addr(hostname)
         try:
             return http_req(hostname=addr,
-                            port='9456',
+                            port=str(self.PORT),
                             headers=self.generate_auth_header(hostname),
                             method=method,
                             data=json.dumps(payload) if payload is not None else None,

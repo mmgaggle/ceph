@@ -13,6 +13,7 @@ import tempfile
 
 from cephadm.services.ceph_exporter import CephExporterService
 from cephadm.services.nvmeof import NvmeofService
+from cephadm.services.node_proxy import NodeProxy
 from cephadm.services.service_registry import service_registry
 
 from ceph.deployment.service_spec import SMBSpec
@@ -135,6 +136,7 @@ class Root:
 <p><a href='prometheus/sd-config?service=haproxy'>HAProxy http sd-config</a></p>
 <p><a href='prometheus/sd-config?service=ceph-exporter'>Ceph exporter http sd-config</a></p>
 <p><a href='prometheus/sd-config?service=nvmeof'>NVMeoF http sd-config</a></p>
+<p><a href='prometheus/sd-config?service=node-proxy'>node-proxy http sd-config</a></p>
 <p><a href='prometheus/sd-config?service=nfs'>NFS http sd-config</a></p>
 <p><a href='prometheus/sd-config?service=smb'>SMB http sd-config</a></p>
 <p><a href='prometheus/sd-config?service=pushgateway'>Pushgateway http sd-config</a></p>
@@ -159,6 +161,7 @@ class Root:
             'ingress': self.haproxy_sd_config,
             'ceph-exporter': self.ceph_exporter_sd_config,
             'nvmeof': self.nvmeof_sd_config,
+            'node-proxy': self.node_proxy_sd_config,
             'nfs': self.nfs_sd_config,
             'smb': self.smb_sd_config,
             'pushgateway': self.pushgateway_sd_config,
@@ -242,6 +245,19 @@ class Root:
             port = NvmeofService.PROMETHEUS_PORT
             srv_entries.append({
                 'targets': [build_url(host=addr, port=port).lstrip('/')],
+                'labels': {'instance': dd.hostname}
+            })
+        return srv_entries
+
+    def node_proxy_sd_config(self) -> List[Dict[str, Collection[str]]]:
+        """Return <http_sd_config> compatible prometheus config for node-proxy service."""
+        srv_entries = []
+        for dd in self.mgr.cache.get_daemons_by_type('node-proxy'):
+            assert dd.hostname is not None
+            # the address its certificate names, as the mgr reaches it
+            addr = self.mgr.inventory.get_addr(dd.hostname)
+            srv_entries.append({
+                'targets': [build_url(host=addr, port=NodeProxy.PORT).lstrip('/')],
                 'labels': {'instance': dd.hostname}
             })
         return srv_entries

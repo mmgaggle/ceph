@@ -257,6 +257,17 @@ class TestServiceDiscovery:
         # check content
         assert cfg[0]['targets'] == ['1.2.3.4:10008']
 
+    def test_get_sd_config_node_proxy(self):
+        mgr = FakeMgr()
+        root = Root(mgr)
+        cfg = root.get_sd_config('node-proxy')
+
+        # one target per host, at the address its certificate names
+        assert cfg == [
+            {'targets': ['1.2.3.4:9456'], 'labels': {'instance': 'node0'}},
+            {'targets': ['1.2.3.4:9456'], 'labels': {'instance': 'node1'}},
+        ]
+
     def test_get_sd_config_nfs(self):
         mgr = FakeMgr()
         root = Root(mgr)

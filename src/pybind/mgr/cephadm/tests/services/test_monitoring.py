@@ -1939,6 +1939,45 @@ spec:
         })
 
     @patch("cephadm.services.monitoring.PrometheusService.get_dependencies", lambda *a, **k: [])
+    @patch('cephadm.cert_mgr.CertMgr.get_root_ca', lambda instance: 'cephadm_root_cert')
+    @pytest.mark.parametrize('security_enabled', [False, True])
+    def test_prometheus_config_scrapes_node_proxy(self, cephadm_module, security_enabled):
+        svc = PrometheusService(cephadm_module)
+        daemon_spec = Mock()
+        daemon_spec.daemon_type = 'prometheus'
+        daemon_spec.service_name = 'prometheus'
+        daemon_spec.host = 'test'
+        cephadm_module.mon_command = Mock(return_value=(0, '', ''))
+        cephadm_module._get_security_config = Mock(return_value=(security_enabled, False, False))
+        cephadm_module._get_alertmanager_credentials = Mock(return_value=('a', 'b'))
+        cephadm_module._get_prometheus_credentials = Mock(return_value=('c', 'd'))
+        cephadm_module.spec_store = {'prometheus': Mock()}
+        cephadm_module.spec_store['prometheus'].spec = PrometheusSpec('prometheus')
+        cephadm_module.set_store('node_proxy/metrics_username', 'prometheus')
+        cephadm_module.set_store('node_proxy/metrics_password', 'scrape-pw')
+        sd = {'ceph': ['http://1.2.3.4:8765/sd/prometheus/sd-config?service=ceph'],
+              'node-proxy': ['http://1.2.3.4:8765/sd/prometheus/sd-config?service=node-proxy']}
+
+        with patch.object(PrometheusService, 'get_service_discovery_cfg', return_value=sd), \
+                patch.object(PrometheusService, 'get_prometheus_certificates',
+                             return_value=TLSCredentials('mycert', 'mykey')):
+            r, _ = svc.generate_config(DaemonDeployContext(daemon_spec))
+
+        assert r['files']['root_cert.pem'] == 'cephadm_root_cert'
+        job = r['files']['prometheus.yml'].split("job_name: 'node-proxy'")[1]
+        assert dedent("""
+            scheme: https
+            tls_config:
+              ca_file: root_cert.pem
+            basic_auth:
+              username: prometheus
+              password: scrape-pw
+            honor_labels: true
+        """).strip() in dedent(job)
+        # Prometheus presents no client certificate to node-proxy
+        assert 'cert_file' not in job.split('http_sd_configs')[0]
+
+    @patch("cephadm.services.monitoring.PrometheusService.get_dependencies", lambda *a, **k: [])
     def test_prometheus_config_does_not_override_existing(self, cephadm_module):
 
         svc = PrometheusService(cephadm_module)

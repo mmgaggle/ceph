@@ -491,6 +491,10 @@ class Metric(object):
 
             return "ceph_{0}".format(result)
 
+        def labelstr(value: Any) -> str:
+            ''' a label value, escaped as the text format requires '''
+            return str(value).replace('\\', '\\\\').replace('\n', '\\n').replace('"', '\\"')
+
         def floatstr(value: float) -> str:
             ''' represent as Go-compatible float '''
             if value == float('inf'):
@@ -513,7 +517,7 @@ class Metric(object):
         for labelvalues, value in self.value.items():
             if self.labelnames:
                 labels_list = zip(self.labelnames, labelvalues)
-                labels = ','.join('%s="%s"' % (k, v) for k, v in labels_list)
+                labels = ','.join('%s="%s"' % (k, labelstr(v)) for k, v in labels_list)
             else:
                 labels = ''
             if labels:

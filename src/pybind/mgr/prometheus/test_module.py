@@ -96,6 +96,17 @@ ceph_disk_occupation_display{ceph_daemon="osd.5+osd.6",device="/dev/dm-1",instan
         self.assertEqual(str(cm.exception), "joins must be callable")
 
 
+class MetricExpfmtTest(TestCase):
+    def test_label_values_are_escaped(self):
+        """A quote, backslash or newline in a label value (a drive model,
+        a pool name) would otherwise make the whole scrape fail."""
+        m = Metric('gauge', 'hardware_storage_capacity_bytes', 'Capacity', ('model', 'serial'))
+        m.set(1, ('say "hi" \\', 'line\nbreak'))
+        self.assertIn('ceph_hardware_storage_capacity_bytes'
+                      '{model="say \\"hi\\" \\\\",serial="line\\nbreak"} 1.0',
+                      m.str_expfmt())
+
+
 class HealthHistoryTest(TestCase):
     def setUp(self):
         self.mgr = mock.MagicMock()

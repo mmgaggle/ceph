@@ -1,7 +1,8 @@
+import json
 import logging
 import os
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..constants import DEFAULT_IMAGE
 from ..container_daemon_form import ContainerDaemonForm, daemon_to_container
@@ -16,6 +17,14 @@ from ..exceptions import Error
 from ..file_utils import populate_files
 
 logger = logging.getLogger()
+
+
+def _device_access(config: Any) -> bool:
+    try:
+        data = json.loads(config) if isinstance(config, str) else config
+    except ValueError:
+        return False
+    return isinstance(data, dict) and bool(data.get('device_access'))
 
 
 @register_daemon_form
@@ -45,6 +54,10 @@ class NodeProxy(ContainerDaemonForm):
         # config-json options
         config = dict_get(config_json, 'node-proxy.json', {})
         self.files = {'node-proxy.json': config}
+        # a node-proxy that reads the host's devices itself (FCM usage
+        # through an NVMe admin pass-through) gets /dev and a privileged
+        # container; the others only reach the Redfish service
+        self.device_access = _device_access(config)
 
         # validate the supplied args
         self.validate()
@@ -86,10 +99,11 @@ class NodeProxy(ContainerDaemonForm):
                 os.path.join(
                     data_dir, 'node-proxy.json'
                 ): '/usr/share/ceph/node-proxy.json:z',
-                # FCM stats open /dev/nvme* after hotplug.
-                '/dev': '/dev',
             }
         )
+        if self.device_access:
+            # FCM stats open /dev/nvme* after hotplug.
+            mounts['/dev'] = '/dev'
 
     def customize_process_args(
         self, ctx: CephadmContext, args: List[str]
@@ -138,9 +152,8 @@ class NodeProxy(ContainerDaemonForm):
         populate_files(data_dir, self.files, uid, gid)
 
     def container(self, ctx: CephadmContext) -> CephContainer:
-        # So the container can modprobe iscsi_target_mod and have write perms
-        # to configfs we need to make this a privileged container.
-        ctr = daemon_to_container(ctx, self, privileged=True)
+        # NVMe admin pass-through needs CAP_SYS_ADMIN on the device
+        ctr = daemon_to_container(ctx, self, privileged=self.device_access)
         return to_deployment_container(ctx, ctr)
 
     def config_and_keyring(

@@ -3,6 +3,7 @@ import re
 import secrets
 import ssl
 import base64
+from dataclasses import replace
 
 from urllib.error import HTTPError, URLError
 from typing import List, Any, Dict, Tuple, Optional, MutableMapping, TYPE_CHECKING
@@ -11,6 +12,7 @@ from .service_registry import register_cephadm_service
 from .cephadmservice import CephadmDaemonDeploySpec, CephService, DaemonDeployContext
 from .. import utils
 from ceph.deployment.service_spec import ServiceSpec, PlacementSpec
+from orchestrator import DaemonDescription
 from ceph.utils import http_req
 from orchestrator import OrchestratorError
 
@@ -22,6 +24,10 @@ if TYPE_CHECKING:
 class NodeProxy(CephService):
     TYPE = 'node-proxy'
     PORT = 9456
+    # vendors whose node-proxy reads the host's devices itself: their local
+    # collectors (ceph_node_proxy.registry) read FCM usage through an NVMe
+    # admin pass-through, so the container gets /dev and is privileged
+    DEVICE_ACCESS_VENDORS = ('atollon',)
     METRICS_USER_KEY = 'node_proxy/metrics_username'
     METRICS_PASS_KEY = 'node_proxy/metrics_password'
 
@@ -78,7 +84,31 @@ class NodeProxy(CephService):
             pass
         metrics_user, metrics_password = cls.metrics_credentials(mgr)
         return sorted([mgr.get_mgr_ip(), server_port, root_cert, mgr.hw_monitoring_vendor,
-                       f'metrics-cred:{utils.config_hash(metrics_user + metrics_password)}'])
+                       f'metrics-cred:{utils.config_hash(metrics_user + metrics_password)}',
+                       f'device-access:{cls.device_access(mgr)}'])
+
+    @classmethod
+    def device_access(cls, mgr: "CephadmOrchestrator") -> bool:
+        return mgr.hw_monitoring_vendor in cls.DEVICE_ACCESS_VENDORS
+
+    def choose_next_action(
+        self,
+        scheduled_action: utils.Action,
+        daemon_type: Optional[str],
+        spec: Optional[ServiceSpec],
+        curr_deps: List[str],
+        last_deps: List[str],
+        daemon: Optional[DaemonDescription] = None,
+    ) -> utils.NextDaemonStep:
+        step = super().choose_next_action(
+            scheduled_action, daemon_type, spec, curr_deps, last_deps)
+        # /dev and the privileged flag are in the container's unit, which
+        # only a redeploy rewrites
+        sym_diff = set(curr_deps).symmetric_difference(last_deps)
+        if step.action is utils.Action.RECONFIG and \
+                any(d.startswith('device-access:') for d in sym_diff):
+            return replace(step, action=utils.Action.REDEPLOY)
+        return step
 
     def generate_config(
             self,
@@ -106,6 +136,7 @@ class NodeProxy(CephService):
             'listener.key': tls_pair.key,
             'system': {'vendor': self.mgr.hw_monitoring_vendor},
             'metrics': {'username': metrics_user, 'password': metrics_password},
+            'device_access': self.device_access(self.mgr),
         }
         config = {'node-proxy.json': json.dumps(cfg)}
 

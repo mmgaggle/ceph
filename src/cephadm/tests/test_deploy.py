@@ -3,6 +3,8 @@ import pathlib
 import unittest
 from unittest import mock
 
+import pytest
+
 from .fixtures import (
     cephadm_fs,
     import_cephadm,
@@ -762,3 +764,32 @@ def test_deploy_smb_container(cephadm_fs, funkypatch):
     assert '-e SAMBA_CONTAINER_ID=smb1' in runfile_lines[-1]
     assert '-e \'SAMBACC_CONFIG=["http://localhost:9876/smb.json"]\'' in runfile_lines[-1]
     assert '--publish' in runfile_lines[-1]
+
+
+@pytest.mark.parametrize('device_access', [False, True])
+def test_deploy_node_proxy_container(cephadm_fs, funkypatch, device_access):
+    import json
+
+    _common_patches(funkypatch)
+    fsid = 'b01dbeef-701d-9abe-0000-e1e5a47004a7'
+    with with_cephadm_ctx([]) as ctx:
+        ctx.container_engine = mock_podman()
+        ctx.fsid = fsid
+        ctx.name = 'node-proxy.host1'
+        ctx.image = 'quay.io/ceph/ceph:latest'
+        ctx.reconfig = False
+        ctx.config_blobs = {
+            'config': 'XXXXXXX',
+            'keyring': 'YYYYYY',
+            'node-proxy.json': json.dumps({
+                'name': 'node-proxy.host1', 'device_access': device_access}),
+        }
+        _cephadm._common_deploy(ctx)
+
+    with open(f'/var/lib/ceph/{fsid}/node-proxy.host1/unit.run') as f:
+        run = f.read().splitlines()[-1]
+    # only a node-proxy reading the FCMs through NVMe pass-through gets
+    # the host's devices
+    assert ('--privileged' in run) is device_access
+    assert ('-v /dev:/dev' in run) is device_access
+    assert '/usr/share/ceph/node-proxy.json:z' in run

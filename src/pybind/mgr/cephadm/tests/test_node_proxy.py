@@ -635,6 +635,7 @@ def test_node_proxy_get_dependencies():
         'ROOT-CA',
         'generic',
         f'metrics-cred:{utils.config_hash("prometheuspw")}',
+        'device-access:False',
     ])
 
 
@@ -737,3 +738,42 @@ def test_metrics_credentials_are_made_once() -> None:
     assert user == 'prometheus' and len(password) >= 32
     assert NodeProxy.metrics_credentials(mgr) == (user, password)
     assert store == {NodeProxy.METRICS_USER_KEY: user, NodeProxy.METRICS_PASS_KEY: password}
+
+
+@pytest.mark.parametrize('vendor, device_access', [('generic', False), ('atollon', True)])
+def test_device_access_only_for_local_collectors(vendor, device_access) -> None:
+    from cephadm.services.cephadmservice import DaemonDeployContext
+    from cephadm.services.node_proxy import NodeProxy
+    from cephadm.tlsobject_types import TLSCredentials
+
+    mgr = MagicMock()
+    mgr.hw_monitoring_vendor = vendor
+    store = {NodeProxy.METRICS_USER_KEY: 'prometheus', NodeProxy.METRICS_PASS_KEY: 'pw'}
+    mgr.get_store.side_effect = store.get
+    mgr.get_mgr_ip.return_value = '10.0.0.1'
+    mgr.http_server.agent.server_port = 7150
+    mgr.cert_mgr.get_root_ca.return_value = 'ROOT-CA'
+    daemon_spec = MagicMock()
+    daemon_spec.host = 'host01'
+    daemon_spec.keyring = 'AQB=='
+    with patch.object(NodeProxy, 'get_certificates', return_value=TLSCredentials('crt', 'key')), \
+            patch.object(NodeProxy, 'get_dependencies', return_value=[]):
+        config, _ = NodeProxy(mgr).generate_config(DaemonDeployContext(daemon_spec))
+    cfg = json.loads(config['node-proxy.json'])
+    assert cfg['device_access'] is device_access
+    assert cfg['system'] == {'vendor': vendor}
+
+
+def test_device_access_change_redeploys() -> None:
+    from cephadm import utils
+    from cephadm.services.node_proxy import NodeProxy
+
+    svc = NodeProxy(MagicMock())
+    old = ['10.0.0.1', 'generic', 'device-access:False']
+    new = ['10.0.0.1', 'atollon', 'device-access:True']
+    step = svc.choose_next_action(utils.Action.NO_ACTION, 'node-proxy', None, new, old)
+    assert step.action is utils.Action.REDEPLOY
+    # another vendor without device access: a reconfig is enough
+    other = ['10.0.0.1', 'dell', 'device-access:False']
+    step = svc.choose_next_action(utils.Action.NO_ACTION, 'node-proxy', None, other, old)
+    assert step.action is utils.Action.RECONFIG

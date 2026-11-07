@@ -4,7 +4,8 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.error import HTTPError, URLError
 
 from ceph_node_proxy.baseclient import BaseClient
-from ceph_node_proxy.util import get_logger, http_req
+from ceph_node_proxy.connections import ConnectionPool
+from ceph_node_proxy.util import get_logger
 
 
 class RedFishClient(BaseClient):
@@ -22,6 +23,7 @@ class RedFishClient(BaseClient):
         self.token: str = ""
         self.location: str = ""
         self.session_service: str = ""
+        self.connections = ConnectionPool(self.host, self.port)
 
     def sessionservice_discover(self) -> None:
         _error_msg: str = "Can't discover SessionService url"
@@ -105,6 +107,7 @@ class RedFishClient(BaseClient):
 
         self.location = ""
         self.token = ""
+        self.connections.close()
 
         return result
 
@@ -137,9 +140,7 @@ class RedFishClient(BaseClient):
             return h
 
         def do_req(h: Dict[str, str]) -> Tuple[HTTPMessage, Any, int]:
-            return http_req(
-                hostname=self.host,
-                port=self.port,
+            return self.connections.request(
                 endpoint=endpoint,
                 headers=h,
                 method=method,

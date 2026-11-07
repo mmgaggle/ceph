@@ -1,7 +1,7 @@
 import concurrent.futures
 import dataclasses
 import json
-from time import sleep
+import threading
 from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional
 
@@ -181,6 +181,8 @@ class BaseRedfishSystem(BaseSystem):
         self.refresh_interval: int = config.get("system", {}).get(
             "refresh_interval", DEFAULTS["system"]["refresh_interval"]
         )
+        # set to poll at once (the Redfish service sent an event)
+        self.wake = threading.Event()
 
     def initialize_redfish_session(self) -> None:
         self.client.login()
@@ -230,8 +232,12 @@ class BaseRedfishSystem(BaseSystem):
                         )
                         self.client.logout()
                         raise
-                    sleep(self.refresh_interval)
             self.log.debug("lock released in the update loop.")
+            # wait without the lock: the API and the reporter read meanwhile;
+            # an event of the Redfish service ends the wait (event_stream)
+            if self.wake.wait(self.refresh_interval):
+                self.wake.clear()
+                self.log.debug("woken by an event of the Redfish service.")
         self.log.debug("exiting update loop.")
         raise SystemExit(0)
 

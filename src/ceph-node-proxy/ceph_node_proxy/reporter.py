@@ -1,10 +1,11 @@
 import json
 import time
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Optional
 from urllib.error import HTTPError, URLError
 
 from ceph_node_proxy.protocols import SystemForReporter
-from ceph_node_proxy.util import BaseThread, _dict_diff, get_logger, http_req
+from ceph_node_proxy.util import DEFAULTS, BaseThread, _dict_diff, get_logger, \
+    http_req, stable_part
 
 DEFAULT_MAX_RETRIES = 30
 RETRY_SLEEP_SEC = 5
@@ -21,8 +22,13 @@ class Reporter(BaseThread):
         reporter_port: str = "443",
         reporter_endpoint: str = "/node-proxy/data",
         max_retries: int = DEFAULT_MAX_RETRIES,
+        readings_interval: int = DEFAULTS["reporter"]["readings_interval"],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         super().__init__()
+        self.readings_interval = readings_interval
+        self._clock = clock
+        self._last_sent: Optional[float] = None
         self.system = system
         self.data: Dict[str, Any] = {}
         self.stop: bool = False
@@ -94,10 +100,19 @@ class Reporter(BaseThread):
         if current == self.system.previous_data:
             self.log.debug("no diff, not sending data to the mgr.")
             return
+        # readings alone changed: at most every readings_interval seconds
+        if (
+            self._last_sent is not None
+            and stable_part(current) == stable_part(self.system.previous_data)
+            and self._clock() - self._last_sent < self.readings_interval
+        ):
+            self.log.debug("only readings changed, sent later.")
+            return
         self._log_data_delta(current)
         self.data["patch"] = current
         if self._send_with_retries():
             self.system.previous_data = current
+            self._last_sent = self._clock()
         else:
             self.log.error(
                 f"Failed to send data after {self.max_retries} retries; "

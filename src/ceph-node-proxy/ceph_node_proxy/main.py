@@ -117,6 +117,12 @@ class NodeProxyManager:
         except RuntimeError:
             self.log.error("Can't initialize the redfish system.")
             raise
+        # poll at once on the Redfish service's events (event_stream)
+        if self.config.get("system", {}).get("event_stream", True) and \
+                hasattr(self.system, "wake") and hasattr(self.system, "client"):
+            from ceph_node_proxy.event_stream import EventStreamWatcher
+            self.event_stream = EventStreamWatcher(self.system.client, self.system.wake)
+            self.event_stream.start()
 
     def init_reporter(self) -> None:
         try:
@@ -131,6 +137,9 @@ class NodeProxyManager:
                 reporter_port=self.mgr_agent_port,
                 reporter_endpoint=self.reporter_endpoint,
                 max_retries=max_retries,
+                readings_interval=self.config.get("reporter", {}).get(
+                    "readings_interval", 300
+                ),
             )
             self.reporter_agent.start()
         except RuntimeError:

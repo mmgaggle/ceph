@@ -16,11 +16,16 @@ DEFAULTS: Dict[str, Any] = {
     "reporter": {
         "check_interval": 5,
         "push_data_max_retries": 30,
+        # readings (temperatures, fan speeds, counters...) alone changing are
+        # sent at most this often; state changes are sent at once
+        "readings_interval": 300,
         "endpoint": "https://%(mgr_host):%(mgr_port)/node-proxy/data",
     },
     "system": {
         "refresh_interval": 20,
         "vendor": "generic",
+        # follow the Redfish service's server-sent events to poll at once
+        "event_stream": True,
     },
     "api": {
         "port": 9456,
@@ -294,3 +299,23 @@ def has_drive(storage: Dict[str, Any], drive_id: Optional[str]) -> bool:
     return bool(drive_id) and any(
         drive_id in drives for drives in storage.values() if isinstance(drives, dict)
     )
+
+
+# report fields that change on every poll: readings, NIC counters and
+# optics, FCM utilization (as the mgr's NodeProxyCache leaves them out of
+# what it persists)
+VOLATILE_FIELDS = frozenset({
+    "reading", "rx_bytes", "tx_bytes", "rx_errors", "tx_errors", "rx_fcs_errors",
+    "rx_discards", "tx_discards", "transceiver", "transceiver_temperature_c",
+    "phy_util_bytes", "log_util_bytes", "compression_ratio", "compression_ratio_str",
+    "compression_ratio_display", "savings_bytes",
+})
+
+
+def stable_part(value: Any) -> Any:
+    """value without its VOLATILE_FIELDS, at any depth"""
+    if isinstance(value, dict):
+        return {k: stable_part(v) for k, v in value.items() if k not in VOLATILE_FIELDS}
+    if isinstance(value, list):
+        return [stable_part(v) for v in value]
+    return value

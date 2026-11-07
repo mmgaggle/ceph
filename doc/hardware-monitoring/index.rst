@@ -41,6 +41,26 @@ This implies that both ``node-proxy`` agent and the Ceph Manager need to be
 able to access the out-of-band network.
 
 
+How Often It Reports
+====================
+
+``node-proxy`` reads the Redfish API every 20 seconds
+(``system.refresh_interval``). It sends a report to the Ceph Manager as
+soon as something other than a reading changes: health, state,
+inventory or firmware. When only readings change (temperatures, fan
+speeds, network counters), it sends them at most every 300 seconds
+(``reporter.readings_interval``).
+
+When the Redfish service has a server-sent event stream
+(``EventService.ServerSentEventUri``), ``node-proxy`` follows it and reads
+the API as soon as an event comes, without waiting for the next refresh
+(``system.event_stream``, on by default). Without one, it keeps polling
+alone.
+
+The Ceph Manager stores each host's report without its readings, and
+only when it changes.
+
+
 Deploying the Agent
 ===================
 

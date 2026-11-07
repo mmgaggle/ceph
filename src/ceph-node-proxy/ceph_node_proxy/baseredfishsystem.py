@@ -1,7 +1,6 @@
 import concurrent.futures
 import dataclasses
 import json
-import threading
 from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional
 
@@ -16,7 +15,6 @@ from ceph_node_proxy.redfish import (
 )
 from ceph_node_proxy.redfish_client import RedFishClient
 from ceph_node_proxy.util import (
-    DEFAULTS,
     check_id,
     fill_missing_identity,
     get_logger,
@@ -149,7 +147,6 @@ class BaseRedfishSystem(BaseSystem):
         self.log.info(
             f"redfish system initialization, host: {self.host}, user: {self.username}"
         )
-        self.data_ready: bool = False
         self.previous_data: Dict = {}
         self.data: Dict[str, Dict[str, Any]] = {}
         self._system: Dict[str, Dict[str, Any]] = {}
@@ -177,16 +174,13 @@ class BaseRedfishSystem(BaseSystem):
             if hasattr(self, func):
                 f = getattr(self, func)
                 self.update_funcs.append(f)
-        config = kw.get("config") or {}
-        self.refresh_interval: int = config.get("system", {}).get(
-            "refresh_interval", DEFAULTS["system"]["refresh_interval"]
-        )
-        # set to poll at once (the Redfish service sent an event)
-        self.wake = threading.Event()
 
     def initialize_redfish_session(self) -> None:
         self.client.login()
         self.endpoints.init()
+
+    def start_session(self) -> None:
+        self.initialize_redfish_session()
 
     def run_update_cycle(self) -> None:
         self._update_system()
@@ -212,35 +206,6 @@ class BaseRedfishSystem(BaseSystem):
             self.log,
             attribute=attribute,
         )
-
-    def main(self) -> None:
-        self.stop = False
-        self.initialize_redfish_session()
-
-        while not self.stop:
-            self.log.debug("waiting for a lock in the update loop.")
-            with self.lock:
-                if not self.pending_shutdown:
-                    self.log.debug("lock acquired in the update loop.")
-                    try:
-                        self.run_update_cycle()
-                        self.data_ready = True
-                        self.keep_snapshot()
-                    except RuntimeError as e:
-                        self.stop = True
-                        self.log.error(
-                            f"Error detected, trying to gracefully log out from redfish api.\n{e}"
-                        )
-                        self.client.logout()
-                        raise
-            self.log.debug("lock released in the update loop.")
-            # wait without the lock: the API and the reporter read meanwhile;
-            # an event of the Redfish service ends the wait (event_stream)
-            if self.wake.wait(self.refresh_interval):
-                self.wake.clear()
-                self.log.debug("woken by an event of the Redfish service.")
-        self.log.debug("exiting update loop.")
-        raise SystemExit(0)
 
     def flush(self) -> None:
         self.log.debug("Acquiring lock to flush data.")

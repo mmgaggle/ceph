@@ -1,11 +1,12 @@
 import copy
 import socket
+import threading
 import time
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple, Union
 
 from ceph_node_proxy.baseclient import BaseClient
-from ceph_node_proxy.util import BaseThread, Config, get_logger
+from ceph_node_proxy.util import DEFAULTS, BaseThread, Config, get_logger
 
 
 class BaseSystem(BaseThread):
@@ -17,6 +18,13 @@ class BaseSystem(BaseThread):
         self.client: BaseClient
         self.log = get_logger(__name__)
         self._snapshot: Tuple[Dict[str, Any], Optional[float]] = ({}, None)
+        self.data_ready: bool = False
+        config = self.config or {}
+        self.refresh_interval: int = config.get("system", {}).get(
+            "refresh_interval", DEFAULTS["system"]["refresh_interval"]
+        )
+        # set to poll at once (the Redfish service sent an event) or to stop
+        self.wake = threading.Event()
 
     def keep_snapshot(self) -> None:
         """Keep a copy of the data an update just read, with its time. The
@@ -32,8 +40,46 @@ class BaseSystem(BaseThread):
         (None before the first)."""
         return self._snapshot
 
-    def main(self) -> None:
+    def start_session(self) -> None:
+        """Log in to the Redfish service before the first update."""
         raise NotImplementedError()
+
+    def run_update_cycle(self) -> None:
+        """Read the hardware once."""
+        raise NotImplementedError()
+
+    def main(self) -> None:
+        self.stop = False
+        self.start_session()
+        while not self.stop:
+            self.log.debug("waiting for a lock in the update loop.")
+            with self.lock:
+                if not self.pending_shutdown:
+                    self.log.debug("lock acquired in the update loop.")
+                    try:
+                        self.run_update_cycle()
+                        self.data_ready = True
+                        self.keep_snapshot()
+                    except RuntimeError as e:
+                        self.stop = True
+                        self.log.error(
+                            f"Error detected, trying to gracefully log out from redfish api.\n{e}"
+                        )
+                        self.client.logout()
+                        raise
+            self.log.debug("lock released in the update loop.")
+            # wait without the lock: the API and the reporter read meanwhile;
+            # an event of the Redfish service (event_stream) or a shutdown
+            # ends the wait
+            if not self.stop and self.wake.wait(self.refresh_interval):
+                self.wake.clear()
+                self.log.debug("woken before the refresh interval.")
+        self.log.debug("exiting update loop.")
+        raise SystemExit(0)
+
+    def shutdown(self) -> None:
+        super().shutdown()
+        self.wake.set()
 
     def get_system(self) -> Dict[str, Any]:
         raise NotImplementedError()

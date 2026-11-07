@@ -105,3 +105,45 @@ class TestCreateNodeBackend:
         assert isinstance(backend, NodeBackend)
         assert backend.redfish is mock_redfish
         assert backend._local.categories() == ["fcm"]
+
+
+class TestNodeBackendLoop:
+    def test_waits_without_the_lock_and_wakes(self, mock_redfish):
+        import threading
+
+        backend = NodeBackend(mock_redfish, LocalCollectorRunner([]))
+        backend.refresh_interval = 60
+        cycles = []
+
+        def cycle():
+            cycles.append(1)
+            if len(cycles) == 2:
+                backend.stop = True
+
+        mock_redfish.run_update_cycle.side_effect = cycle
+        thread = threading.Thread(target=lambda: pytest.raises(SystemExit, backend.main))
+        thread.start()
+        # the first cycle is done: the loop waits, not holding the lock
+        for _ in range(100):
+            if cycles and backend.data_ready:
+                break
+            threading.Event().wait(0.01)
+        assert backend.lock.acquire(timeout=1)
+        backend.lock.release()
+        assert backend.snapshot()[1] is not None
+        # an event of the Redfish service ends the wait at once
+        backend.wake.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive() and len(cycles) == 2
+        mock_redfish.initialize_redfish_session.assert_called_once()
+
+    def test_shutdown_ends_the_wait_and_stops_the_queries(self, mock_redfish):
+        backend = NodeBackend(mock_redfish, LocalCollectorRunner([]))
+        backend.shutdown()
+        assert backend.wake.is_set() and backend.stop
+        mock_redfish.shutdown.assert_called_once()
+
+    def test_has_what_the_event_stream_needs(self, mock_redfish):
+        backend = NodeBackend(mock_redfish, LocalCollectorRunner([]))
+        assert backend.client is mock_redfish.client
+        assert backend.wake is not None

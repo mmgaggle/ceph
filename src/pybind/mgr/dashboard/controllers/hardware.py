@@ -54,7 +54,7 @@ HARDWARE_HOST_SCHEMA = {
 }
 
 
-@APIRouter('/hardware')
+@APIRouter('/hardware', Scope.HOSTS)
 @APIDoc("Hardware management API", "Hardware")
 class Hardware(RESTController):
 
@@ -69,7 +69,7 @@ class Hardware(RESTController):
         return HardwareService.get_summary(categories, hostname)
 
 
-@APIRouter('/hardware/compression')
+@APIRouter('/hardware/compression', Scope.HOSTS)
 @APIDoc("Hardware compression API", "Hardware")
 class HardwareCompression(RESTController):
 
@@ -79,7 +79,7 @@ class HardwareCompression(RESTController):
         return HardwareService.get_compression()
 
 
-@APIRouter('/hardware/hosts')
+@APIRouter('/hardware/hosts', Scope.HOSTS)
 @APIDoc("Hardware hosts API", "Hardware")
 class HardwareHosts(RESTController):
 

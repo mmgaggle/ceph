@@ -1,4 +1,4 @@
-from ceph_node_proxy.util import fill_missing_identity, is_unknown
+from ceph_node_proxy.util import fill_missing_identity, host_of, is_unknown
 
 
 def test_is_unknown_treats_none_empty_and_unknown() -> None:
@@ -51,3 +51,9 @@ def test_fill_missing_identity_does_not_add_name() -> None:
     member = {"id": "DevType2_DIMM0", "description": "unknown"}
     fill_missing_identity(member, "dimm0")
     assert "name" not in member
+
+
+def test_host_of() -> None:
+    assert host_of("node-proxy.host01") == "host01"
+    assert host_of("node-proxy.host01.example.com") == "host01.example.com"
+    assert host_of("host02") == "host02"

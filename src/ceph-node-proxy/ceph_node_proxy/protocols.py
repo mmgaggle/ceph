@@ -1,5 +1,5 @@
 from threading import Lock
-from typing import Any, Dict, List, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 
 @runtime_checkable
@@ -21,6 +21,8 @@ class SystemBackend(Protocol):
     def get_temperatures(self) -> Dict[str, Any]: ...
 
     def get_firmware(self) -> Dict[str, Any]: ...
+
+    def snapshot(self) -> Tuple[Dict[str, Any], Optional[float]]: ...
 
     def get_led(self) -> Dict[str, Any]: ...
 

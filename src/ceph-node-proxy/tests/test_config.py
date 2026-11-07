@@ -59,3 +59,18 @@ def test_cephadm_system_vendor_merged_into_node_proxy_config() -> None:
             defaults=defaults,
         )
         assert config.get("system", {}).get("vendor") == "atollon"
+
+
+def test_cephadm_config_metrics_credentials() -> None:
+    data = {
+        "target_ip": "10.0.0.1",
+        "target_port": "7150",
+        "keyring": "AQ==",
+        "root_cert.pem": "ca",
+        "listener.crt": "crt",
+        "listener.key": "key",
+        "name": "node-proxy.host01",
+    }
+    assert CephadmConfig.from_dict(data).metrics == {}   # an older cephadm
+    data["metrics"] = {"username": "prometheus", "password": "pw"}
+    assert CephadmConfig.from_dict(data).metrics == {"username": "prometheus", "password": "pw"}

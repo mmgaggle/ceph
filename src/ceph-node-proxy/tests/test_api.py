@@ -20,6 +20,7 @@ def api():
     _api.log = MagicMock()
     _api.backend = MagicMock()
     _api.backend.get_storage.return_value = STORAGE
+    _api.hostname = "host01"
     return _api
 
 
@@ -96,3 +97,64 @@ def test_check_auth_takes_the_cephx_identity() -> None:
     assert not api.check_auth("localhost", "node-proxy.host02", "AQBsecret==")
     api.cephx_name = api.cephx_secret = ""
     assert not api.check_auth("localhost", "", "")
+
+
+REPORT = {
+    "status": {
+        "storage": {"CAN01": {"driveslot-2": {
+            "capacity_bytes": 3840755982336, "model": "FCM5", "protocol": "NVMe",
+            "firmware_version": "000A5305", "slot": 2, "serial_number": "S1",
+            "status": {"health": "OK", "state": "Enabled"}}}},
+        "fans": {"CAN01": {"0": {"name": "FAN1", "reading": 8000,
+                                 "status": {"health": "Warning", "state": "Enabled"}}}},
+    },
+    "firmware": {"bmc": {"name": "BMC", "version": "1.2"}},
+}
+
+
+class TestMetrics:
+    def test_metrics(self, api):
+        api.backend.snapshot.return_value = (REPORT, 1793862223.5)
+        text = api.metrics().decode()
+        assert cherrypy.serving.response.headers["Content-Type"].startswith(
+            "text/plain; version=0.0.4"
+        )
+        assert 'ceph_hardware_fan_rpm{hostname="host01",fan_name="FAN1"} 8000.0\n' in text
+        assert (
+            'ceph_hardware_status{hostname="host01",component="FAN1",'
+            'category="fans",state="Enabled"} 1.0\n'
+        ) in text
+        assert (
+            'ceph_hardware_firmware_info{hostname="host01",component="BMC",version="1.2"} 1.0'
+        ) in text
+        assert 'ceph_hardware_report_timestamp_seconds{hostname="host01"} 1793862223.5\n' in text
+        api.backend.get_storage.assert_not_called()     # never waits on the system
+
+    def test_before_the_first_update(self, api):
+        api.backend.snapshot.return_value = ({}, None)
+        text = api.metrics().decode()
+        assert "# TYPE ceph_hardware_status gauge" in text
+        assert "{" not in text
+
+
+def test_metrics_credentials_open_metrics_only() -> None:
+    from ceph_node_proxy.api import NodeProxyApi
+
+    api = NodeProxyApi.__new__(NodeProxyApi)
+    api.username = api.password = ""
+    api.cephx_name, api.cephx_secret = "node-proxy.host01", "AQBsecret=="
+    api.metrics_username, api.metrics_password = "prometheus", "scrape"
+    request = cherrypy.serving.request
+    try:
+        request.path_info = "/metrics"
+        assert api.check_auth("localhost", "prometheus", "scrape")
+        assert not api.check_auth("localhost", "prometheus", "wrong")
+        assert api.check_auth("localhost", "node-proxy.host01", "AQBsecret==")
+        for path in ("/led/chassis", "/diagnostics", "/storage", "/metrics/x"):
+            request.path_info = path
+            assert not api.check_auth("localhost", "prometheus", "scrape"), path
+        api.metrics_username = api.metrics_password = ""
+        request.path_info = "/metrics"
+        assert not api.check_auth("localhost", "", "")
+    finally:
+        request.path_info = "/"

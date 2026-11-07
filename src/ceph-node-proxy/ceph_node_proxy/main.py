@@ -31,12 +31,14 @@ class NodeProxyManager:
         config_path: Optional[str] = None,
         reporter_scheme: str = "https",
         reporter_endpoint: str = "/node-proxy/data",
+        metrics_credentials: Optional[Dict[str, str]] = None,
     ) -> None:
         self.exc: Optional[Exception] = None
         self.log = get_logger(__name__)
         self.mgr_host = mgr_host
         self.cephx_name = cephx_name
         self.cephx_secret = cephx_secret
+        self.metrics_credentials = metrics_credentials or {}
         self.ca_path = ca_path
         self.api_ssl_crt = api_ssl_crt
         self.api_ssl_key = api_ssl_key

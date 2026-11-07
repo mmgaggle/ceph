@@ -36,6 +36,7 @@ def create_node_proxy_manager(cephadm_config: CephadmConfig) -> "NodeProxyManage
         api_ssl_key=cephadm_config.listener_key,
         config_path=cephadm_config.node_proxy_config_path,
         config=config,
+        metrics_credentials=cephadm_config.metrics,
     )
     # Keep temp file alive for the lifetime of the manager
     manager._ca_temp_file = ca_file

@@ -31,6 +31,9 @@ class CephadmConfig:
     name: str
     node_proxy_config_path: str
     system: Dict[str, Any]
+    # Prometheus's credentials for /metrics; a cephadm that predates it
+    # sends none, and /metrics then takes the mgr's only
+    metrics: Dict[str, str]
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> CephadmConfig:
@@ -43,6 +46,7 @@ class CephadmConfig:
         )
         assert node_proxy_config_path is not None
         system = data.get("system")
+        metrics = data.get("metrics")
         return cls(
             target_ip=data["target_ip"],
             target_port=data["target_port"],
@@ -53,6 +57,7 @@ class CephadmConfig:
             name=data["name"],
             node_proxy_config_path=node_proxy_config_path,
             system=system if isinstance(system, dict) else {},
+            metrics=metrics if isinstance(metrics, dict) else {},
         )
 
 

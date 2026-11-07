@@ -38,6 +38,7 @@ class NodeBackend(BaseSystem):
                         self.redfish.run_update_cycle()
                         self._local.update()
                         self.data_ready = True
+                        self.keep_snapshot()
                     except RuntimeError as exc:
                         self.stop = True
                         self.redfish.stop = True
@@ -60,6 +61,7 @@ class NodeBackend(BaseSystem):
         self.redfish.flush()
         self._local.flush()
         self.previous_data = {}
+        self.drop_snapshot()
         self.data_ready = False
         self.log.info("Data flushed.")
         self.lock.release()

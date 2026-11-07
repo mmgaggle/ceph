@@ -5,11 +5,19 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.error import HTTPError
 
 import cherrypy  # type: ignore
+from ceph.hardware_metrics import render, samples
 from cherrypy._cpserver import Server  # type: ignore
 
 from ceph_node_proxy.protocols import SystemBackend
 from ceph_node_proxy.reporter import Reporter
-from ceph_node_proxy.util import Config, check_id, get_logger, has_drive, write_tmp_file
+from ceph_node_proxy.util import (
+    Config,
+    check_id,
+    get_logger,
+    has_drive,
+    host_of,
+    write_tmp_file,
+)
 
 if TYPE_CHECKING:
     from ceph_node_proxy.main import NodeProxyManager
@@ -64,12 +72,15 @@ class API(Server):
         config: "Config",
         addr: str = "0.0.0.0",
         port: int = 0,
+        hostname: str = "",
     ) -> None:
         super().__init__()
         self.log = get_logger(__name__)
         self.backend = backend
         self.reporter = reporter
         self.config = config
+        # the cephadm host name, the hostname label of the metrics
+        self.hostname = hostname
         self.socket_port = (
             port if port else self.config.get("api", {}).get("port", 9456)
         )
@@ -135,6 +146,23 @@ class API(Server):
     @cherrypy.tools.json_out()
     def firmwares(self) -> Dict[str, Any]:
         return {"firmwares": self.backend.get_firmware()}
+
+    @cherrypy.expose
+    @cherrypy.tools.allow(methods=["GET"])
+    def metrics(self) -> bytes:
+        """The hardware metrics, for Prometheus. They come from the last
+        complete update, so a scrape never waits for the Redfish service."""
+        report, when = self.backend.snapshot()
+        text = render(samples(self.hostname, report))
+        name = "ceph_hardware_report_timestamp_seconds"
+        text += (
+            f"# HELP {name} When node-proxy last read the hardware (Unix time)\n"
+            f"# TYPE {name} gauge\n"
+        )
+        if when is not None:
+            text += f'{name}{{hostname="{self.hostname}"}} {when}\n'
+        cherrypy.response.headers["Content-Type"] = "text/plain; version=0.0.4; charset=utf-8"
+        return text.encode("utf-8")
 
     def _cp_dispatch(self, vpath: List[str]) -> "API":
         if vpath[0] == "led" and len(vpath) > 1:  # /led/{type}/{id}
@@ -360,23 +388,39 @@ class NodeProxyApi(Thread):
         # the mgr authenticates with this daemon's cephx identity
         self.cephx_name = getattr(self.node_proxy_mgr, "cephx_name", "")
         self.cephx_secret = getattr(self.node_proxy_mgr, "cephx_secret", "")
+        # Prometheus scrapes /metrics with these, and nothing else
+        metrics = getattr(self.node_proxy_mgr, "metrics_credentials", None) or {}
+        self.metrics_username = str(metrics.get("username", ""))
+        self.metrics_password = str(metrics.get("password", ""))
         self.ssl_crt = self.node_proxy_mgr.api_ssl_crt
         self.ssl_key = self.node_proxy_mgr.api_ssl_key
         self.system = self.node_proxy_mgr.system
         self.reporter_agent = self.node_proxy_mgr.reporter_agent
         self.config = self.node_proxy_mgr.config
-        self.api = API(self.system, self.reporter_agent, self.config)
+        self.api = API(
+            self.system,
+            self.reporter_agent,
+            self.config,
+            hostname=host_of(self.cephx_name),
+        )
 
     def check_auth(self, realm: str, username: str, password: str) -> bool:
         """The mgr's credentials: this daemon's cephx name and secret. The
         out-of-band (Redfish) credentials are still accepted from an mgr
-        that predates this, for one release."""
+        that predates this, for one release. Prometheus's credentials open
+        /metrics only."""
         def same(a: str, b: str) -> bool:
             return bool(a) and hmac.compare_digest(str(a).encode(), str(b).encode())
 
         if same(self.cephx_name, username) and same(self.cephx_secret, password):
             return True
-        return same(self.username, username) and same(self.password, password)
+        if same(self.username, username) and same(self.password, password):
+            return True
+        return (
+            cherrypy.request.path_info == "/metrics"
+            and same(self.metrics_username, username)
+            and same(self.metrics_password, password)
+        )
 
     def shutdown(self) -> None:
         self.log.info("Stopping node-proxy API...")

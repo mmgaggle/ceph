@@ -293,6 +293,13 @@ def check_id(value: str, what: str = "ID") -> str:
     return value
 
 
+def host_of(cephx_name: str) -> str:
+    """The cephadm host of a node-proxy daemon, from its cephx name
+    (node-proxy.<host>)."""
+    prefix = "node-proxy."
+    return cephx_name[len(prefix):] if cephx_name.startswith(prefix) else cephx_name
+
+
 def has_drive(storage: Dict[str, Any], drive_id: Optional[str]) -> bool:
     """True when a drive of the storage report (per system: {system_id:
     {drive_id: ...}}) has this ID"""

@@ -1,6 +1,8 @@
+import copy
 import socket
+import time
 from threading import Lock
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from ceph_node_proxy.baseclient import BaseClient
 from ceph_node_proxy.util import BaseThread, Config, get_logger
@@ -14,6 +16,21 @@ class BaseSystem(BaseThread):
         self.config: Optional[Union[Config, Dict[str, Any]]] = kw.get("config")
         self.client: BaseClient
         self.log = get_logger(__name__)
+        self._snapshot: Tuple[Dict[str, Any], Optional[float]] = ({}, None)
+
+    def keep_snapshot(self) -> None:
+        """Keep a copy of the data an update just read, with its time. The
+        caller holds the lock. Readers that must not wait for the lock while
+        the next update runs (/metrics) read the copy."""
+        self._snapshot = (copy.deepcopy(self.get_system()), time.time())
+
+    def drop_snapshot(self) -> None:
+        self._snapshot = ({}, None)
+
+    def snapshot(self) -> Tuple[Dict[str, Any], Optional[float]]:
+        """The data of the last complete update and when it was read
+        (None before the first)."""
+        return self._snapshot
 
     def main(self) -> None:
         raise NotImplementedError()

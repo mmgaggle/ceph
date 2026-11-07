@@ -225,6 +225,7 @@ class BaseRedfishSystem(BaseSystem):
                     try:
                         self.run_update_cycle()
                         self.data_ready = True
+                        self.keep_snapshot()
                     except RuntimeError as e:
                         self.stop = True
                         self.log.error(
@@ -247,6 +248,7 @@ class BaseRedfishSystem(BaseSystem):
         self.log.debug("Lock acquired, flushing data.")
         self._system = {}
         self.previous_data = {}
+        self.drop_snapshot()
         self.log.info("Data flushed.")
         self.data_ready = False
         self.log.debug("Data marked as not ready.")

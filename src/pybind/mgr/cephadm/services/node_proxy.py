@@ -1,4 +1,5 @@
 import json
+import re
 import ssl
 import base64
 
@@ -246,16 +247,26 @@ class NodeProxy(CephService):
         task: Dict[str, Any] = json.loads(result)
         return task
 
+    @staticmethod
+    def _check_id(value: str, what: str) -> str:
+        # IDs go into URLs of node-proxy, then of the host's Redfish service
+        if not re.fullmatch(r'[A-Za-z0-9._-]{1,128}', str(value)) or value in ('.', '..'):
+            raise OrchestratorError(f'Invalid {what}: {value!r}')
+        return value
+
     def diagnostics_task(self, hostname: str, task_id: str) -> Dict[str, Any]:
+        task_id = self._check_id(task_id, 'task ID')
         _, result, _ = self._diagnostics_query(hostname, f'/diagnostics/tasks/{task_id}')
         task: Dict[str, Any] = json.loads(result)
         return task
 
     def download_diagnostics(self, hostname: str, entry_id: str) -> Tuple[str, bytes]:
+        entry_id = self._check_id(entry_id, 'entry ID')
         headers, content, _ = self._diagnostics_query(
             hostname, f'/diagnostics/{entry_id}', raw=True, timeout=180)
         filename = headers.get_filename() if hasattr(headers, 'get_filename') else None
         return filename or f'{entry_id}.bin', content
 
     def delete_diagnostics(self, hostname: str, entry_id: str) -> None:
+        entry_id = self._check_id(entry_id, 'entry ID')
         self._diagnostics_query(hostname, f'/diagnostics/{entry_id}', 'DELETE')

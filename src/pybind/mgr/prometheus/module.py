@@ -760,6 +760,14 @@ class Module(MgrModule, OrchestratorClientMixin):
             runtime=True
         ),
         Option(
+            name='exclude_hardware_metrics',
+            type='bool',
+            default=True,
+            desc='Do not include the hardware metrics (ceph_hardware_*) in the metrics output',
+            long_desc='node-proxy serves the hardware metrics of each host, with current readings, and the Prometheus that cephadm deploys scrapes them there. Exporting them from the mgr as well would duplicate every series. Disable this only when a Prometheus scrapes the mgr but not node-proxy.',
+            runtime=True
+        ),
+        Option(
             name='healthcheck_history_max_entries',
             type='int',
             default=1000,
@@ -2191,7 +2199,8 @@ class Module(MgrModule, OrchestratorClientMixin):
         self.get_num_objects()
         self.get_all_daemon_health_metrics()
         self.get_smb_metadata()
-        self.get_hardware_metrics()
+        if not self.get_module_option('exclude_hardware_metrics'):
+            self.get_hardware_metrics()
         self.set_cephadm_daemon_status_metrics()
 
         if not self.get_module_option('exclude_perf_counters'):

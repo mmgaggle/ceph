@@ -556,6 +556,17 @@ class HardwareMetricsTest(TestCase):
         self.assertNotIn(('host.example.com', 'nvme_device0_nsid1', 'storage', 'unknown'),
                          values['hardware_status'])
 
+    def test_left_to_node_proxy_by_default(self):
+        (option,) = [o for o in Module.MODULE_OPTIONS if o['name'] == 'exclude_hardware_metrics']
+        self.assertIs(option['default'], True)
+        options = {'exclude_perf_counters': True, 'exclude_hardware_metrics': True}
+        self.module.get_module_option.side_effect = options.get
+        Module.collect(self.module)
+        self.module.get_hardware_metrics.assert_not_called()
+        options['exclude_hardware_metrics'] = False
+        Module.collect(self.module)
+        self.module.get_hardware_metrics.assert_called_once()
+
     def test_only_with_cephadm(self):
         self.module.get_module_option_ex.return_value = 'rook'
         self.assertEqual(self.collect()['hardware_status'], {})

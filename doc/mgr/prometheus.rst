@@ -65,6 +65,7 @@ Configuration
 .. confval:: standby_behaviour
 .. confval:: standby_error_status_code
 .. confval:: exclude_perf_counters
+.. confval:: exclude_hardware_metrics
 .. confval:: healthcheck_history_max_entries
 .. confval:: ssl
 .. confval:: ssl_server_port
@@ -333,6 +334,22 @@ the module option ``exclude_perf_counters`` to ``false``:
 .. prompt:: bash #
 
    ceph config set mgr mgr/prometheus/exclude_perf_counters false
+
+Hardware metrics
+----------------
+
+``node-proxy`` serves the hardware metrics (``ceph_hardware_*``) of each
+host itself, and the Prometheus that cephadm deploys scrapes them there (see
+:ref:`hardware-monitoring-metrics`). The ``prometheus`` module therefore does
+not export them by default. To export them from the module as well, for a
+Prometheus that scrapes only the Ceph Manager, run:
+
+.. prompt:: bash #
+
+   ceph config set mgr mgr/prometheus/exclude_hardware_metrics false
+
+Do not do this when a Prometheus scrapes ``node-proxy``: every series would
+then be exported twice.
 
 Statistic names and labels
 ==========================

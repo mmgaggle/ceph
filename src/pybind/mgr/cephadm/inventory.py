@@ -3,7 +3,9 @@ import enum
 from copy import copy
 import ipaddress
 import itertools
+import base64
 import json
+import zlib
 import logging
 import math
 import socket
@@ -1835,12 +1837,53 @@ class HostCache():
         ]
 
 
+# node-proxy report fields that change on every poll (sensor readings,
+# NIC counters and optics, FCM utilization): kept in memory, never
+# persisted, so the mon store is written only when the inventory or the
+# health of a host changes
+NODE_PROXY_VOLATILE_FIELDS = frozenset({
+    'reading', 'rx_bytes', 'tx_bytes', 'rx_errors', 'tx_errors', 'rx_fcs_errors',
+    'rx_discards', 'tx_discards', 'transceiver', 'transceiver_temperature_c',
+    'phy_util_bytes', 'log_util_bytes', 'compression_ratio', 'compression_ratio_str',
+    'compression_ratio_display', 'savings_bytes',
+})
+# persisted reports above this size are stored compressed: a config-key
+# entry is limited to mon_config_key_max_entry_size (64 KiB)
+NODE_PROXY_COMPRESS_ABOVE = 32 * 1024
+NODE_PROXY_COMPRESSED = 'zlib+b64:'
+
+
+def _stable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _stable(v) for k, v in value.items() if k not in NODE_PROXY_VOLATILE_FIELDS}
+    if isinstance(value, list):
+        return [_stable(v) for v in value]
+    return value
+
+
+def _encode_report(text: str) -> str:
+    if len(text) <= NODE_PROXY_COMPRESS_ABOVE:
+        return text
+    return NODE_PROXY_COMPRESSED + base64.b64encode(zlib.compress(text.encode())).decode()
+
+
+def _decode_report(stored: str) -> Any:
+    if stored.startswith(NODE_PROXY_COMPRESSED):
+        stored = zlib.decompress(base64.b64decode(stored[len(NODE_PROXY_COMPRESSED):])).decode()
+    return json.loads(stored)
+
+
 class NodeProxyCache:
     def __init__(self, mgr: 'CephadmOrchestrator') -> None:
         self.mgr = mgr
         self.data: Dict[str, Any] = {}
         self.oob: Dict[str, Any] = {}
         self.keyrings: Dict[str, str] = {}
+        # what was last persisted for each host (its stable part)
+        self._persisted: Dict[str, str] = {}
+        # members that are not ok, per host and component, for the
+        # HARDWARE_* health checks
+        self.nok: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
 
     @staticmethod
     def _host_firmware(host_data: Dict[str, Any]) -> Any:
@@ -1871,7 +1914,8 @@ class NodeProxyCache:
                     pass
                 continue
 
-            self.data[host] = json.loads(v)
+            self.data[host] = _decode_report(v)
+            self._persisted[host] = json.dumps(_stable(self.data[host]), sort_keys=True)
             if original_host != host:
                 self.save(host=host, data=self.data[host])
                 self.mgr.set_store(
@@ -1884,7 +1928,39 @@ class NodeProxyCache:
             data = {}
         host = normalize_hostname(host)
         self.data[host] = data
-        self.mgr.set_store(f'{NODE_PROXY_CACHE_PREFIX}/data/{host}', json.dumps(data))
+        stable = json.dumps(_stable(data), sort_keys=True)
+        if self._persisted.get(host) == stable:
+            return
+        self._persisted[host] = stable
+        self.mgr.set_store(f'{NODE_PROXY_CACHE_PREFIX}/data/{host}', _encode_report(stable))
+
+    def has_drive(self, host: str, drive_id: str) -> bool:
+        """True when the host reported a drive with this ID (storage is
+        reported per system: {system_id: {drive_id: ...}})"""
+        report = self.data.get(normalize_hostname(host)) or {}
+        storage = (report.get('status') or {}).get('storage') or {}
+        return bool(drive_id) and any(
+            drive_id in drives for drives in storage.values() if isinstance(drives, dict))
+
+    def update_nok(self, host: str,
+                   members: Dict[str, List[Dict[str, str]]]) -> List[str]:
+        """Record the members of a host that are not ok, per component;
+        return the components whose members changed."""
+        host = normalize_hostname(host)
+        before = self.nok.get(host, {})
+        self.nok[host] = members
+        return sorted(c for c in set(before) | set(members)
+                      if before.get(c, []) != members.get(c, []))
+
+    def nok_members(self, component: str) -> List[Dict[str, str]]:
+        """The members of every host that are not ok for a component; hosts
+        sharing an enclosure report its members alike: listed once."""
+        result: List[Dict[str, str]] = []
+        for host in sorted(self.nok):
+            for member in self.nok[host].get(component, []):
+                if member not in result:
+                    result.append(member)
+        return result
 
     def update_oob(self, host: str, host_oob_info: Dict[str, str]) -> None:
         self.oob[host] = host_oob_info

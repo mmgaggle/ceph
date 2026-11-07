@@ -2494,9 +2494,8 @@ Then run the following:
 
     @handle_orch_error
     def hardware_diagnostics_collect(self, hostname: str, device: str) -> Dict[str, Any]:
-        storage = self.node_proxy_cache.data.get(hostname, {}).get('status', {}).get('storage', {})
         if hostname in self.node_proxy_cache.data and \
-                not any(device in drives for drives in storage.values()):
+                not self.node_proxy_cache.has_drive(hostname, device):
             raise OrchestratorValidationError(
                 f"'{device}' not found on {hostname}: see 'ceph orch hardware status "
                 f"{hostname} --category storage'")

@@ -268,22 +268,30 @@ class NodeProxyEndpoint:
 
         # The health checks are cluster wide: list the members this host
         # reports with the ones the other hosts reported last, or each host's
-        # report would replace the others' members.
+        # report would replace the others' members. Only this host's report
+        # is looked at, and a warning only changes when its members do.
+        cache = self.mgr.node_proxy_cache
         host = data['cephx']['name'][11:]
-        reports = dict(self.mgr.node_proxy_cache.data)
-        reports[host] = data['patch']
-        for component in data['patch']['status'].keys():
+        raise_again: List[str] = []
+        if not cache.nok:
+            # a mgr that just started (failover): the members the hosts
+            # reported last, and their warnings set again
+            for other, report in cache.data.items():
+                status = report.get('status') if isinstance(report, dict) else None
+                if isinstance(status, dict):
+                    members = {c: self.get_nok_members(m or {}) for c, m in status.items()}
+                    cache.update_nok(other, members)
+                    raise_again += [c for c, m in members.items() if m]
+        status = data['patch'].get('status') or {}
+        changed = cache.update_nok(host, {c: self.get_nok_members(m or {})
+                                          for c, m in status.items()})
+        update = set(changed) | set(raise_again)
+        # in the order of the report, then the components it no longer has
+        for component in [c for c in status if c in update] + \
+                sorted(c for c in update if c not in status):
             alert_name = f'HARDWARE_{component.upper()}'
             self.mgr.remove_health_warning(alert_name)
-            nok_members: List[Dict[str, str]] = []
-            for report in reports.values():
-                status = report.get('status') if isinstance(report, dict) else None
-                if not isinstance(status, dict):
-                    continue
-                for member in self.get_nok_members(status.get(component) or {}):
-                    # hosts sharing an enclosure report its members alike
-                    if member not in nok_members:
-                        nok_members.append(member)
+            nok_members = cache.nok_members(component)
 
             if nok_members:
                 count = len(nok_members)
@@ -404,9 +412,7 @@ class NodeProxyEndpoint:
             payload['state'] = data['state']
 
             if led_type == 'drive':
-                # storage is reported per system: {system_id: {drive_id: ...}}
-                storage = self.mgr.node_proxy_cache.data[hostname]['status']['storage']
-                if not any(id_drive in drives for drives in storage.values()):
+                if not self.mgr.node_proxy_cache.has_drive(hostname, id_drive):
                     msg = f"'{id_drive}' not found."
                     self.mgr.log.debug(msg)
                     raise cherrypy.HTTPError(400, msg)

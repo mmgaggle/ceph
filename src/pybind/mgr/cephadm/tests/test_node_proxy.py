@@ -78,6 +78,9 @@ class TestNodeProxyEndpoint(helper.CPWebCase):
     def setUp(self):
         self.PORT = PORT
         self.monkeypatch = MonkeyPatch()
+        # each test starts like a mgr that just started
+        TestNodeProxyEndpoint.mgr.node_proxy_cache.nok = {}
+        TestNodeProxyEndpoint.mgr.set_health_warning.reset_mock()
 
     def keyring_headers(self, hostname: str = 'host01', secret: str = 'fake-secret01') -> list:
         return [
@@ -146,6 +149,15 @@ class TestNodeProxyEndpoint(helper.CPWebCase):
                       summary='1 memory member is not ok')]
 
         assert TestNodeProxyEndpoint.mgr.set_health_warning.mock_calls == calls
+
+    def test_data_same_report_leaves_health_alone(self):
+        mgr = TestNodeProxyEndpoint.mgr
+        self.post_data('host01', node_proxy_data.full_set_with_critical)
+        mgr.set_health_warning.reset_mock()
+        mgr.remove_health_warning.reset_mock()
+        self.post_data('host01', node_proxy_data.full_set_with_critical)
+        assert mgr.set_health_warning.mock_calls == []
+        assert mgr.remove_health_warning.mock_calls == []
 
     def post_data(self, host, patch):
         data_str = json.dumps({"cephx": {"name": f"node-proxy.{host}",
@@ -655,3 +667,40 @@ def test_node_proxy_cache_summary_redfish_health():
     assert summary['host01']['status']['processors'] == 'ok'
     assert summary['host02']['status']['storage'] == 'error'
     assert summary['host03']['status']['storage'] == 'ok'
+
+
+class TestNodeProxyCachePersistence:
+
+    def cache(self):
+        mgr = MagicMock()
+        mgr.inventory = ['host01']
+        return mgr, NodeProxyCache(mgr)
+
+    def report(self, reading=21.0, health='OK', drives=1):
+        return {'status': {
+            'temperatures': {'1': {'inlet': {'reading': reading, 'status': {'health': health}}}},
+            'storage': {'1': {f'disk{i}': {'serial_number': f'SN{i:04d}' * 8,
+                                           'status': {'health': 'OK'}}
+                              for i in range(drives)}}}}
+
+    def test_readings_are_not_persisted(self):
+        mgr, cache = self.cache()
+        cache.save('host01', self.report(21.0))
+        assert mgr.set_store.call_count == 1
+        cache.save('host01', self.report(23.5))
+        assert mgr.set_store.call_count == 1
+        assert cache.data['host01']['status']['temperatures']['1']['inlet']['reading'] == 23.5
+        cache.save('host01', self.report(23.5, health='Critical'))
+        assert mgr.set_store.call_count == 2
+        stored = json.loads(mgr.set_store.call_args[0][1])
+        assert 'reading' not in stored['status']['temperatures']['1']['inlet']
+
+    def test_large_reports_are_compressed(self):
+        from cephadm.inventory import NODE_PROXY_COMPRESSED, _decode_report
+        mgr, cache = self.cache()
+        report = self.report(drives=1000)
+        cache.save('host01', report)
+        stored = mgr.set_store.call_args[0][1]
+        assert stored.startswith(NODE_PROXY_COMPRESSED)
+        assert len(stored) < 64 * 1024 < len(json.dumps(report))
+        assert _decode_report(stored)['status']['storage'] == report['status']['storage']

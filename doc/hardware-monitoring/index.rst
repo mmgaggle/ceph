@@ -368,6 +368,29 @@ The dashboard's *Hardware drives* table has *Encryption* and *Problems*
 columns.
 
 
+FCM Compression
+_______________
+
+IBM FlashCore Modules (FCMs) compress data before they store it.
+``node-proxy`` reports each FCM's flash (physical) and logical size and
+use, the compression ratio and the savings. ``ceph orch hardware status
+<host> --category fcm`` shows them, and so does the dashboard.
+
+When the Redfish service models FCMs with SNIA Swordfish, ``node-proxy``
+reads these numbers from it:
+
+* the drive's ``StoragePool``: ``Capacity.Data.AllocatedBytes`` and
+  ``ConsumedBytes`` are the flash size and use;
+* the pool's ``AllocatedVolumes``: their ``Capacity.Data.ProvisionedBytes``
+  and ``ConsumedBytes`` are the logical size and use;
+* the volumes' ``Links.Drives``: the drive.
+
+Without such a service, ``node-proxy`` with the ``atollon`` vendor reads
+them from the FCMs' log page ``0xCA`` through an NVMe admin pass-through.
+cephadm then runs it in a privileged container with the host's ``/dev``.
+With any other vendor, ``node-proxy`` gets neither.
+
+
 Diagnostic Data
 ---------------
 

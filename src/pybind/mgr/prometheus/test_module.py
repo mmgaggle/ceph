@@ -1,7 +1,6 @@
 from typing import Dict
 from unittest import TestCase, mock
 import errno
-import math
 
 from prometheus.module import Metric, LabelValues, Number, HealthHistory, ThreadSafeLRUCacheDict, Module
 import json
@@ -517,274 +516,50 @@ MOCK_HW_FULLREPORT = {
 
 
 class HardwareMetricsTest(TestCase):
-    """Tests for hardware metrics processing from node-proxy fullreport data."""
+    """The mgr exports node-proxy's reports through ceph.hardware_metrics,
+    whose tests are in python-common."""
 
     def setUp(self):
-        from prometheus.module import (
-            Module, HW_STORAGE_LABELS, HW_CPU_LABELS, HW_MEMORY_LABELS,
-            HW_STATUS_LABELS, HW_TEMP_LABELS, HW_FAN_LABELS, HW_FIRMWARE_LABELS,
-        )
+        from ceph import hardware_metrics
+        from orchestrator import OrchResult
         self.module = mock.MagicMock(spec=Module)
         self.module.log = mock.MagicMock()
         self.module.metrics = {
-            'hardware_storage_capacity_bytes': Metric(
-                'gauge', 'hardware_storage_capacity_bytes', '', HW_STORAGE_LABELS),
-            'hardware_cpu_cores': Metric(
-                'gauge', 'hardware_cpu_cores', '', HW_CPU_LABELS),
-            'hardware_memory_capacity_bytes': Metric(
-                'gauge', 'hardware_memory_capacity_bytes', '', HW_MEMORY_LABELS),
-            'hardware_status': Metric(
-                'gauge', 'hardware_status', '', HW_STATUS_LABELS),
-            'hardware_temperature_celsius': Metric(
-                'gauge', 'hardware_temperature_celsius', '', HW_TEMP_LABELS),
-            'hardware_fan_rpm': Metric(
-                'gauge', 'hardware_fan_rpm', '', HW_FAN_LABELS),
-            'hardware_firmware_info': Metric(
-                'gauge', 'hardware_firmware_info', '', HW_FIRMWARE_LABELS),
-        }
-        self.hostname = 'host.example.com'
-        self.data = MOCK_HW_FULLREPORT[self.hostname]
-        self.status = self.data['status']
-        self.module._hw_status_value = Module._hw_status_value
-        self.module._hw_get_health_value = Module._hw_get_health_value.__get__(self.module)
-        self.module._hw_set_health_metric = Module._hw_set_health_metric.__get__(self.module)
-        self.module._hw_iter_components = Module._hw_iter_components.__get__(self.module)
-        self.module._hw_set_sensor_metric = Module._hw_set_sensor_metric.__get__(self.module)
-        self.module._process_storage = Module._process_storage.__get__(self.module)
-        self.module._process_processors = Module._process_processors.__get__(self.module)
-        self.module._process_memory = Module._process_memory.__get__(self.module)
-        self.module._process_power_network = Module._process_power_network.__get__(self.module)
-        self.module._process_sensors = Module._process_sensors.__get__(self.module)
-        self.module._process_firmware = Module._process_firmware.__get__(self.module)
+            name: Metric(info.mtype, name, info.description, info.labels)
+            for name, info in hardware_metrics.METRICS.items()}
+        self.module.orch_is_available.return_value = True
+        self.module.get_module_option_ex.return_value = 'cephadm'
+        self.report = json.loads(json.dumps(MOCK_HW_FULLREPORT))
+        self.module.node_proxy_fullreport.side_effect = lambda: OrchResult(self.report)
+        self.module._hw_unknown_health = Module._hw_unknown_health.__get__(self.module)
 
-    # --- _hw_get_health_value ---
+    def collect(self):
+        Module.get_hardware_metrics(self.module)
+        return {name: m.value for name, m in self.module.metrics.items()}
 
-    def test_health_value_ok(self):
-        val = self.module._hw_get_health_value({'health': 'OK'})
-        self.assertEqual(val, 0)
+    def test_exports_the_reports(self):
+        values = self.collect()
+        storage = ('host.example.com', 'nvme_device0_nsid1', 'Micron_2550_MTFDKBK512TGE',
+                   'NVMe', 'V6MA001', '0', '24424BAA3C40')
+        self.assertEqual(values['hardware_storage_capacity_bytes'][storage], 512110190592)
+        self.assertEqual(values['hardware_fan_rpm'], {('host.example.com', 'FAN1_TACH_IN'): 23940})
+        self.assertIn('ceph_hardware_temperature_celsius{hostname="host.example.com",'
+                      'sensor_name="C1_CPU_TEMP"} 47.0',
+                      self.module.metrics['hardware_temperature_celsius'].str_expfmt())
 
-    def test_health_value_warning(self):
-        val = self.module._hw_get_health_value({'health': 'Warning'})
-        self.assertEqual(val, 1)
-
-    def test_health_value_critical(self):
-        val = self.module._hw_get_health_value({'health': 'Critical'})
-        self.assertEqual(val, 2)
-
-    def test_health_value_string_input(self):
-        val = self.module._hw_get_health_value('OK')
-        self.assertEqual(val, 0)
-
-    def test_health_value_not_reported(self):
-        self.assertEqual(self.module._hw_get_health_value({'health': 'unknown'}), -1)
-        self.assertEqual(self.module._hw_get_health_value({}), -1)
-
-    def test_health_value_unknown_logs_warning(self):
-        val = self.module._hw_get_health_value(
-            {'health': 'Exploded'}, 'host1', 'comp1', 'storage')
-        self.assertIsNone(val)
+    def test_unknown_health_is_logged(self):
+        self.report['host.example.com']['status']['storage']['Self'][
+            'nvme_device0_nsid1']['status'] = {'health': 'Exploded'}
+        values = self.collect()
         self.module.log.warning.assert_called_once()
+        self.assertIn('Exploded', self.module.log.warning.call_args[0][0])
+        self.assertNotIn(('host.example.com', 'nvme_device0_nsid1', 'storage', 'unknown'),
+                         values['hardware_status'])
 
-    def test_health_value_unknown_skips_metric(self):
-        self.module._hw_set_health_metric(
-            {'health': 'Exploded'}, 'host1', 'comp1', 'storage')
-        self.assertEqual(self.module.metrics['hardware_status'].value, {})
-
-    # --- state label ---
-
-    def test_status_metric_state_label(self):
-        cases = [
-            ({'health': 'Warning', 'state': 'Enabled'}, 'Enabled', 1),
-            ({'health': 'unknown', 'state': 'Disabled'}, 'Disabled', -1),
-            ({'health': 'OK'}, 'unknown', 0),
-            # node-proxy turns a null Redfish Status into the string 'unknown'
-            ('unknown', 'unknown', -1),
-        ]
-        for status, state, value in cases:
-            with self.subTest(status=status):
-                self.module.metrics['hardware_status'].clear()
-                self.module._hw_set_health_metric(status, 'host1', 'FAN1', 'fans')
-                self.assertEqual(self.module.metrics['hardware_status'].value,
-                                 {('host1', 'FAN1', 'fans', state): value})
-
-    # --- _process_storage ---
-
-    def test_storage_capacity_and_labels(self):
-        self.module._process_storage(self.status, self.hostname)
-        expected_labels = (
-            self.hostname, 'nvme_device0_nsid1',
-            'Micron_2550_MTFDKBK512TGE', 'NVMe', 'V6MA001', '0', '24424BAA3C40',
-        )
-        self.assertEqual(
-            self.module.metrics['hardware_storage_capacity_bytes'].value[expected_labels],
-            512110190592,
-        )
-
-    def test_storage_sets_health(self):
-        self.module._process_storage(self.status, self.hostname)
-        health_labels = (self.hostname, 'nvme_device0_nsid1', 'storage', 'Enabled')
-        self.assertEqual(
-            self.module.metrics['hardware_status'].value[health_labels], 0)
-
-    # --- _process_processors ---
-
-    def test_cpu_cores_and_threads_label(self):
-        self.module._process_processors(self.status, self.hostname)
-        expected_labels = (
-            self.hostname, 'devtype1_cpu0',
-            'Advanced Micro Devices, Inc.', 'unknown', 96,
-        )
-        self.assertEqual(
-            self.module.metrics['hardware_cpu_cores'].value[expected_labels], 48)
-
-    # --- _process_memory ---
-
-    def test_memory_mib_to_bytes_conversion(self):
-        self.module._process_memory(self.status, self.hostname)
-        expected_labels = (self.hostname, 'devtype2_dimm0', 'DDR5')
-        self.assertEqual(
-            self.module.metrics['hardware_memory_capacity_bytes'].value[expected_labels],
-            131072 * 1048576,
-        )
-
-    # --- _process_power_network ---
-
-    def test_power_uses_name_not_numeric_id(self):
-        """Power components use human-readable name (PSU1_PIN) not dict key (38)."""
-        self.module._process_power_network(self.status, self.hostname)
-        health = self.module.metrics['hardware_status'].value
-        self.assertIn((self.hostname, 'PSU1_PIN', 'power', 'Enabled'), health)
-        self.assertIn((self.hostname, 'PSU1_POUT', 'power', 'Enabled'), health)
-        self.assertNotIn((self.hostname, '38', 'power', 'Enabled'), health)
-        self.assertNotIn((self.hostname, '39', 'power', 'Enabled'), health)
-
-    def test_network_uses_comp_id_not_generic_name(self):
-        """Network uses descriptive comp_id, not generic 'NetworkAdapter_0'."""
-        self.module._process_power_network(self.status, self.hostname)
-        health = self.module.metrics['hardware_status'].value
-        self.assertIn(
-            (self.hostname, 'networkinterfaces_devtype7_nic0', 'network', 'Enabled'), health)
-        self.assertNotIn(
-            (self.hostname, 'NetworkAdapter_0', 'network', 'Enabled'), health)
-
-    # --- _process_sensors ---
-
-    def test_temperature_uses_sensor_name(self):
-        """Temperature reading uses 'C1_DCSCM_TEMP' not numeric key '0'."""
-        self.module._process_sensors(self.status, self.hostname)
-        temp = self.module.metrics['hardware_temperature_celsius'].value
-        self.assertIn((self.hostname, 'C1_DCSCM_TEMP'), temp)
-        self.assertEqual(temp[(self.hostname, 'C1_DCSCM_TEMP')], 32.0)
-        self.assertNotIn((self.hostname, '0'), temp)
-
-    def test_temperature_health_uses_sensor_name(self):
-        """Health metric for temperatures also uses sensor name, not numeric key."""
-        self.module._process_sensors(self.status, self.hostname)
-        health = self.module.metrics['hardware_status'].value
-        self.assertIn((self.hostname, 'C1_DCSCM_TEMP', 'temperatures', 'Enabled'), health)
-        self.assertIn((self.hostname, 'C1_CPU_TEMP', 'temperatures', 'Enabled'), health)
-        self.assertNotIn((self.hostname, '0', 'temperatures', 'Enabled'), health)
-        self.assertNotIn((self.hostname, '6', 'temperatures', 'Enabled'), health)
-
-    def test_fan_uses_fan_name(self):
-        """Fan reading uses 'FAN1_TACH_IN' not numeric key '0'."""
-        self.module._process_sensors(self.status, self.hostname)
-        fan = self.module.metrics['hardware_fan_rpm'].value
-        self.assertIn((self.hostname, 'FAN1_TACH_IN'), fan)
-        self.assertEqual(fan[(self.hostname, 'FAN1_TACH_IN')], 23940.0)
-
-    def test_sensor_unknown_reading_skipped(self):
-        """Sensors with 'unknown' reading should not set reading metric but still set health."""
-        status = {'temperatures': {'Self': {
-            '99': {
-                'name': 'GHOST_TEMP',
-                'reading': 'unknown',
-                'status': {'health': 'OK', 'state': 'Enabled'},
-            },
-        }}}
-        self.module._process_sensors(status, self.hostname)
-        self.assertNotIn(
-            (self.hostname, 'GHOST_TEMP'),
-            self.module.metrics['hardware_temperature_celsius'].value)
-        self.assertIn(
-            (self.hostname, 'GHOST_TEMP', 'temperatures', 'Enabled'),
-            self.module.metrics['hardware_status'].value)
-
-    # --- _process_firmware ---
-
-    def test_firmware_known_version_exported(self):
-        self.module._process_firmware(self.hostname, self.data)
-        fw = self.module.metrics['hardware_firmware_info'].value
-        self.assertIn((self.hostname, 'BMC', '0.50.d57cfd'), fw)
-        self.assertEqual(fw[(self.hostname, 'BMC', '0.50.d57cfd')], 1)
-
-    def test_firmware_unknown_version_skipped(self):
-        """BIOS and CPLD with version='unknown' should not be exported."""
-        self.module._process_firmware(self.hostname, self.data)
-        fw = self.module.metrics['hardware_firmware_info'].value
-        for labels in fw:
-            self.assertNotEqual(labels[1], 'BIOS')
-            self.assertNotEqual(labels[1], 'CPLD')
-
-    # --- label count consistency ---
-
-    def test_storage_label_count_matches(self):
-        self.module._process_storage(self.status, self.hostname)
-        for labels in self.module.metrics['hardware_storage_capacity_bytes'].value:
-            self.assertEqual(len(labels), 7)
-
-    def test_cpu_label_count_matches(self):
-        self.module._process_processors(self.status, self.hostname)
-        for labels in self.module.metrics['hardware_cpu_cores'].value:
-            self.assertEqual(len(labels), 5)
-
-    # --- values the Redfish service does not report ---
-
-    def test_unreported_values_export_nan(self):
-        """
-        node-proxy turns the fields a Redfish service does not provide into
-        'unknown': the series are kept with a NaN value, along with the
-        health, and the exposition stays valid.
-        """
-        status = {
-            'storage': {'1': {'driveslot-2': {
-                'capacity_bytes': 'unknown', 'model': 'FCM4', 'protocol': 'unknown',
-                'firmware_version': 'unknown', 'slot': 2, 'serial_number': 'FCM0002',
-                'status': {'health': 'Warning', 'state': 'Enabled'}}}},
-            'processors': {'1': {'cpu-1': {
-                'total_cores': 'unknown', 'total_threads': 'unknown',
-                'manufacturer': 'unknown', 'model': 'unknown', 'status': 'unknown'}}},
-            'memory': {'1': {'dimm1': {
-                'capacity_mi_b': 'unknown', 'memory_device_type': 'unknown',
-                'status': {'health': 'OK', 'state': 'Enabled'}}}},
-        }
-        self.module._process_storage(status, self.hostname)
-        self.module._process_processors(status, self.hostname)
-        self.module._process_memory(status, self.hostname)
-
-        for key in ('hardware_storage_capacity_bytes', 'hardware_cpu_cores',
-                    'hardware_memory_capacity_bytes'):
-            values = list(self.module.metrics[key].value.values())
-            self.assertEqual(len(values), 1, key)
-            self.assertTrue(math.isnan(values[0]), key)
-            self.assertIn(' NaN', self.module.metrics[key].str_expfmt())
-        health = self.module.metrics['hardware_status'].value
-        self.assertEqual(
-            health[(self.hostname, 'driveslot-2', 'storage', 'Enabled')], 1)
-        self.assertEqual(health[(self.hostname, 'dimm1', 'memory', 'Enabled')], 0)
-        self.module.metrics['hardware_status'].str_expfmt()
-
-    def test_missing_values_export_nan(self):
-        status = {'storage': {'1': {'slot-1': {'model': 'ST20000NM'}}}}
-        self.module._process_storage(status, self.hostname)
-        (value,) = self.module.metrics['hardware_storage_capacity_bytes'].value.values()
-        self.assertTrue(math.isnan(value))
-
-    def test_numeric_strings_are_exported(self):
-        status = {'storage': {'1': {'slot-1': {'capacity_bytes': '1000'}}}}
-        self.module._process_storage(status, self.hostname)
-        (value,) = self.module.metrics['hardware_storage_capacity_bytes'].value.values()
-        self.assertEqual(value, 1000.0)
+    def test_only_with_cephadm(self):
+        self.module.get_module_option_ex.return_value = 'rook'
+        self.assertEqual(self.collect()['hardware_status'], {})
+        self.module.node_proxy_fullreport.assert_not_called()
 
 
 class RgwSyncMetricsTest(TestCase):

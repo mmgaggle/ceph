@@ -21,6 +21,7 @@ from mgr_module import MgrModule, MgrStandbyModule, PG_STATES, Option, ServiceIn
 from mgr_util import get_default_addr, profile_method, build_url, test_port_allocation, PortAlreadyInUse, verify_tls_files
 from orchestrator import OrchestratorClientMixin, raise_if_exception, OrchestratorError
 from rbd import RBD
+from ceph import hardware_metrics
 
 from typing import DefaultDict, Optional, Dict, Any, Set, cast, Tuple, Union, List, Callable, IO, TypeVar, Iterator
 LabelValues = Tuple[str, ...]
@@ -186,60 +187,6 @@ NUM_OBJECTS = ['degraded', 'misplaced', 'unfound']
 
 SMB_METADATA = ('smb_version', 'volume',
                 'subvolume_group', 'subvolume', 'netbiosname', 'share')
-
-HW_STORAGE_LABELS = ('hostname', 'device', 'model', 'protocol', 'firmware_version', 'slot', 'serial_number')
-
-HW_CPU_LABELS = ('hostname', 'cpu', 'manufacturer', 'model', 'total_threads')
-
-HW_MEMORY_LABELS = ('hostname', 'dimm', 'type')
-MIB_TO_BYTES = 1048576
-
-
-def hw_value(value: Any) -> float:
-    """Numeric value of a node-proxy field, NaN when it is not reported.
-
-    node-proxy reports the fields a Redfish service does not provide as the
-    string 'unknown'. NaN keeps the series and its inventory labels while
-    exporting the string would fail the whole collection.
-    """
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return math.nan
-
-
-HW_STATUS_LABELS = ('hostname', 'component', 'category', 'state')
-
-HW_TEMP_LABELS = ('hostname', 'sensor_name')
-
-HW_FAN_LABELS = ('hostname', 'fan_name')
-
-HW_FIRMWARE_LABELS = ('hostname', 'component', 'version')
-
-HEALTH_STATUS_MAP = {
-    'OK': 0,
-    'Warning': 1,
-    'Degraded': 1,
-    'Error': 2,
-    'Critical': 2,
-    # Health not reported by the BMC
-    'unknown': -1,
-}
-
-sensor_metric = namedtuple('sensor_metric', 'metric description labels')
-
-SENSOR_METRICS: Dict[str, sensor_metric] = {
-    'fans': sensor_metric(
-        'hardware_fan_rpm',
-        'Hardware fan speed in RPM',
-        HW_FAN_LABELS,
-    ),
-    'temperatures': sensor_metric(
-        'hardware_temperature_celsius',
-        'Hardware temperature sensor reading in Celsius',
-        HW_TEMP_LABELS,
-    )
-}
 
 CEPHADM_DAEMON_STATUS = ('service_type', 'daemon_name', 'hostname', 'service_name')
 
@@ -1125,49 +1072,8 @@ class Module(MgrModule, OrchestratorClientMixin):
                 check.description,
             )
 
-        metrics['hardware_storage_capacity_bytes'] = Metric(
-            'gauge',
-            'hardware_storage_capacity_bytes',
-            'Storage device capacity in bytes',
-            HW_STORAGE_LABELS
-        )
-
-        metrics['hardware_cpu_cores'] = Metric(
-            'gauge',
-            'hardware_cpu_cores',
-            'Total CPU cores',
-            HW_CPU_LABELS
-        )
-
-        metrics['hardware_memory_capacity_bytes'] = Metric(
-            'gauge',
-            'hardware_memory_capacity_bytes',
-            'Memory capacity in bytes',
-            HW_MEMORY_LABELS
-        )
-
-        metrics['hardware_status'] = Metric(
-            'gauge',
-            'hardware_status',
-            'Hardware component health (-1=Unknown, 0=OK, 1=Warning, 2=Error), '
-            'labelled with the Redfish state of the component',
-            HW_STATUS_LABELS
-        )
-
-        for sensor in SENSOR_METRICS.values():
-            metrics[sensor.metric] = Metric(
-                'gauge',
-                sensor.metric,
-                sensor.description,
-                sensor.labels
-            )
-
-        metrics['hardware_firmware_info'] = Metric(
-            'gauge',
-            'hardware_firmware_info',
-            'Firmware version information (value is always 1, version in label)',
-            HW_FIRMWARE_LABELS
-        )
+        for name, info in hardware_metrics.METRICS.items():
+            metrics[name] = Metric(info.mtype, name, info.description, info.labels)
 
         return metrics
 
@@ -2225,137 +2131,12 @@ class Module(MgrModule, OrchestratorClientMixin):
         except Exception as e:
             self.log.error(f"Failed to get SMB metadata: {str(e)}")
 
-    @staticmethod
-    def _hw_status_value(status_val: Any, field: str) -> str:
-        """Return the value of a Redfish Status field (e.g. state, health), 'unknown' if missing."""
-        status = status_val if isinstance(status_val, dict) else {}
-        return status.get(field, 'unknown')
-
-    def _hw_get_health_value(
-            self, status_val: Any, hostname: str = '',
-            comp_id: str = '', category: str = ''
-    ) -> Optional[int]:
-        """Map a Redfish health status to a numeric value (-1=Unknown, 0=OK, 1=Warning, 2=Error)."""
-        if isinstance(status_val, str):
-            health_str = status_val
-        else:
-            health_str = self._hw_status_value(status_val, 'health')
-
-        value = HEALTH_STATUS_MAP.get(health_str)
-        if value is None:
-            self.log.warning(
-                f"node-proxy: unexpected health status "
-                f"'{health_str}' for {category}/{comp_id} "
-                f"on {hostname}, skipping"
-            )
-        return value
-
-    def _hw_set_health_metric(
-            self, status_val: Any, hostname: str,
-            comp_id: str, category: str
-    ) -> None:
-        """Set hardware_status gauge for a single component.
-
-        The value is the Redfish health, the Redfish state is exported as a label.
-        """
-        state = self._hw_status_value(status_val, 'state')
-        health_value = self._hw_get_health_value(
-            status_val, hostname, comp_id, category
+    def _hw_unknown_health(self, health: str, hostname: str,
+                           component: str, category: str) -> None:
+        self.log.warning(
+            f"node-proxy: unexpected health status '{health}' for "
+            f"{category}/{component} on {hostname}, skipping"
         )
-        if health_value is None:
-            return
-        self.metrics['hardware_status'].set(
-            health_value, (hostname, comp_id, category, state)
-        )
-
-    def _hw_iter_components(
-            self, status: Dict[str, Any], category: str
-    ) -> Iterator[Tuple[str, Dict[str, Any]]]:
-        """Yield (comp_id, comp_dict) pairs from nested status[category] dicts."""
-        for components in status.get(category, {}).values():
-            for comp_id, comp in components.items():
-                if isinstance(comp, dict):
-                    yield comp_id, comp
-
-    def _hw_set_sensor_metric(
-            self, comp: Dict[str, Any], comp_id: str,
-            hostname: str, category: str, metric_key: str
-    ) -> None:
-        """Set sensor value (temperature/fan) and health gauges using the sensor name."""
-        name = comp.get('name', comp_id)
-        reading = comp.get('reading')
-        if reading is not None and reading != 'unknown':
-            try:
-                self.metrics[metric_key].set(float(reading), (hostname, name))
-            except (ValueError, TypeError):
-                pass
-        self._hw_set_health_metric(comp.get('status', {}), hostname, name, category)
-
-    def _process_storage(self, status: Dict[str, Any], hostname: str) -> None:
-        """Set storage capacity and health metrics per drive."""
-        for device_id, device in self._hw_iter_components(status, 'storage'):
-            capacity = hw_value(device.get('capacity_bytes'))
-            labels = (
-                hostname,
-                device_id,
-                device.get('model', 'unknown'),
-                device.get('protocol', 'unknown'),
-                device.get('firmware_version', 'unknown'),
-                device.get('slot', 'unknown'),
-                device.get('serial_number', 'unknown')
-            )
-            self.metrics['hardware_storage_capacity_bytes'].set(capacity, labels)
-            self._hw_set_health_metric(device.get('status', {}), hostname, device_id, 'storage')
-
-    def _process_processors(self, status: Dict[str, Any], hostname: str) -> None:
-        """Set CPU cores count and health metrics per processor."""
-        for cpu_id, cpu in self._hw_iter_components(status, 'processors'):
-            cores = hw_value(cpu.get('total_cores'))
-            labels = (
-                hostname,
-                cpu_id,
-                cpu.get('manufacturer', 'unknown'),
-                cpu.get('model', 'unknown'),
-                cpu.get('total_threads', 'unknown')
-            )
-            self.metrics['hardware_cpu_cores'].set(cores, labels)
-            self._hw_set_health_metric(cpu.get('status', {}), hostname, cpu_id, 'processors')
-
-    def _process_memory(self, status: Dict[str, Any], hostname: str) -> None:
-        """Set memory capacity (in bytes) and health metrics per DIMM."""
-        for dimm_id, dimm in self._hw_iter_components(status, 'memory'):
-            capacity_bytes = hw_value(dimm.get('capacity_mi_b')) * MIB_TO_BYTES
-            labels = (
-                hostname,
-                dimm_id,
-                dimm.get('memory_device_type', 'unknown'),
-            )
-            self.metrics['hardware_memory_capacity_bytes'].set(capacity_bytes, labels)
-            self._hw_set_health_metric(dimm.get('status', {}), hostname, dimm_id, 'memory')
-
-    def _process_power_network(self, status: Dict[str, Any], hostname: str) -> None:
-        """Set health metrics for power and network"""
-        for comp_id, comp in self._hw_iter_components(status, 'power'):
-            name = comp.get('name', comp_id)
-            self._hw_set_health_metric(comp.get('status', {}), hostname, name, 'power')
-        for comp_id, comp in self._hw_iter_components(status, 'network'):
-            self._hw_set_health_metric(comp.get('status', {}), hostname, comp_id, 'network')
-
-    def _process_sensors(self, status: Dict[str, Any], hostname: str) -> None:
-        """Set fan and temperature readings and health metrics"""
-        for category, sensor in SENSOR_METRICS.items():
-            for comp_id, comp in self._hw_iter_components(status, category):
-                self._hw_set_sensor_metric(comp, comp_id, hostname, category, sensor.metric)
-
-    def _process_firmware(self, hostname: str, data: Dict[str, Any]) -> None:
-        """Set firmware info metrics (value=1) with version as label, skip unknown."""
-        fw_data = data.get('firmware', data.get('firmwares', {}))
-        for fw_id, fw_info in fw_data.items():
-            component = fw_info.get('name', fw_id)
-            version = fw_info.get('version', 'unknown')
-            if version and version != 'unknown':
-                labels = (hostname, component, str(version))
-                self.metrics['hardware_firmware_info'].set(1, labels)
 
     @profile_method(True)
     def get_hardware_metrics(self) -> None:
@@ -2387,13 +2168,8 @@ class Module(MgrModule, OrchestratorClientMixin):
             return
 
         for hostname, data in report.items():
-            status = data.get('status', {})
-            self._process_firmware(hostname, data)
-            self._process_storage(status, hostname)
-            self._process_processors(status, hostname)
-            self._process_memory(status, hostname)
-            self._process_power_network(status, hostname)
-            self._process_sensors(status, hostname)
+            for sample in hardware_metrics.samples(hostname, data, self._hw_unknown_health):
+                self.metrics[sample.metric].set(sample.value, sample.labels)
 
     @profile_method(True)
     def collect(self) -> str:

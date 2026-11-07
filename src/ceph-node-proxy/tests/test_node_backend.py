@@ -26,6 +26,8 @@ def mock_redfish():
         },
         "firmware": {},
     }
+    # a Redfish service without Swordfish storage pools
+    redfish.get_fcm.return_value = {}
     return redfish
 
 
@@ -105,6 +107,24 @@ class TestCreateNodeBackend:
         assert isinstance(backend, NodeBackend)
         assert backend.redfish is mock_redfish
         assert backend._local.categories() == ["fcm"]
+
+
+FCM_STATS = {"driveslot-2": {"device": "driveslot-2", "valid": True}}
+
+
+class TestNodeBackendFcm:
+    def test_redfish_fcm_wins_over_the_local_collector(self, mock_redfish):
+        mock_redfish.get_system.return_value["status"]["fcm"] = {"CAN01": FCM_STATS}
+        mock_redfish.get_fcm.return_value = {"CAN01": FCM_STATS}
+        runner = LocalCollectorRunner([FCMCollector()])
+        backend = NodeBackend(mock_redfish, runner)
+        with patch(
+            "ceph_node_proxy.local_collectors.collect_fcm_stats",
+            return_value={"nvme0n1": {"valid": True}},
+        ):
+            runner.update()
+        assert backend.get_system()["status"]["fcm"] == {"CAN01": FCM_STATS}
+        assert backend.get_fcm() == {"CAN01": FCM_STATS}
 
 
 class TestNodeBackendLoop:

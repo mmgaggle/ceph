@@ -5,6 +5,7 @@ from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional
 
 from ceph_node_proxy.basesystem import BaseSystem
+from ceph_node_proxy.fcm_stats import fcm_stats_data
 from ceph_node_proxy.network import conditions, interface_details
 from ceph_node_proxy.redfish import (
     ComponentUpdateSpec,
@@ -14,6 +15,7 @@ from ceph_node_proxy.redfish import (
     update_component,
 )
 from ceph_node_proxy.redfish_client import RedFishClient
+from ceph_node_proxy.swordfish import PoolUsage, pool_usage
 from ceph_node_proxy.util import (
     check_id,
     fill_missing_identity,
@@ -238,7 +240,7 @@ class BaseRedfishSystem(BaseSystem):
         return [self._get_path(member["@odata.id"]) for member in data["Members"]]
 
     def get_system(self) -> Dict[str, Any]:
-        result = {
+        result: Dict[str, Any] = {
             "host": self.get_host(),
             "sn": self.get_sn(),
             "status": {
@@ -252,6 +254,9 @@ class BaseRedfishSystem(BaseSystem):
             },
             "firmware": self.get_firmware(),
         }
+        fcm = self.get_fcm()
+        if fcm:
+            result["status"]["fcm"] = fcm
         return result
 
     def _update_system(self) -> None:
@@ -281,6 +286,9 @@ class BaseRedfishSystem(BaseSystem):
 
     def get_storage(self) -> Dict[str, Dict[str, Dict]]:
         return dict(self._sys.get("storage", {}))
+
+    def get_fcm(self) -> Dict[str, Dict[str, Dict]]:
+        return dict(self._sys.get("fcm", {}))
 
     def get_firmware(self) -> Dict[str, Dict[str, Dict]]:
         return dict(self._sys.get("firmware", {}))
@@ -395,14 +403,18 @@ class BaseRedfishSystem(BaseSystem):
             "SecurityIDOwned",
         ]
         result: Dict[str, Dict[str, Dict]] = dict()
+        fcm: Dict[str, Dict[str, Dict]] = dict()
         self.log.debug("Updating storage")
         members_names = self.endpoints["systems"].get_members_names()
         for member in members_names:
             result[member] = {}
+            usage: List[PoolUsage] = []
             members_data = self.endpoints["systems"][member][
                 "Storage"
             ].get_members_data()
             for entity in members_data:
+                # FCMs: compression from the Swordfish storage pools
+                usage += pool_usage(members_data[entity], self._fetch)
                 for drive in members_data[entity]["Drives"]:
                     data: Dict[str, Any] = Endpoint(
                         drive["@odata.id"], self.endpoints.client
@@ -421,7 +433,33 @@ class BaseRedfishSystem(BaseSystem):
             for drive_id, drive_data in result[member].items():
                 fill_missing_identity(drive_data, drive_id)
                 fill_drive_slot_and_firmware(drive_data)
+            if usage:
+                fcm[member] = self.fcm_stats(result[member], usage)
             self._sys["storage"] = result
+        self._sys["fcm"] = fcm
+
+    @staticmethod
+    def fcm_stats(
+        drives: Dict[str, Dict[str, Any]], usage: List[PoolUsage]
+    ) -> Dict[str, Any]:
+        """The FCM stats of a system's drives, by drive ID, from the usage
+        of their storage pools."""
+        by_endpoint = {d.get("redfish_endpoint"): (i, d) for i, d in drives.items()}
+        stats: Dict[str, Any] = {}
+        for pool in usage:
+            if pool.drive not in by_endpoint:
+                continue
+            drive_id, drive = by_endpoint[pool.drive]
+            stats[drive_id] = fcm_stats_data(
+                drive_id,
+                str(drive.get("model") or ""),
+                str(drive.get("serial_number") or ""),
+                pool.phy_size_bytes,
+                pool.phy_util_bytes,
+                pool.log_size_bytes,
+                pool.log_util_bytes,
+            )
+        return stats
 
     def _update_sn(self) -> None:
         serials: List[str] = []

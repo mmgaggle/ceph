@@ -49,15 +49,18 @@ class NodeBackend(BaseSystem):
 
     def get_system(self) -> Dict[str, Any]:
         result = self.redfish.get_system()
+        # a local collector fills what the Redfish service does not report
+        # (FCMs behind a BMC without Swordfish storage pools)
         for category in self._local.categories():
-            result["status"][category] = self._local.get_category(category)
+            if not result["status"].get(category):
+                result["status"][category] = self._local.get_category(category)
         return result
 
     def get_local_category(self, name: str) -> Dict[str, Any]:
         return self._local.get_category(name)
 
     def get_fcm(self) -> Dict[str, Any]:
-        return self.get_local_category("fcm")
+        return self.redfish.get_fcm() or self.get_local_category("fcm")
 
     def get_status(self) -> Dict[str, Dict[str, Dict]]:
         return dict(self.redfish.get_status())

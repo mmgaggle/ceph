@@ -219,10 +219,9 @@ def apply_fcm_display_fields(stats: FCMStatsData) -> FCMStatsData:
     return {**stats, **display}
 
 
-def read_fcm_stats(device: str) -> FCMStatsData:
-    model = read_sysfs_block(device, "device/model")
-    serial_number = read_sysfs_block(device, "device/serial")
-    invalid = apply_fcm_display_fields({
+def invalid_fcm_stats(device: str, model: str, serial_number: str) -> FCMStatsData:
+    """The stats of an FCM whose usage could not be read."""
+    return apply_fcm_display_fields({
         "device": device,
         "model": model,
         "serial_number": serial_number,
@@ -243,23 +242,19 @@ def read_fcm_stats(device: str) -> FCMStatsData:
         "log_usage_display": "",
     })
 
-    raw_bytes = query_nvme_log_page(device)
-    if raw_bytes is None:
-        return invalid
 
-    try:
-        phy_size_bytes = struct.unpack("<Q", raw_bytes[:8])[0]
-        phy_util_bytes = struct.unpack("<Q", raw_bytes[8:16])[0]
-        log_size_bytes = struct.unpack("<Q", raw_bytes[16:24])[0]
-        log_util_bytes = struct.unpack("<Q", raw_bytes[24:32])[0]
-    except struct.error as exc:
-        logger.error(
-            "Problem unpacking usage stats from log page 0xCA for device %s: %s",
-            device,
-            exc,
-        )
-        return invalid
-
+def fcm_stats_data(
+    device: str,
+    model: str,
+    serial_number: str,
+    phy_size_bytes: int,
+    phy_util_bytes: int,
+    log_size_bytes: int,
+    log_util_bytes: int,
+) -> FCMStatsData:
+    """The stats of an FCM from its physical (flash) and logical size and
+    use, in bytes: what log page 0xCA holds, or a Redfish service's
+    Swordfish storage pool and volumes."""
     phy_util_percent = (
         (phy_util_bytes / phy_size_bytes) * 100 if phy_size_bytes else 0.0
     )
@@ -291,6 +286,36 @@ def read_fcm_stats(device: str) -> FCMStatsData:
         "phy_usage_display": "",
         "log_usage_display": "",
     })
+
+
+def read_fcm_stats(device: str) -> FCMStatsData:
+    model = read_sysfs_block(device, "device/model")
+    serial_number = read_sysfs_block(device, "device/serial")
+    raw_bytes = query_nvme_log_page(device)
+    if raw_bytes is None:
+        return invalid_fcm_stats(device, model, serial_number)
+
+    try:
+        phy_size_bytes, phy_util_bytes, log_size_bytes, log_util_bytes = struct.unpack(
+            "<4Q", raw_bytes[:FCM_LOG_PAGE_LEN]
+        )
+    except struct.error as exc:
+        logger.error(
+            "Problem unpacking usage stats from log page 0xCA for device %s: %s",
+            device,
+            exc,
+        )
+        return invalid_fcm_stats(device, model, serial_number)
+
+    return fcm_stats_data(
+        device,
+        model,
+        serial_number,
+        phy_size_bytes,
+        phy_util_bytes,
+        log_size_bytes,
+        log_util_bytes,
+    )
 
 
 def collect_fcm_stats() -> dict[str, FCMStatsData]:

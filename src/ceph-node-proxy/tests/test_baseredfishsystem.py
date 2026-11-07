@@ -413,6 +413,25 @@ class TestStorageSlotAndFirmware:
         assert drive["conditions"][0]["message"].startswith("The drive is locked")
         assert drive["conditions"][0]["severity"] == "Warning"
 
+    def test_update_storage_reads_fcm_from_storage_pools(self, system, mock_endpoints):
+        from tests.test_swordfish import HAL, STORAGE
+
+        systems = storage_endpoints([HAL_DRIVE])
+        storage = systems["CAN01"]["Storage"]
+        storage.get_members_data.return_value["Enclosure0"].update(HAL[STORAGE])
+        mock_endpoints.__getitem__.side_effect = lambda key: {"systems": systems}[key]
+        with patch("ceph_node_proxy.baseredfishsystem.Endpoint") as mock_endpoint, \
+                patch.object(system, "_fetch", side_effect=lambda url: HAL.get(url, {})):
+            mock_endpoint.return_value.data = HAL_DRIVE
+            system._update_storage()
+        fcm = system.get_fcm()["CAN01"]["driveslot-2"]
+        assert fcm["valid"] is True
+        assert (fcm["model"], fcm["serial_number"]) == ("101-FCM4", "FCM0002")
+        assert (fcm["phy_util_bytes"], fcm["log_util_bytes"]) == (1000000000, 2300000000)
+        assert fcm["compression_ratio"] == 2.3
+        assert fcm["status"] == {"health": "OK", "state": "Enabled"}
+        assert system.get_system()["status"]["fcm"] == system.get_fcm()
+
     def test_drive_without_encryption(self, system, mock_endpoints):
         mock_endpoints.__getitem__.side_effect = lambda key: {
             "systems": storage_endpoints([HAL_DRIVE])

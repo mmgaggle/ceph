@@ -61,6 +61,44 @@ The Ceph Manager stores each host's report without its readings, and
 only when it changes.
 
 
+.. _hardware-monitoring-metrics:
+
+Metrics
+=======
+
+Each ``node-proxy`` serves its host's hardware metrics in the Prometheus
+format at ``https://<host>:9456/metrics``:
+
+* ``ceph_hardware_status``: the health of every component, with its
+  Redfish state;
+* temperatures, fan speeds, drive and memory capacities, CPU cores and
+  firmware versions;
+* ``ceph_hardware_report_timestamp_seconds``: when ``node-proxy`` last
+  read the hardware. A value that stops moving means it cannot read the
+  Redfish API.
+
+They come from its last complete read of the Redfish API, so the readings
+are at most ``system.refresh_interval`` seconds old, and a scrape does not
+wait for the Redfish API. The metrics do not go through the Ceph Manager,
+which no longer exports them (``mgr/prometheus/exclude_hardware_metrics``,
+on by default).
+
+The Prometheus that cephadm deploys finds every ``node-proxy`` through
+cephadm's service discovery. It scrapes them over TLS, checks their
+certificates with cephadm's root CA, and logs in with credentials that
+cephadm creates once for the cluster. These credentials open
+``/metrics`` and nothing else.
+
+To scrape ``node-proxy`` from another Prometheus, give it the root CA and
+the credentials:
+
+.. prompt:: bash #
+
+   ceph orch certmgr cert get cephadm_root_ca_cert
+   ceph config-key get mgr/cephadm/node_proxy/metrics_username
+   ceph config-key get mgr/cephadm/node_proxy/metrics_password
+
+
 Deploying the Agent
 ===================
 

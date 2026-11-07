@@ -704,3 +704,19 @@ class TestNodeProxyCachePersistence:
         assert stored.startswith(NODE_PROXY_COMPRESSED)
         assert len(stored) < 64 * 1024 < len(json.dumps(report))
         assert _decode_report(stored)['status']['storage'] == report['status']['storage']
+
+
+def test_mgr_authenticates_with_the_cephx_identity() -> None:
+    import base64
+    from cephadm.services.node_proxy import NodeProxy
+    mgr = MagicMock()
+    mgr.node_proxy_cache.keyrings = {'host01': 'AQBsecret=='}
+    mgr.node_proxy_cache.oob = {'host01': {'username': 'oob', 'password': 'pw'},
+                                'host02': {'username': 'oob2', 'password': 'pw2'}}
+    service = NodeProxy.__new__(NodeProxy)
+    service.mgr = mgr
+    header = service.generate_auth_header('host01')['Authorization']
+    assert base64.b64decode(header[6:]).decode() == 'node-proxy.host01:AQBsecret=='
+    # no keyring yet: the out-of-band credentials, as before
+    header = service.generate_auth_header('host02')['Authorization']
+    assert base64.b64decode(header[6:]).decode() == 'oob2:pw2'

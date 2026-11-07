@@ -151,16 +151,21 @@ class NodeProxy(CephService):
         return result_json
 
     def generate_auth_header(self, hostname: str) -> Dict[str, str]:
-        try:
-            username = self.mgr.node_proxy_cache.oob[hostname]['username']
-            password = self.mgr.node_proxy_cache.oob[hostname]['password']
-            auth: bytes = f'{username}:{password}'.encode('utf-8')
-            auth_str: str = base64.b64encode(auth).decode('utf-8')
-            header = {'Authorization': f'Basic {auth_str}'}
-        except KeyError as e:
-            self.mgr.log.error(f'Check oob information is provided for {hostname}.')
-            raise RuntimeError(e)
-        return header
+        # the node-proxy daemon's cephx identity: the out-of-band (BMC)
+        # credentials stay between node-proxy and the Redfish service
+        keyring = self.mgr.node_proxy_cache.keyrings.get(hostname)
+        if keyring:
+            username, password = f'node-proxy.{hostname}', keyring
+        else:
+            try:
+                username = self.mgr.node_proxy_cache.oob[hostname]['username']
+                password = self.mgr.node_proxy_cache.oob[hostname]['password']
+            except KeyError as e:
+                self.mgr.log.error(f'Check oob information is provided for {hostname}.')
+                raise RuntimeError(e)
+        auth: bytes = f'{username}:{password}'.encode('utf-8')
+        auth_str: str = base64.b64encode(auth).decode('utf-8')
+        return {'Authorization': f'Basic {auth_str}'}
 
     def shutdown(self, hostname: str, force: Optional[bool] = False) -> Dict[str, Any]:
         ssl_ctx: ssl.SSLContext = self.get_ssl_ctx()

@@ -78,3 +78,21 @@ class TestLed:
         with pytest.raises(cherrypy.HTTPError) as e:
             api._led(type="chassis")
         assert e.value.status == 501
+
+
+def test_check_auth_takes_the_cephx_identity() -> None:
+    from unittest.mock import MagicMock
+    from ceph_node_proxy.api import NodeProxyApi
+
+    mgr = MagicMock()
+    mgr.username, mgr.password = "oob-user", "oob-pass"
+    mgr.cephx_name, mgr.cephx_secret = "node-proxy.host01", "AQBsecret=="
+    api = NodeProxyApi.__new__(NodeProxyApi)
+    api.username, api.password = mgr.username, mgr.password
+    api.cephx_name, api.cephx_secret = mgr.cephx_name, mgr.cephx_secret
+    assert api.check_auth("localhost", "node-proxy.host01", "AQBsecret==")
+    assert api.check_auth("localhost", "oob-user", "oob-pass")     # an older mgr
+    assert not api.check_auth("localhost", "node-proxy.host01", "wrong")
+    assert not api.check_auth("localhost", "node-proxy.host02", "AQBsecret==")
+    api.cephx_name = api.cephx_secret = ""
+    assert not api.check_auth("localhost", "", "")

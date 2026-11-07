@@ -1,4 +1,5 @@
 import cherrypy
+import hmac
 import json
 import socket
 import ssl
@@ -193,7 +194,8 @@ class NodeProxyEndpoint:
                 raise cherrypy.HTTPError(400, 'The node-proxy keyring must be provided.')
             elif not self.mgr.node_proxy_cache.keyrings.get(hostname, ''):
                 raise cherrypy.HTTPError(502, f'Make sure the node-proxy is running on {hostname}')
-            elif data['cephx']['secret'] != self.mgr.node_proxy_cache.keyrings[hostname]:
+            elif not hmac.compare_digest(str(data['cephx']['secret']).encode(),
+                                         self.mgr.node_proxy_cache.keyrings[hostname].encode()):
                 raise cherrypy.HTTPError(403, f'Got wrong keyring from agent on host {hostname}.')
         except AttributeError:
             raise cherrypy.HTTPError(400, 'Malformed data received.')

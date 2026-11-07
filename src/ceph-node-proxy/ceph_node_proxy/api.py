@@ -1,3 +1,4 @@
+import hmac
 import json
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -356,6 +357,9 @@ class NodeProxyApi(Thread):
         self.node_proxy_mgr = node_proxy_mgr
         self.username = self.node_proxy_mgr.username
         self.password = self.node_proxy_mgr.password
+        # the mgr authenticates with this daemon's cephx identity
+        self.cephx_name = getattr(self.node_proxy_mgr, "cephx_name", "")
+        self.cephx_secret = getattr(self.node_proxy_mgr, "cephx_secret", "")
         self.ssl_crt = self.node_proxy_mgr.api_ssl_crt
         self.ssl_key = self.node_proxy_mgr.api_ssl_key
         self.system = self.node_proxy_mgr.system
@@ -364,7 +368,15 @@ class NodeProxyApi(Thread):
         self.api = API(self.system, self.reporter_agent, self.config)
 
     def check_auth(self, realm: str, username: str, password: str) -> bool:
-        return self.username == username and self.password == password
+        """The mgr's credentials: this daemon's cephx name and secret. The
+        out-of-band (Redfish) credentials are still accepted from an mgr
+        that predates this, for one release."""
+        def same(a: str, b: str) -> bool:
+            return bool(a) and hmac.compare_digest(str(a).encode(), str(b).encode())
+
+        if same(self.cephx_name, username) and same(self.cephx_secret, password):
+            return True
+        return same(self.username, username) and same(self.password, password)
 
     def shutdown(self) -> None:
         self.log.info("Stopping node-proxy API...")

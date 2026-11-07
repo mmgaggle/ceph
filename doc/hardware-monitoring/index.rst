@@ -161,20 +161,6 @@ _________________
   +---------+--------+--------------+--------------------------------------------+-------+---------+--------+---------+
 
 
-Network Devices Report
-______________________
-
-.. prompt:: bash # auto
-
-  # ceph orch hardware status node-10 --category network
-  +---------+--------+----------------------------------+-------+--------+---------+
-  |   HOST  | SYS_ID |               NAME               | SPEED | STATUS |  STATE  |
-  +---------+--------+----------------------------------+-------+--------+---------+
-  | node-10 |   1    | NIC in Slot 1 Port 1 Partition 1 | 10000 |   OK   | Enabled |
-  | node-10 |   1    |             eno8303              |  1000 |   OK   | Enabled |
-  +---------+--------+----------------------------------+-------+--------+---------+
-
-
 Power Supplies Report
 _____________________
 
@@ -318,7 +304,7 @@ The drives' conditions say why one stays locked, in ``HARDWARE_STORAGE``:
 
   # ceph health detail
   [WRN] HARDWARE_STORAGE: 1 storage member is not ok
-      [CS1CAN01]: driveslot-6 is warning: Enabled: The drive is locked and HAL cannot read its credential from Vault: https://vault.example.com:8200: ConnectionError. HAL unlocks it once Vault answers.
+      [CS1CAN01]: driveslot-6 is warning: Enabled: The drive is locked and its credential cannot be read from the key manager (connection refused). It is unlocked once the key manager answers.
 
 The dashboard's *Hardware drives* table has *Encryption* and *Problems*
 columns.

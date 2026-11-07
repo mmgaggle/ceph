@@ -2,6 +2,7 @@ import concurrent.futures
 import dataclasses
 import json
 from time import sleep
+from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional
 
 from ceph_node_proxy.basesystem import BaseSystem
@@ -16,12 +17,17 @@ from ceph_node_proxy.redfish import (
 from ceph_node_proxy.redfish_client import RedFishClient
 from ceph_node_proxy.util import (
     DEFAULTS,
+    check_id,
     fill_missing_identity,
     get_logger,
     is_unknown,
     normalize_dict,
     to_snake_case,
 )
+
+#: diagnostic data larger than this is refused (it is held in memory
+#: here and in the mgr): download it from the host instead
+MAX_DIAGNOSTICS_BYTES = 512 * 1024 * 1024
 
 
 def fill_drive_slot_and_firmware(drive: Dict[str, Any]) -> None:
@@ -660,24 +666,30 @@ class BaseRedfishSystem(BaseSystem):
         return self._task_summary(task)
 
     def get_diagnostics_task(self, task_id: str) -> Dict[str, Any]:
+        task_id = check_id(task_id, "task ID")
         _, data, _ = self.client.query(
             method="GET",
-            endpoint=f"{RedFishClient.PREFIX}TaskService/Tasks/{task_id}",
+            endpoint=f"{RedFishClient.PREFIX}TaskService/Tasks/{quote(task_id)}",
         )
         return self._task_summary(json.loads(data) if data else {})
 
     def download_diagnostics(self, entry_id: str) -> Dict[str, Any]:
         """The data of an entry: {'filename': ..., 'content': bytes}"""
-        entry = self._diagnostics_entry(entry_id)
+        entry = self._diagnostics_entry(check_id(entry_id, "entry ID"))
         headers, data, _ = self.client.query(
             method="GET", endpoint=entry["download_endpoint"], timeout=120, raw=True
         )
+        if len(data or b"") > MAX_DIAGNOSTICS_BYTES:
+            raise ValueError(
+                f"diagnostic data {entry_id} is larger than "
+                f"{MAX_DIAGNOSTICS_BYTES} bytes: download it from the host"
+            )
         get_filename = getattr(headers, "get_filename", None)
         filename = get_filename() if callable(get_filename) else None
         return {"filename": filename or f"{entry_id}.bin", "content": data}
 
     def delete_diagnostics(self, entry_id: str) -> int:
-        entry = self._diagnostics_entry(entry_id)
+        entry = self._diagnostics_entry(check_id(entry_id, "entry ID"))
         _, _, status = self.client.query(
             method="DELETE", endpoint=entry["redfish_endpoint"]
         )

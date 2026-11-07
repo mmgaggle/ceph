@@ -8,7 +8,7 @@ from cherrypy._cpserver import Server  # type: ignore
 
 from ceph_node_proxy.protocols import SystemBackend
 from ceph_node_proxy.reporter import Reporter
-from ceph_node_proxy.util import Config, get_logger, write_tmp_file
+from ceph_node_proxy.util import Config, check_id, get_logger, has_drive, write_tmp_file
 
 if TYPE_CHECKING:
     from ceph_node_proxy.main import NodeProxyManager
@@ -184,19 +184,23 @@ class API(Server):
             return self._json(self._diagnostics_call(self.backend.get_diagnostics))
         if not path and method == "POST":
             return self._collect_diagnostics()
-        if len(path) == 2 and path[0] == "tasks" and method == "GET":
+        try:
+            ids = [check_id(p) for p in path]
+        except ValueError as e:
+            raise cherrypy.HTTPError(400, str(e))
+        if len(ids) == 2 and ids[0] == "tasks" and method == "GET":
             return self._json(
-                self._diagnostics_call(self.backend.get_diagnostics_task, path[1])
+                self._diagnostics_call(self.backend.get_diagnostics_task, ids[1])
             )
-        if len(path) == 1 and method in ("GET", "DELETE"):
-            return self._diagnostics_entry(path[0], method)
+        if len(ids) == 1 and method in ("GET", "DELETE"):
+            return self._diagnostics_entry(ids[0], method)
         raise cherrypy.HTTPError(404)
 
     def _collect_diagnostics(self) -> bytes:
         data: Dict[str, Any] = getattr(cherrypy.request, "json", None) or {}
         drive = data.get("drive")
         storage = self.backend.get_storage()
-        if not drive or not any(drive in drives for drives in storage.values()):
+        if not has_drive(storage, drive):
             msg = "A valid drive ID must be provided."
             self.log.warning(msg)
             raise cherrypy.HTTPError(400, msg)
@@ -266,9 +270,7 @@ class API(Server):
         if led_type == "drive":
             # storage is reported per system: {system_id: {drive_id: ...}}
             storage = self.backend.get_storage()
-            if not id_drive or not any(
-                id_drive in drives for drives in storage.values()
-            ):
+            if not has_drive(storage, id_drive):
                 msg = "A valid device ID must be provided."
                 self.log.warning(msg)
                 raise cherrypy.HTTPError(400, msg)
@@ -381,6 +383,9 @@ class NodeProxyApi(Thread):
             "/": {
                 "request.methods_with_bodies": ("POST", "PUT", "PATCH"),
                 "tools.trailing_slash.on": False,
+                # every endpoint: the reports carry LLDP neighbors, addresses,
+                # serial numbers; the mgr always authenticates
+                "tools.auth_basic.on": True,
                 "tools.auth_basic.realm": "localhost",
                 "tools.auth_basic.checkpassword": self.check_auth,
             }

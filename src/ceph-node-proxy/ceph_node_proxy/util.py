@@ -274,3 +274,23 @@ def _dict_diff(old: Any, new: Any) -> Any:
             if sub is not None:
                 delta[k] = sub
     return delta if delta else None
+
+
+# IDs from the API's callers that end up in Redfish URLs: task and
+# diagnostic data entry IDs
+SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+def check_id(value: str, what: str = "ID") -> str:
+    """value, when it is a plain ID; ValueError otherwise"""
+    if not isinstance(value, str) or not SAFE_ID.fullmatch(value) or value in (".", ".."):
+        raise ValueError(f"invalid {what}: {value!r}")
+    return value
+
+
+def has_drive(storage: Dict[str, Any], drive_id: Optional[str]) -> bool:
+    """True when a drive of the storage report (per system: {system_id:
+    {drive_id: ...}}) has this ID"""
+    return bool(drive_id) and any(
+        drive_id in drives for drives in storage.values() if isinstance(drives, dict)
+    )

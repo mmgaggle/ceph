@@ -418,6 +418,17 @@ class Orchestrator(object):
         """
         raise NotImplementedError()
 
+    def node_proxy_live(self, hostname: str) -> OrchResult[Dict[str, Any]]:
+        """
+        Return the hardware of a host as its node-proxy last read it, fetched
+        from node-proxy: the full report carries new readings less often.
+
+        :param hostname: hostname
+        :return: {'report': <node-proxy report>, 'timestamp': <when node-proxy
+            read the hardware, Unix time>}
+        """
+        raise NotImplementedError()
+
     def node_proxy_firmware(self, hostname: Optional[str] = None) -> OrchResult[Dict[str, Any]]:
         """
         Return node-proxy firmware report

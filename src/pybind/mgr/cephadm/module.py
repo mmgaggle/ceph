@@ -2461,8 +2461,8 @@ Then run the following:
             raise OrchestratorValidationError(f"Can't perform powercycle on node {hostname}: {e}")
         return f'Powercycle scheduled on {hostname}'
 
-    def _hardware_diagnostics_call(self, hostname: str, call: Callable[..., Any], *args: Any,
-                                   unsupported: str = 'diagnostic data') -> Any:
+    def _node_proxy_call(self, hostname: str, call: Callable[..., Any], *args: Any,
+                         unsupported: str = 'diagnostic data') -> Any:
         if hostname not in self.node_proxy_cache.data:
             raise OrchestratorValidationError(
                 f"'{hostname}' has not reported hardware data: is node-proxy running there?")
@@ -2482,11 +2482,11 @@ Then run the following:
     @handle_orch_error
     def hardware_diagnostics_ls(self, hostname: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
         if hostname:
-            return {hostname: self._hardware_diagnostics_call(hostname, self.node_proxy.diagnostics)}
+            return {hostname: self._node_proxy_call(hostname, self.node_proxy.diagnostics)}
         result: Dict[str, List[Dict[str, Any]]] = {}
         for host in self.node_proxy_cache.list_hosts():
             try:
-                result[host] = self._hardware_diagnostics_call(host, self.node_proxy.diagnostics)
+                result[host] = self._node_proxy_call(host, self.node_proxy.diagnostics)
             except OrchestratorValidationError as e:
                 # one host failing does not hide the others' data
                 self.log.warning(f'diagnostic data of {host}: {e}')
@@ -2499,7 +2499,7 @@ Then run the following:
             raise OrchestratorValidationError(
                 f"'{device}' not found on {hostname}: see 'ceph orch hardware status "
                 f"{hostname} --category storage'")
-        task: Dict[str, Any] = self._hardware_diagnostics_call(
+        task: Dict[str, Any] = self._node_proxy_call(
             hostname, self.node_proxy.collect_diagnostics, device,
             unsupported=f'the diagnostic data of {device}')
         self.log.info(f'collecting the diagnostic data of {device} on {hostname}: '
@@ -2508,25 +2508,30 @@ Then run the following:
 
     @handle_orch_error
     def hardware_diagnostics_task(self, hostname: str, task_id: str) -> Dict[str, Any]:
-        task: Dict[str, Any] = self._hardware_diagnostics_call(
+        task: Dict[str, Any] = self._node_proxy_call(
             hostname, self.node_proxy.diagnostics_task, task_id)
         return task
 
     @handle_orch_error
     def hardware_diagnostics_get(self, hostname: str, entry_id: str) -> Tuple[str, bytes]:
-        result: Tuple[str, bytes] = self._hardware_diagnostics_call(
+        result: Tuple[str, bytes] = self._node_proxy_call(
             hostname, self.node_proxy.download_diagnostics, entry_id)
         return result
 
     @handle_orch_error
     def hardware_diagnostics_rm(self, hostname: str, entry_id: str) -> str:
-        self._hardware_diagnostics_call(hostname, self.node_proxy.delete_diagnostics, entry_id)
+        self._node_proxy_call(hostname, self.node_proxy.delete_diagnostics, entry_id)
         return f'Removed diagnostic data {entry_id} of {hostname}'
 
     @handle_orch_error
     def node_proxy_list_hosts(self) -> List[str]:
         # Returns hosts with a complete node-proxy report; no blobs loaded.
         return self.node_proxy_cache.list_hosts()
+
+    @handle_orch_error
+    def node_proxy_live(self, hostname: str) -> Dict[str, Any]:
+        live: Dict[str, Any] = self._node_proxy_call(hostname, self.node_proxy.report)
+        return live
 
     @handle_orch_error
     def node_proxy_fullreport(self, hostname: Optional[str] = None) -> Dict[str, Any]:

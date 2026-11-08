@@ -2,6 +2,7 @@ import json
 import re
 import secrets
 import ssl
+import time
 import base64
 from dataclasses import replace
 
@@ -30,6 +31,13 @@ class NodeProxy(CephService):
     DEVICE_ACCESS_VENDORS = ('atollon',)
     METRICS_USER_KEY = 'node_proxy/metrics_username'
     METRICS_PASS_KEY = 'node_proxy/metrics_password'
+    # how long a host's hardware fetched from its node-proxy is reused: the
+    # dashboard pages open on the host share one fetch
+    LIVE_TTL = 5.0
+
+    def __init__(self, mgr: "CephadmOrchestrator") -> None:
+        super().__init__(mgr)
+        self._live: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
     @property
     def needs_monitoring(self) -> bool:
@@ -271,16 +279,13 @@ class NodeProxy(CephService):
 
         return result_json
 
-    # Diagnostic data (drive dumps) collected by the Redfish service of a
-    # host, through its node-proxy API (/diagnostics).
-
-    def _diagnostics_query(self,
-                           hostname: str,
-                           endpoint: str,
-                           method: str = 'GET',
-                           payload: Optional[Dict[str, Any]] = None,
-                           raw: bool = False,
-                           timeout: Optional[int] = None) -> Tuple[Any, Any, int]:
+    def _query(self,
+               hostname: str,
+               endpoint: str,
+               method: str = 'GET',
+               payload: Optional[Dict[str, Any]] = None,
+               raw: bool = False,
+               timeout: Optional[int] = None) -> Tuple[Any, Any, int]:
         addr: str = self.mgr.inventory.get_addr(hostname)
         try:
             return http_req(hostname=addr,
@@ -298,14 +303,32 @@ class NodeProxy(CephService):
         except URLError as e:
             raise RuntimeError(e)
 
+    def report(self, hostname: str) -> Dict[str, Any]:
+        """
+        The host's hardware as its node-proxy last read it, fetched from
+        node-proxy: the reports it sends carry new readings less often.
+        {'report': <a node-proxy report>, 'timestamp': <when it was read>}
+        """
+        now = time.monotonic()
+        self._live = {host: cached for host, cached in self._live.items()
+                      if now - cached[0] < self.LIVE_TTL}
+        if hostname in self._live:
+            return self._live[hostname][1]
+        _, result, _ = self._query(hostname, '/report')
+        live: Dict[str, Any] = json.loads(result)
+        self._live[hostname] = (now, live)
+        return live
+
+    # Diagnostic data (drive dumps) collected by the Redfish service of a
+    # host, through its node-proxy API (/diagnostics).
+
     def diagnostics(self, hostname: str) -> List[Dict[str, Any]]:
-        _, result, _ = self._diagnostics_query(hostname, '/diagnostics')
+        _, result, _ = self._query(hostname, '/diagnostics')
         entries: List[Dict[str, Any]] = json.loads(result)
         return entries
 
     def collect_diagnostics(self, hostname: str, device: str) -> Dict[str, Any]:
-        _, result, _ = self._diagnostics_query(hostname, '/diagnostics', 'POST',
-                                               {'drive': device})
+        _, result, _ = self._query(hostname, '/diagnostics', 'POST', {'drive': device})
         task: Dict[str, Any] = json.loads(result)
         return task
 
@@ -318,17 +341,17 @@ class NodeProxy(CephService):
 
     def diagnostics_task(self, hostname: str, task_id: str) -> Dict[str, Any]:
         task_id = self._check_id(task_id, 'task ID')
-        _, result, _ = self._diagnostics_query(hostname, f'/diagnostics/tasks/{task_id}')
+        _, result, _ = self._query(hostname, f'/diagnostics/tasks/{task_id}')
         task: Dict[str, Any] = json.loads(result)
         return task
 
     def download_diagnostics(self, hostname: str, entry_id: str) -> Tuple[str, bytes]:
         entry_id = self._check_id(entry_id, 'entry ID')
-        headers, content, _ = self._diagnostics_query(
+        headers, content, _ = self._query(
             hostname, f'/diagnostics/{entry_id}', raw=True, timeout=180)
         filename = headers.get_filename() if hasattr(headers, 'get_filename') else None
         return filename or f'{entry_id}.bin', content
 
     def delete_diagnostics(self, hostname: str, entry_id: str) -> None:
         entry_id = self._check_id(entry_id, 'entry ID')
-        self._diagnostics_query(hostname, f'/diagnostics/{entry_id}', 'DELETE')
+        self._query(hostname, f'/diagnostics/{entry_id}', 'DELETE')

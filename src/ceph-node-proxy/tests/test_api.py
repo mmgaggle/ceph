@@ -137,6 +137,19 @@ class TestMetrics:
         assert "{" not in text
 
 
+class TestReport:
+    def test_report(self, api):
+        api.backend.snapshot.return_value = (REPORT, 1793862223.5)
+        assert api.report() == {"report": REPORT, "timestamp": 1793862223.5}
+        api.backend.get_storage.assert_not_called()     # never waits on the system
+
+    def test_before_the_first_update(self, api):
+        api.backend.snapshot.return_value = ({}, None)
+        with pytest.raises(cherrypy.HTTPError) as e:
+            api.report()
+        assert e.value.status == 503
+
+
 def test_metrics_credentials_open_metrics_only() -> None:
     from ceph_node_proxy.api import NodeProxyApi
 
@@ -150,7 +163,7 @@ def test_metrics_credentials_open_metrics_only() -> None:
         assert api.check_auth("localhost", "prometheus", "scrape")
         assert not api.check_auth("localhost", "prometheus", "wrong")
         assert api.check_auth("localhost", "node-proxy.host01", "AQBsecret==")
-        for path in ("/led/chassis", "/diagnostics", "/storage", "/metrics/x"):
+        for path in ("/led/chassis", "/diagnostics", "/storage", "/report", "/metrics/x"):
             request.path_info = path
             assert not api.check_auth("localhost", "prometheus", "scrape"), path
         api.metrics_username = api.metrics_password = ""

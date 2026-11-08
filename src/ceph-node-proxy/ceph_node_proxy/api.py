@@ -149,6 +149,18 @@ class API(Server):
 
     @cherrypy.expose
     @cherrypy.tools.allow(methods=["GET"])
+    @cherrypy.tools.json_out()
+    def report(self) -> Dict[str, Any]:
+        """The hardware as of the last complete read, and when it was read
+        (Unix time). The mgr fetches it while a host's dashboard page is
+        open: the reports sent to the mgr carry new readings less often."""
+        report, when = self.backend.snapshot()
+        if when is None:
+            raise cherrypy.HTTPError(503, "The hardware has not been read yet")
+        return {"report": report, "timestamp": when}
+
+    @cherrypy.expose
+    @cherrypy.tools.allow(methods=["GET"])
     def metrics(self) -> bytes:
         """The hardware metrics, for Prometheus. They come from the last
         complete update, so a scrape never waits for the Redfish service."""

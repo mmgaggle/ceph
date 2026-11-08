@@ -60,6 +60,15 @@ alone.
 The Ceph Manager stores each host's report without its readings, and
 only when it changes.
 
+While a host's page is open in the dashboard, the dashboard asks the Ceph
+Manager every 10 seconds for the host's hardware as ``node-proxy`` last
+read it. The Ceph Manager fetches it from that host's ``node-proxy``
+(``GET /report``) and shares one fetch between the pages open on the host
+for 5 seconds. The page then shows readings at most
+``system.refresh_interval`` seconds old, and when they were read. It stops
+asking when it is closed or hidden. The browser never connects to
+``node-proxy`` or to the Redfish API.
+
 
 .. _hardware-monitoring-metrics:
 

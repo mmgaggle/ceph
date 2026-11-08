@@ -75,6 +75,17 @@ describe('HardwareService', () => {
       expect(req.request.method).toBe('GET');
       req.flush({});
     });
+
+    it('should request the hardware as node-proxy last read it', () => {
+      const service = createService();
+
+      service.getHostLive('node/1').subscribe();
+
+      const req = httpTesting.expectOne('api/hardware/hosts/node%2F1/live');
+      expect(req.request.method).toBe('GET');
+      expect(req.request.headers.get('Accept')).toBe('application/vnd.ceph.api.v0.1+json');
+      req.flush({});
+    });
   });
 
   describe('isHardwareMonitoringEnabled$', () => {

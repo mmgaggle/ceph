@@ -54,6 +54,12 @@ HARDWARE_HOST_SCHEMA = {
 }
 
 
+HARDWARE_LIVE_SCHEMA = {
+    **HARDWARE_HOST_SCHEMA,
+    'read_at': (float, 'When node-proxy read the hardware (Unix time)'),
+}
+
+
 @APIRouter('/hardware', Scope.HOSTS)
 @APIDoc("Hardware management API", "Hardware")
 class Hardware(RESTController):
@@ -126,6 +132,26 @@ class HardwareHosts(RESTController):
     def get(self, hostname: str) -> Dict[str, object]:
         return HardwareHostResponse.from_raw(
             OrchClient.instance().hardware.fullreport(hostname)).to_dict()
+
+    @RESTController.Resource('GET', path='/live', version=APIVersion.EXPERIMENTAL)
+    @EndpointDoc(
+        "Get the hardware of a single host as its node-proxy last read it, at most "
+        "node-proxy's refresh interval old. The manager fetches it from node-proxy: the "
+        "report of the host endpoint carries new readings less often. For a page open on "
+        "the host.",
+        parameters={
+            'hostname': Param(str, 'The name of the host', False),
+        },
+        responses={200: HARDWARE_LIVE_SCHEMA},
+    )
+    @raise_if_no_orchestrator()
+    @handle_orchestrator_error('hardware')
+    @handle_custom_error('Hardware', http_status_code=404, exceptions=(HardwareNoReport,))
+    def live(self, hostname: str) -> Dict[str, object]:
+        report, read_at = OrchClient.instance().hardware.live(hostname)
+        host = HardwareHostResponse.from_raw(report).to_dict()
+        host['read_at'] = read_at
+        return host
 
 
 DIAGNOSTICS_ENTRY_SCHEMA = {

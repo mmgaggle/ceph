@@ -12,8 +12,17 @@ import {
 import { ActivatedRoute, ParamMap } from '@angular/router';
 
 import { saveAs } from 'file-saver';
-import { Subscription, timer } from 'rxjs';
-import { filter, finalize, mergeMap, switchMap, takeWhile, tap } from 'rxjs/operators';
+import { EMPTY, Subscription, timer } from 'rxjs';
+import {
+  catchError,
+  exhaustMap,
+  filter,
+  finalize,
+  mergeMap,
+  switchMap,
+  takeWhile,
+  tap
+} from 'rxjs/operators';
 
 import { attachmentFilename, HardwareService } from '~/app/shared/api/hardware.service';
 import { HostService } from '~/app/shared/api/host.service';
@@ -37,6 +46,7 @@ import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
 import { HostOverviewDetails, STATUS_MAP, getStatus } from '~/app/shared/models/host.interface';
 import { SEVERITY, SeverityIconMap } from '~/app/shared/models/overview';
 import { Permissions } from '~/app/shared/models/permissions';
+import { RelativeDatePipe } from '~/app/shared/pipes/relative-date.pipe';
 import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
 import { FormatterService } from '~/app/shared/services/formatter.service';
 import { ModalCdsService } from '~/app/shared/services/modal-cds.service';
@@ -44,6 +54,11 @@ import { NotificationService } from '~/app/shared/services/notification.service'
 
 /* How often a diagnostic data collection in progress is checked */
 export const DIAGNOSTICS_POLL_MS = 3000;
+/*
+ * How often the page asks for the host's hardware as node-proxy last read it
+ * (node-proxy reads it every 20 seconds by default), while it is open and visible
+ */
+export const LIVE_POLL_MS = 10000;
 
 /* Drive health, with the same severity icons as the overview page. */
 const DRIVE_HEALTH: Record<HardwareHealth, { icon: string; label: string }> = {
@@ -132,6 +147,7 @@ function maxTemperature(report: HardwareHostResponse, context: string): string |
 @Component({
   selector: 'cd-host-resource-page',
   templateUrl: './host-resource-page.component.html',
+  providers: [RelativeDatePipe],
   standalone: false
 })
 export class HostResourcePageComponent implements OnInit, OnDestroy {
@@ -147,7 +163,13 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
   readonly hardware = signal<HardwareHostResponse | null>(null);
 
   readonly hardwareTitle = $localize`Hardware`;
-  readonly hardwareFields = computed(() => this.buildHardwareFields(this.hardware()));
+  /* Counts the live polls, so that the time of the last read stays relative to now */
+  private readonly livePolls = signal(0);
+  readonly hardwareFields = computed(() => {
+    this.livePolls();
+    return this.buildHardwareFields(this.hardware());
+  });
+  private live = new Subscription();
   /* Drive ids are only unique within a chassis. */
   readonly hardwareDrives = computed(() =>
     (this.hardware()?.status.storage.components ?? []).map((drive) => ({
@@ -269,7 +291,8 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
     private hostService: HostService,
     private orchService: OrchestratorService,
     private authStorageService: AuthStorageService,
-    private formatter: FormatterService
+    private formatter: FormatterService,
+    private relativeDatePipe: RelativeDatePipe
   ) {
     this.permissions = this.authStorageService.getPermissions();
   }
@@ -290,6 +313,7 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     this.sub.unsubscribe();
+    this.live.unsubscribe();
   }
 
   private loadOverview(): void {
@@ -333,6 +357,7 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
 
   private loadHardware(): void {
     this.hardware.set(null);
+    this.live.unsubscribe();
     this.sub.add(
       this.hardwareService.isHardwareMonitoringEnabled$
         .pipe(
@@ -343,6 +368,7 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
           next: (report) => {
             this.hardware.set(report);
             this.loadDiagnostics();
+            this.followHardware();
           },
           error: (error) => {
             // A host without node-proxy data is expected: show no hardware, not an error.
@@ -352,6 +378,30 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
           }
         })
     );
+  }
+
+  /*
+   * While the page is open and visible, show the hardware as node-proxy last
+   * read it: the report loaded first may carry readings minutes old. When
+   * node-proxy cannot be reached, the page keeps what it shows.
+   */
+  private followHardware(): void {
+    const hostname = this.hostname;
+    this.live.unsubscribe();
+    this.live = timer(0, LIVE_POLL_MS)
+      .pipe(
+        tap(() => this.livePolls.update((polls) => polls + 1)),
+        filter(() => document.visibilityState !== 'hidden'),
+        exhaustMap(() =>
+          this.hardwareService.getHostLive(hostname).pipe(
+            catchError((error) => {
+              error?.preventDefault?.();
+              return EMPTY;
+            })
+          )
+        )
+      )
+      .subscribe((report) => this.hardware.set(report));
   }
 
   updateDriveSelection(selection: CdTableSelection): void {
@@ -505,6 +555,13 @@ export class HostResourcePageComponent implements OnInit, OnDestroy {
           helperText
         }
       );
+    }
+    if (report.read_at !== undefined) {
+      fields.push({
+        label: $localize`Last read`,
+        value: this.relativeDatePipe.transform(report.read_at),
+        helperText: $localize`When the server's hardware was last read. The readings are updated while this page is open.`
+      });
     }
     return fields;
   }

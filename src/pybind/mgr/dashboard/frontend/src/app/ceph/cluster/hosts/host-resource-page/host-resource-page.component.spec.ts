@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { HttpHeaders, HttpParams, HttpResponse } from '@angular/common/http';
 import { HttpClientTestingModule } from '@angular/common/http/testing';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
@@ -6,7 +6,7 @@ import { By } from '@angular/platform-browser';
 import { ActivatedRoute, convertToParamMap, ParamMap } from '@angular/router';
 import { RouterTestingModule } from '@angular/router/testing';
 import { saveAs } from 'file-saver';
-import { BehaviorSubject, of, throwError } from 'rxjs';
+import { BehaviorSubject, EMPTY, of, throwError } from 'rxjs';
 
 import { HardwareService } from '~/app/shared/api/hardware.service';
 import { HostService } from '~/app/shared/api/host.service';
@@ -21,7 +21,11 @@ import { NotificationService } from '~/app/shared/services/notification.service'
 import { OrchestratorService } from '~/app/shared/api/orchestrator.service';
 import { SharedModule } from '~/app/shared/shared.module';
 import { configureTestBed } from '~/testing/unit-test-helper';
-import { DIAGNOSTICS_POLL_MS, HostResourcePageComponent } from './host-resource-page.component';
+import {
+  DIAGNOSTICS_POLL_MS,
+  HostResourcePageComponent,
+  LIVE_POLL_MS
+} from './host-resource-page.component';
 
 jest.mock('file-saver', () => ({ saveAs: jest.fn() }));
 
@@ -48,6 +52,7 @@ describe('HostResourcePageComponent', () => {
   const hardwareServiceSpy = {
     isHardwareMonitoringEnabled$: hardwareEnabled$,
     getHost: jest.fn(),
+    getHostLive: jest.fn(),
     listDiagnostics: jest.fn(),
     collectDiagnostics: jest.fn(),
     getDiagnosticsTask: jest.fn(),
@@ -100,6 +105,7 @@ describe('HostResourcePageComponent', () => {
     hostServiceSpy.getRawCapacityBytes.mockClear();
     hardwareEnabled$.next(false);
     hardwareServiceSpy.getHost.mockReset();
+    hardwareServiceSpy.getHostLive.mockReset().mockReturnValue(EMPTY);
     hardwareServiceSpy.listDiagnostics.mockReset().mockReturnValue(of([]));
     hardwareServiceSpy.collectDiagnostics.mockReset();
     hardwareServiceSpy.getDiagnosticsTask.mockReset();
@@ -438,6 +444,79 @@ describe('HostResourcePageComponent', () => {
         load(of(report));
 
         expect(text()).not.toContain('Network ports');
+      });
+    });
+
+    describe('while the page is open', () => {
+      const live = (cpu: number, readAt: number) =>
+        ({
+          ...report,
+          status: {
+            ...report.status,
+            temperatures: { components: [sensor('CPU1 Temp', 'CPU', cpu)] }
+          },
+          read_at: readAt
+        }) as unknown as HardwareHostResponse;
+
+      beforeEach(() => jest.useFakeTimers());
+      afterEach(() => jest.useRealTimers());
+
+      it('should show the hardware as node-proxy last read it', () => {
+        hardwareServiceSpy.getHostLive.mockReturnValue(of(live(61, Date.now() / 1000 - 120)));
+        load(of(report));
+        expect(hardwareField('CPU temperature')?.value).toBe('48°C');
+        expect(hardwareField('Last read')).toBeUndefined();
+
+        jest.advanceTimersByTime(0);
+        expect(hardwareServiceSpy.getHostLive).toHaveBeenCalledWith('node-1');
+        expect(hardwareField('CPU temperature')?.value).toBe('61°C');
+        expect(hardwareField('Last read')?.value).toBe('2 minutes ago');
+
+        jest.advanceTimersByTime(LIVE_POLL_MS);
+        expect(hardwareServiceSpy.getHostLive).toHaveBeenCalledTimes(2);
+      });
+
+      it('should stop asking when the page is closed', () => {
+        load(of(report));
+        jest.advanceTimersByTime(0);
+        fixture.destroy();
+        jest.advanceTimersByTime(3 * LIVE_POLL_MS);
+
+        expect(hardwareServiceSpy.getHostLive).toHaveBeenCalledTimes(1);
+      });
+
+      it('should not ask while the page is hidden', () => {
+        const visibility = jest.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
+        load(of(report));
+        jest.advanceTimersByTime(3 * LIVE_POLL_MS);
+        visibility.mockRestore();
+
+        expect(hardwareServiceSpy.getHostLive).not.toHaveBeenCalled();
+      });
+
+      it('should keep what it shows when node-proxy cannot be reached', () => {
+        const error = { status: 400, preventDefault: jest.fn() };
+        hardwareServiceSpy.getHostLive.mockReturnValue(throwError(error));
+        load(of(report));
+        jest.advanceTimersByTime(0);
+
+        expect(error.preventDefault).toHaveBeenCalled();
+        expect(hardwareField('CPU temperature')?.value).toBe('48°C');
+
+        jest.advanceTimersByTime(LIVE_POLL_MS);
+        expect(hardwareServiceSpy.getHostLive).toHaveBeenCalledTimes(2);
+      });
+
+      it('should age the time of the last read when no new read comes', () => {
+        hardwareServiceSpy.getHostLive
+          .mockReturnValueOnce(of(live(61, Date.now() / 1000)))
+          .mockReturnValue(throwError({ status: 400, preventDefault: jest.fn() }));
+        load(of(report));
+        jest.advanceTimersByTime(0);
+        expect(hardwareField('Last read')?.value).toBe('A few seconds ago');
+
+        jest.advanceTimersByTime(18 * LIVE_POLL_MS);
+        expect(hardwareField('Last read')?.value).toBe('3 minutes ago');
       });
     });
 

@@ -89,6 +89,8 @@ export interface HardwareHostResponse {
   firmware: Record<string, string>;
   /* null when the host has no FCM drives */
   compression: CompressionStats | null;
+  /* When node-proxy read the hardware (Unix time): only in the live report */
+  read_at?: number;
 }
 
 /* Diagnostic data (a drive dump) kept by a host's hardware: GET /api/hardware/diagnostics */

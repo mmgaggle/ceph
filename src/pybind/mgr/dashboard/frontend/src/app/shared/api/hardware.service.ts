@@ -60,6 +60,17 @@ export class HardwareService {
     );
   }
 
+  /*
+   * Hardware of one host as its node-proxy last read it, fetched through the
+   * manager: the report getHost() returns carries new readings less often.
+   */
+  getHostLive(hostname: string): Observable<HardwareHostResponse> {
+    return this.http.get<HardwareHostResponse>(
+      `${this.baseURL}/hosts/${encodeURIComponent(hostname)}/live`,
+      { headers: EXPERIMENTAL }
+    );
+  }
+
   /* Diagnostic data (drive dumps) the hardware of a host keeps */
   listDiagnostics(hostname: string): Observable<DiagnosticsEntry[]> {
     return this.http.get<DiagnosticsEntry[]>(`${this.baseURL}/diagnostics`, {

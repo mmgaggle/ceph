@@ -900,6 +900,40 @@ class HardwareHostDetailControllerTest(ControllerTestCase):
             'unknown': 0, 'components': []})
 
     @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_live(self, mock_instance):
+        readings = {**MOCK_HOST_BLOB['status'], 'fans': {'1': {'fan1': {
+            'status': {'health': 'OK'}, 'reading': 9100}}}}
+        mock_instance.return_value.hardware._live.return_value = {
+            'report': {**MOCK_HOST_BLOB, 'status': readings}, 'timestamp': 1793862223.5}
+        mock_instance.return_value.hardware.live = \
+            lambda hostname: HardwareManager.live(mock_instance.return_value.hardware, hostname)
+        self._get(f'{self.URL}/host1/live', version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(200)
+        live = self.json_body()
+        self.assertEqual(live['read_at'], 1793862223.5)
+        self.assertEqual(live['status']['fans']['components'][0]['reading'], 9100)
+        self.assertEqual(set(live) - {'read_at'},
+                         {'hostname', 'sn', 'health', 'status', 'firmware', 'compression'})
+        mock_instance.return_value.hardware._live.assert_called_once_with('host1')
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_live_incomplete_report_is_404(self, mock_instance):
+        mock_instance.return_value.hardware._live.return_value = {
+            'report': {'sn': 'ABC123'}, 'timestamp': 1793862223.5}
+        mock_instance.return_value.hardware.live = \
+            lambda hostname: HardwareManager.live(mock_instance.return_value.hardware, hostname)
+        self._get(f'{self.URL}/host1/live', version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(404)
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
+    def test_live_node_proxy_down(self, mock_instance):
+        mock_instance.return_value.hardware.live.side_effect = OrchestratorError(
+            'Make sure the node-proxy agent is deployed and running on host1')
+        self._get(f'{self.URL}/host1/live', version=APIVersion.EXPERIMENTAL)
+        self.assertStatus(400)
+        self.assertIn('node-proxy agent', self.json_body()['detail'])
+
+    @mock.patch('dashboard.controllers.hardware.OrchClient.instance')
     def test_detail_no_report_is_404(self, mock_instance):
         mock_instance.return_value.hardware.fullreport.side_effect = HardwareNoReport(
             "Host 'nope' has no node-proxy data")

@@ -2,7 +2,7 @@
 
 import logging
 from functools import wraps
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from ceph.deployment.service_spec import ServiceSpec
 from orchestrator import NODE_PROXY_REPORT_KEYS, DaemonDescription, \
@@ -225,6 +225,24 @@ class HardwareManager(ResourceManager):
     @wait_api_result
     def _fullreport(self, hostname: str) -> NodeProxyRawData:
         return self.api.node_proxy_fullreport(hostname=hostname)
+
+    def live(self, hostname: str) -> Tuple[RawHostReport, float]:
+        """
+        This host's hardware as its node-proxy last read it, and when (Unix
+        time), fetched from node-proxy: the report fullreport() returns
+        carries new readings less often.
+
+        :raises HardwareNoReport: node-proxy's report lacks host, sn or status.
+        """
+        live = self._live(hostname)
+        report = live.get('report') or {}
+        if not all(key in report for key in NODE_PROXY_REPORT_KEYS):
+            raise HardwareNoReport(f"Host '{hostname}' has an incomplete node-proxy report.")
+        return cast(RawHostReport, report), float(live['timestamp'])
+
+    @wait_api_result
+    def _live(self, hostname: str) -> Dict[str, Any]:
+        return self.api.node_proxy_live(hostname)
 
     @wait_api_result
     def common(self, category: str, hostname: Optional[List[str]] = None) -> str:
